@@ -1,4 +1,4 @@
-# crafter
+# [crafter]
 
 Build a structure in Minecraft, send it to a robot.
 
