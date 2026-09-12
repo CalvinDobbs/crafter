@@ -1,5 +1,7 @@
 # minecraft — digital-twin block builder
 
+Project-level sequencing, demo definition, and the voice-during-motion plan: **[../PLAN.md](../PLAN.md)**. This file is the robot-app architecture and runbook.
+
 ## The idea
 
 A player builds a structure in Minecraft (stacking blocks). The robot finds

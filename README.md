@@ -2,6 +2,8 @@
 
 Build a structure in Minecraft, send it to a robot.
 
+The overall project plan (goals, sequencing, gaps, voice) is **[PLAN.md](PLAN.md)**. This README is how to build and run the Minecraft mod.
+
 ## Components
 
 ### `minecraft-mod/`
@@ -16,10 +18,10 @@ instead of structures.
 
 ## The bot side
 
-Not in this repo yet. The receiver runs on the BracketBot (Ubuntu, aarch64), listens on tcp/5005,
-and is written against [WIRE_FORMAT.md](WIRE_FORMAT.md) — the contract covering TCP framing, the
-JSON schema, coordinate conventions, and the edge cases a receiver has to handle. Read that before
-writing anything that consumes a structure.
+Python for the robot lives in [`bot-code/`](bot-code/) (planner, perception, orchestrator). Hardware
+motion is a separate process, `mc_skills` on the BracketBot (see PLAN.md). The TCP receiver that
+should listen on tcp/5005 is **not written yet**; until it is, ingest a `.json` / `.nbt` / grid-UI
+file. Anything that consumes a live scan must follow [WIRE_FORMAT.md](WIRE_FORMAT.md).
 
 ## Building the mod
 
