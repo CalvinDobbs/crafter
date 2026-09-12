@@ -1,0 +1,18 @@
+# Gradle / Fabric Loom
+.gradle/
+build/
+
+# Minecraft dev-client run directory (worlds, logs, options)
+run/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+desktop.ini
