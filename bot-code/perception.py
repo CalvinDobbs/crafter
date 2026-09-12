@@ -14,12 +14,20 @@
 Only this module and fixtures/scan_sample.json belong to perception. No motor
 Writers, HTTP motion calls, agent state, or shared-contract edits belong here.
 Use PerceptionSession for persistent memory; scan() is a one-shot convenience.
+The old main.py still uses fixed-grid contracts and must NOT drive a moving
+build using these snapshots until its
+owner integrates BuildFrame and PerceptionSession. Legacy scan_all(sweeps>1)
+now rejects requests instead of moving the robot or merging stale coordinates.
 
 Frames: base is +x forward, +y left, +z up, meters. Session world starts at the
 first wheel sample. Wheel distances and optional IMU yaw increments estimate
 T_world_base; this is drifting planar dead reckoning, NOT SLAM or a navigation
 safety map. Gaps/reset jumps invalidate the map rather than mixing frames.
-Depth points already use base coordinates; do not apply IMU pitch twice.
+Depth points use the depth daemon's calibrated axes. Perception normalizes
+heading into +x forward using the fixed forward-facing head camera's extrinsic;
+--depth-yaw-deg can override this alignment. Do not apply IMU pitch twice.
+The map assumes a level floor and requires a physical sign/scale check before
+motion use. The module never claims navigation or successful manipulation.
 
 camera.rect.left and camera.points share acquisition timestamps. Sparse points
 map back to the rectified image through idx_2d[:num_points], not reshape().
@@ -80,6 +88,7 @@ class Settings:
     memory_s: float = 30.0
     anchor_ttl: float = 15.0
     fresh_s: float = 0.8
+    depth_yaw_deg: float | None = None
 
     def __post_init__(self):
         positive = (self.box_size, self.cell, self.resolution, self.radius,
@@ -92,6 +101,8 @@ class Settings:
             raise ValueError("cell pitch must fit the box; anchor offset needs two values")
         if not np.isfinite(self.anchor_offset).all():
             raise ValueError("anchor offset must be finite")
+        if self.depth_yaw_deg is not None and not math.isfinite(self.depth_yaw_deg):
+            raise ValueError("depth heading override must be finite")
 
 
 @dataclass
@@ -230,6 +241,7 @@ class Scan:
     surface_cells: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     anchor_seen: bool = False
+    diagnostics: dict = field(default_factory=dict)
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 3)), repr=False)
 
 
@@ -443,8 +455,22 @@ class WorldModel:
         return s
 
 
+def depth_heading_rotation(extrinsic, yaw_deg=None):
+    m = np.asarray(extrinsic, dtype=float)
+    if m.shape != (3, 4) or not np.isfinite(m).all():
+        raise ValueError("invalid depth extrinsic")
+    if yaw_deg is None:
+        forward = m[:2, 2]
+        if np.linalg.norm(forward) < .1:
+            raise ValueError("down-looking camera has no reliable heading; supply --depth-yaw-deg")
+        yaw = -math.atan2(forward[1], forward[0])
+    else:
+        yaw = math.radians(yaw_deg)
+    return Pose(yaw=yaw).rotation(), math.degrees(yaw)
+
+
 class LiveSource:
-    def __init__(self, source="wheel-imu"):
+    def __init__(self, source="wheel-imu", settings=None):
         from bbos import Reader, Config
         self.stack = contextlib.ExitStack()
         self.points = self.stack.enter_context(Reader("camera.points", keeptime=False))
@@ -453,7 +479,10 @@ class LiveSource:
         self.imu = self.stack.enter_context(Reader("imu.orientation", keeptime=False))
         drive = Config("drive")
         self.odom = Odometry(drive.wheel_diam, drive.robot_width, source)
-        self.camera_origin = np.asarray(Config("depth").camera_to_base_3x4)[:, 3]
+        extrinsic = np.asarray(Config("depth").camera_to_base_3x4)
+        self.depth_rotation, self.depth_yaw_deg = depth_heading_rotation(
+            extrinsic, (settings or Settings()).depth_yaw_deg)
+        self.camera_origin = self.depth_rotation @ extrinsic[:, 3]
         self.imu_sample = None
         self.last_frame = 0.0
 
@@ -483,7 +512,8 @@ class LiveSource:
         n = int(d["num_points"])
         if not 0 <= n <= len(d["points"]):
             raise ValueError("invalid depth point count")
-        return (np.array(rgb["left"], copy=True), np.array(d["points"][:n], dtype=float, copy=True),
+        points = np.asarray(d["points"][:n], dtype=float) @ self.depth_rotation.T
+        return (np.array(rgb["left"], copy=True), points,
                 np.array(d["idx_2d"][:n], copy=True), ts, self.odom.at(ts))
 
     def close(self):
@@ -500,7 +530,7 @@ class PerceptionSession:
     def __init__(self, mock=False, settings=None, pose_source="wheel-imu"):
         self.mock, self.settings = mock, settings or Settings()
         self.world = WorldModel(self.settings)
-        self.source = None if mock else LiveSource(pose_source)
+        self.source = None if mock else LiveSource(pose_source, self.settings)
         self.scene = MockSource(self.settings) if mock else None
         self.latest = Scan()
         self.jpeg = b""
@@ -524,6 +554,12 @@ class PerceptionSession:
             ok, encoded = cv2.imencode(".jpg", image)
             self.jpeg = encoded.tobytes() if ok else b""
         self.latest = self.world.update(observations, pose, ts, anchor, points, warnings)
+        if not self.mock:
+            self.latest.diagnostics = {"depth_yaw_deg": self.source.depth_yaw_deg,
+                                       "point_count": len(points), "rect_shape": list(rgb.shape),
+                                       "marker_ids": [mid for mid, _ in markers],
+                                       "pose_camera_skew_s": abs(pose.ts-ts),
+                                       "imu_units": "publisher degrees -> internal radians"}
         return self.latest
 
     def close(self):
@@ -692,7 +728,7 @@ def scan_to_dict(s, settings=None, mock=False):
             "anchor_seen": s.anchor_seen, "tracks": tracks,
             "boxes": [asdict(d) for d in s.boxes] if not stale else [],
             "protected": [asdict(d) for d in s.protected], "unknown": [asdict(d) for d in s.unknown],
-            "surface_cells": s.surface_cells, "settings": asdict(cfg),
+            "surface_cells": s.surface_cells, "settings": asdict(cfg), "diagnostics": s.diagnostics,
             "warnings": s.warnings + (["snapshot stale; no pick candidates"] if stale else []),
             "map_semantics": "observed surfaces only; blank cells UNKNOWN, not free; not a navigation map"}
 
@@ -800,14 +836,14 @@ function draw(d){
 ctx.clearRect(0,0,800,800);ctx.font='12px monospace';const radius=Number(document.getElementById('range').value),scale=360/radius;
 ctx.strokeStyle='#1d2e43';ctx.lineWidth=1;
 for(let t=-radius;t<=radius+.001;t+=d.settings.resolution){ctx.beginPath();ctx.moveTo(400+t*scale,40);ctx.lineTo(400+t*scale,760);ctx.stroke();ctx.beginPath();ctx.moveTo(40,400+t*scale);ctx.lineTo(760,400+t*scale);ctx.stroke();}
-for(const c of d.surface_cells){ctx.fillStyle=`rgba(49,130,188,${Math.max(.07,.28*(1-c.age/d.settings.memory_s))})`;const yaw=d.pose.yaw,co=Math.cos(yaw),si=Math.sin(yaw);gridSquare(c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
+for(const c of d.surface_cells){const height=Math.max(0,Math.min(1,c.z_max/1.8));ctx.fillStyle=`rgba(49,${Math.round(90+height*110)},220,${Math.max(.07,.4*(1-c.age/d.settings.memory_s))})`;const yaw=d.pose.yaw,co=Math.cos(yaw),si=Math.sin(yaw);gridSquare(c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
 if(d.build){ctx.strokeStyle=d.build.valid?'#ffb85c':'#755f48';for(const c of d.build.cells){gridSquare(c,d.build.col,d.build.row,d.settings.cell/2,d);ctx.stroke();}dot(d.build.marker,'#ff7373',5,'anchor 49',d);ctx.strokeStyle='#ef6479';path([d.build.origin,d.build.origin.map((v,i)=>v+.2*d.build.col[i])],d);ctx.stroke();ctx.strokeStyle='#73d497';path([d.build.origin,d.build.origin.map((v,i)=>v+.2*d.build.row[i])],d);ctx.stroke();}
 ctx.strokeStyle='#3c5b7e';ctx.setLineDash([6,7]);path([[1.5*Math.cos(.838),1.5*Math.sin(.838),0],[0,0,0],[1.5*Math.cos(.838),-1.5*Math.sin(.838),0]],d);ctx.stroke();ctx.setLineDash([]);
 const grouped=new Map();for(const t of d.tracks){const p=px(t.pos,d),k=p.map(v=>Math.round(v/15)).join(',');if(!grouped.has(k))grouped.set(k,[]);grouped.get(k).push(t);}
 for(const group of grouped.values()){const t=group[0],color={loose:'#58dfb6',protected:'#ffb85c',unknown:'#c8a0ef'}[t.classification];ctx.globalAlpha=t.current?1:.45;ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash(t.current?[]:[3,3]);const p=px(t.pos,d);ctx.beginPath();ctx.arc(...p,8,0,Math.PI*2);ctx.stroke();if(t.current)dot(t.pos,color,5,null,d);ctx.fillStyle='#e8f0ff';ctx.fillText(group.map(b=>'#'+b.id).join(' / '),p[0]+11,p[1]-10);ctx.globalAlpha=1;ctx.setLineDash([]);}
 // robot
 ctx.fillStyle='#69b7ff';path([[.11,0,0],[-.06,.06,0],[-.06,-.06,0]],d,true);ctx.fill();dot([0,0,0],'#69b7ff',4,null,d);
-ctx.fillStyle='#aec1da';ctx.fillText('Forward +x / left +y   |   '+d.settings.resolution.toFixed(2)+' m cells',18,22);ctx.fillText('FOV wedge is illustrative, not a calibrated visibility/free-space mask.',18,786);
+ctx.fillStyle='#aec1da';ctx.fillText((document.getElementById('view').value==='robot'?'Forward +x / left +y':'Fixed session axes / robot heading shown by arrow')+' | '+d.settings.resolution.toFixed(2)+' m cells',18,22);ctx.fillText('FOV wedge is illustrative, not a calibrated visibility/free-space mask.',18,786);
 sc.clearRect(0,0,600,240);const maxZ=Math.max(.4,...d.tracks.map(t=>t.pos[2]+t.size)),zscale=175/maxZ;
 sc.strokeStyle='#52657b';sc.beginPath();sc.moveTo(30,215);sc.lineTo(580,215);sc.stroke();sc.font='12px monospace';
 for(const t of d.tracks){const x=300-t.pos[1]*220/radius,z=215-t.pos[2]*zscale;sc.globalAlpha=t.current?1:.4;sc.fillStyle={loose:'#58dfb6',protected:'#ffb85c',unknown:'#c8a0ef'}[t.classification];sc.fillRect(x-8,z-t.size*zscale/2,16,Math.max(4,t.size*zscale));sc.fillText('#'+t.id+' '+t.pos[2].toFixed(2)+'m',x+12,z);sc.globalAlpha=1;}
@@ -857,6 +893,15 @@ def self_test():
             image = np.full((200, 200, 3), 255, np.uint8)
             image[30:170, 30:170] = marker[:, :, None]
             self.assertEqual([mid for mid, _ in _detect_aruco(image)], [ANCHOR_ID])
+
+        def test_depth_heading_matches_wheel_frame(self):
+            matrix = np.array([[1,0,0,0],[0,-.629,.777,0],[0,-.777,-.629,1.62]])
+            rotation, yaw = depth_heading_rotation(matrix)
+            self.assertAlmostEqual(yaw, -90)
+            np.testing.assert_allclose(rotation @ [0,1,.7], [1,0,.7], atol=1e-12)
+            np.testing.assert_allclose(rotation @ [1,0,0], [0,-1,0], atol=1e-12)
+            identity, _ = depth_heading_rotation(matrix, 0)
+            np.testing.assert_allclose(identity, np.eye(3))
 
         def test_sparse_indices_not_reshape(self):
             mask = np.zeros((3, 4), bool)
@@ -1034,12 +1079,14 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8007)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--pose-source", choices=["wheel", "wheel-imu"], default="wheel-imu")
+    ap.add_argument("--depth-yaw-deg", type=float, default=None, help="override depth-to-forward heading rotation")
     ap.add_argument("--box-size", type=float, default=BOX_SIZE)
     ap.add_argument("--build-cols", type=int, default=FOOTPRINT)
     ap.add_argument("--build-rows", type=int, default=FOOTPRINT)
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
-    cfg = Settings(box_size=a.box_size, cell=a.box_size, build_cols=a.build_cols, build_rows=a.build_rows)
+    cfg = Settings(box_size=a.box_size, cell=a.box_size, build_cols=a.build_cols,
+                   build_rows=a.build_rows, depth_yaw_deg=a.depth_yaw_deg)
     if a.self_test:
         self_test()
     elif a.viz:
