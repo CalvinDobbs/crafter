@@ -1,236 +1,234 @@
-# minecraft — digital-twin block builder
+# crafter bot-code — digital-twin block builder
 
 Project-level sequencing, demo definition, and the voice-during-motion plan: **[../PLAN.md](../PLAN.md)**. This file is the robot-app architecture and runbook.
 
 ## The idea
 
-A player builds a structure in Minecraft (stacking blocks). The robot finds
-physical cardboard boxes scattered in front of it, picks them up, and stacks
-them so the real-world pile matches the in-game build. It is NOT teleoperation
-— the robot never mirrors player movements. The game build is a *target spec*;
-the robot perceives the world, plans which box goes to which cell, and executes
-pick/place primitives. An LLM does the high-level reasoning (box assignment,
-ordering, narration); deterministic code does all motion.
+A player builds a structure in Minecraft; the Fabric mod
+(`../minecraft-mod/`, Structure Scanner item) streams it to the bot over
+TCP:5005 per `../WIRE_FORMAT.md`. The robot finds physical cardboard boxes,
+picks them up, and stacks them so the pile matches the in-game build. It is
+NOT teleoperation — the game build is a *target spec*; the robot maintains a
+world model, plans which box goes to which cell, and executes pick/place
+primitives. An LLM does high-level reasoning; deterministic code does motion.
 
 Demo story: "You build it in Minecraft. It builds it in real life."
 
-## Platform context (read this before writing code)
+## Platform context (read before writing code)
 
-The robot is BracketBot: self-balancing 2-wheel base, two 8-DoF arms
-(index 7 = gripper), head stereo camera, 2 wrist cameras, mic/speaker, LED.
-All I/O goes through **bbos IPC**: shared-memory topics accessed via
-`Reader`/`Writer`/`Type`/`Config` from the `bbos` package.
+BracketBot: self-balancing 2-wheel base, two 8-DoF arms (index 7 = gripper),
+head stereo camera, 2 wrist cameras, mic/speaker, LED. All I/O is **bbos IPC**
+— shared-memory topics via `Reader`/`Writer`/`Type`/`Config`.
 
-Critical facts that shape this design:
+- **ONE writer per topic.** A second `Writer("arm_right.ctrl")` anywhere else
+  raises `RuntimeError`. Exactly ONE process owns hardware: `mc_skills`.
+  Everyone else calls its HTTP API. Never open Writers on `arm_*.ctrl`,
+  `*.torque`, `drive.ctrl`, `led.ctrl`, `speaker.audio` outside it.
+- **Readers are unlimited.** Perception can run live on the robot at any time
+  without conflicting with anything.
+- Arm control = position in motor turns. Cartesian via IK:
+  `Config("arm_right").ik.solve(pos[3], quat_xyzw[4]) -> 7 urdf joints` →
+  `urdf2q` → turns.
+- `camera.points` = **base-frame xyz per pixel** — detections arrive already
+  in robot coordinates. Base frame: +x forward, +y left, +z up, meters.
+- Homing: use `staged_home_arms`/`park_arms` from
+  `bbapps/quest_teleop/scripts/homing.py` (mc_skills does). Leave arms limp.
+- VLM plumbing exists in `~/bbapps/inference/vlm.py` (multi-provider clients,
+  `grab_right_eye`, strict JSON schema) — reuse it, don't rebuild it.
+- Full platform doc: `~/bbapps/AGENTS.md`.
 
-- **ONE writer per topic.** A second `Writer("arm_right.ctrl", ...)` in any
-  other process raises `RuntimeError`. This is why there is exactly ONE
-  hardware-owning process (`mc_skills`) and everyone else goes through its
-  HTTP API. Never open a `Writer` on `arm_*.ctrl`, `arm_*.torque`,
-  `drive.ctrl`, `led.ctrl`, or `speaker.audio` outside `mc_skills`.
-- **Readers are unlimited.** Many processes may `Reader(...)` the same topic
-  concurrently. Perception work can run live on the robot at any time without
-  conflicting with anything.
-- Arm control is position control in **motor turns** (`<arm>.ctrl` pos field,
-  8 floats). Cartesian moves go through IK: `Config("arm_right").ik.solve(
-  pos[3], quat_xyzw[4]) -> 7 urdf joints`, then `urdf2q` -> motor turns.
-- `camera.points` publishes **base-frame xyz per pixel** — detection output is
-  already in the robot's coordinate frame. No TF math needed.
-- Base frame convention: `+x` forward, `+y` left, `+z` up, meters.
-- Homing is nontrivial (staged torque enable). Always use
-  `staged_home_arms`/`park_arms` from `bbapps/quest_teleop/scripts/homing.py`
-  (mc_skills already does). On exit: leave arms limp.
-- Full platform details: `~/bbapps/AGENTS.md`.
+## The world model (core concept — read this)
+
+Each `scan()` produces a snapshot in the robot's **current** base frame:
+
+```python
+Scan { boxes: [Detection],   # loose, pickable — outside the grid
+       stacked: [Detection], # inside grid footprint = already placed
+       anchor: [x,y,z]|None, # base-frame pos of the grid anchor marker
+       ts: float }
+```
+
+- **Anchor marker** (ArUco id 99) is taped at cell (0,0)'s table spot and
+  re-detected every scan → the virtual grid is always resolved in the
+  *current* heading. This replaces SLAM: rotating stales old detections, but
+  every action re-scans first. Fallback when anchor unseen: fixed
+  `GRID_ORIGIN` (fine while the base stays parked).
+- **Grid gate:** any detection projecting inside the footprint is `stacked`,
+  never a pick candidate. "Don't grab the 3rd block off the stack" is a
+  spatial rule in code — the LLM never sees placed boxes as options.
+- **Dual tracking:** `placed` (agent's authoritative set — what SHOULD be
+  there) vs `column_heights()` (measured z per cell from the pointcloud —
+  what IS there). Disagreement = fumble → feed back, re-plan.
 
 ## Architecture
 
 ```
-  Minecraft / grid UI ──> structure.json ──┐
-                                           v
-  cameras+depth ──> perception ──> detections ──> planner ──> Plan
-        (Readers only)                (pure fn, LLM optional)   │
-                                                              v
-                                            orchestrator (main.py)
-                                                              │ HTTP
-                                                              v
-                              ┌─────── mc_skills (body server) ────────┐
-                              │ owns ALL hardware Writers              │
-                              │ /home /park /pick /place /goto         │
-                              │ /gripper /rotate /say /celebrate       │
-                              └────────────────────────────────────────┘
+ minecraft-mod ──TCP:5005──> structure_rx.py ──> structure.json ─┐
+   (grid UI / .json fixtures are fallbacks)                       v
+ cameras+depth ──> perception.scan() ──> Scan ──> agent/planner ──> steps
+       (Readers only)                                │            │
+                                                     v            v
+                                   orchestrator (main.py)  <── feedback
+                                                     │ HTTP
+                                                     v
+                       ┌─────── mc_skills (body server, :8006) ────────┐
+                       │ owns ALL hardware Writers                     │
+                       │ /home /park /pick /place /goto /drive         │
+                       │ /gripper /rotate /say /celebrate              │
+                       └───────────────────────────────────────────────┘
 ```
-
-Every arrow is a JSON or function-call boundary defined in `contracts.py`.
-Modules never share state, never import each other's internals, and never
-touch hardware outside their lane.
 
 ## Files
 
 ```
-bbapps/mc_skills/main.py     body server — the ONLY hardware writer owner
-bbapps/minecraft/
-  contracts.py               shared types + grid math (pure python, no bbos)
-  skills_client.py           SkillsClient (HTTP) + MockSkills (same interface)
-  structure_src.py           .nbt import, structure.json, fallback grid web UI
-  perception.py              camera/depth -> Detection list (Readers only)
-  planner.py                 plan_build(): LLM backend + deterministic fallback
-  main.py                    orchestrator app (`run minecraft`)
-  fixtures/                  sample structure + world state for offline dev
+~/bbapps/mc_skills/main.py   body server — ONLY hardware writer owner
+bot-code/
+  contracts.py               shared types (pure python, no bbos) — FROZEN
+  skills_client.py           SkillsClient (HTTP) + MockSkills
+  structure_src.py           .nbt import, structure.json, grid web UI :8005
+  structure_rx.py            STAGED: TCP :5005 receiver per WIRE_FORMAT.md
+  perception.py              Scan world model, gate, verify_* — DONE
+  planner.py                 one-shot plan_build() — deterministic + LLM
+  agent.py                   STAGED: per-step reasoning loop (see below)
+  main.py                    orchestrator (`run minecraft` equivalent)
+  fixtures/                  structure_house.json, world_state.json,
+                             scan_sample.json (boxes+anchor+stacked+heights)
 ```
 
-## Contracts — freeze these first
+## Contracts
 
-`contracts.py` is the single source of truth. If you change it, tell the team.
+`contracts.py` is the single source of truth — frozen, changes need team
+agreement. Perception-local types (`Scan`, `ANCHOR_ID`, `is_in_grid`,
+anchor-relative `cell_center`) currently live in `perception.py`, marked as
+candidates for promotion — do NOT edit contracts.py unilaterally.
 
 ```python
 Block(x, y, z, kind)            # minecraft cell; y = layer (0 = on table)
 Structure(blocks)               # target spec; .layers(), .supported()
-Detection(id, pos, color, size) # a physical box; pos = base-frame xyz meters
-Action(kind, box_id, cell)      # 'pick' uses box_id; 'place' uses cell=(x,y,z)
-Plan(actions, narration)        # pick/place alternate pairwise + voice lines
-
-cell_center(x, y, z) -> [bx, by, bz]   # minecraft cell -> base-frame position
+Detection(id, pos, color, size) # physical box; pos = base-frame xyz meters
+Action(kind, box_id, cell)      # 'pick' | 'place'
+Plan(actions, narration)
 ```
 
-JSON on disk:
-- `structure.json`: `{"blocks": [{x,y,z,kind}, ...]}`
-- `world_state.json`: `{"detections": [{id, pos:[x,y,z], color, size}, ...]}`
+Wire → contract: mod sends `{origin,size,count,palette,blocks:[[x,y,z,i]]}`,
+MC axes +X east/+Z south/+Y up; coords relative to origin. MC `y` = our layer.
+Receiver: accept → **read to EOF** (half-close framing) → parse →
+`save_structure`. Backlog ≥8, sends can overlap. See `../WIRE_FORMAT.md`.
 
-Module boundaries:
+## perception.py — DONE (Readers only, live-safe)
 
-| producer | artifact / call | consumer |
-|---|---|---|
-| structure_src | `load_structure(path) -> Structure` | orchestrator |
-| perception | `detect_boxes(mock=?) / scan_all(...) -> list[Detection]` | orchestrator |
-| planner | `plan_build(structure, boxes, backend) -> Plan` | orchestrator |
-| mc_skills | HTTP API (below) | orchestrator, any dev's curl |
+- `scan(mock=False) -> Scan` — ArUco `DICT_4X4_50` (marker id = box id, 99 =
+  anchor) → pixel mask → median `camera.points` → base-frame pos; grid gate
+  splits `boxes`/`stacked`.
+- `is_in_grid(pos, anchor)`, `cell_center(x,y,z,anchor)`, `resolve_anchor`,
+  `column_heights(cells, anchor)` — measured stack tops (90th-pct z disk).
+- `verify_pick(box)` — marker gone/moved from old spot.
+  `verify_place(cell, anchor, expected_top)` — measured z ≈ expected.
+- `scan_all(skills, mock, sweeps)` — compat wrapper used by main.py.
+- **Debug viz:** `uv run perception.py --viz [--mock]` → :8007 top-down map
+  (robot, grid, loose/stacked markers, anchor) + live head-cam feed.
+- Prep: print markers 0..N-1 + id 99 anchor. Fallbacks: color blobs →
+  hardcoded positions.
+- ⚠️ FIRST LIVE CHECK: confirm `camera.points` is pixel-aligned to the left
+  half of head rgb (compare shapes) before trusting positions.
 
-## mc_skills — the body server (port 8006)
+## agent.py — STAGED (the reasoning loop)
+
+The build memory lives in CODE, not the model's context:
+
+```python
+BuildState { placed: set[cell], loose: {id: Detection}, used_boxes: set,
+             anchor, column_heights, history }
+think(state, last_result) -> Step   # backends: openai | mcp | deterministic
+validate(step, state) -> str|None   # reject illegal: occupied/unsupported
+                                    # cell, reused/gated box
+run(structure, skills, detect_fn, max_steps)
+```
+
+LLM ops (strict JSON schema, `reason` field first): `pick_place{box_id,cell,
+say}` | `scan` (rotate+re-detect until loose box found) | `approach{box_id}`
+(rotate to bearing → `/drive` fwd → re-detect → pick) | `done`.
+Per turn: refresh Scan → think → validate → execute → verify_pick/
+verify_place → on failure append error to history and loop. `max_steps` caps
+runaway. Deterministic think() mirrors `plan_deterministic` — demo survives a
+dead API. Rule: LLM chooses WHICH box → WHICH cell; never positions/joints.
+
+## mc_skills — body server (:8006)
 
 ```bash
-uv run ~/bbapps/mc_skills/main.py          # real: claims all writers at boot
-MOCK=1 uv run ~/bbapps/mc_skills/main.py   # fake: same API, no bbos import
+uv run ~/bbapps/mc_skills/main.py          # real: claims writers at boot
+MOCK=1 uv run ~/bbapps/mc_skills/main.py   # same API, no bbos — laptops
 ```
 
-Endpoints (POST json unless noted): `GET /health`, `GET /state`,
-`/home`, `/park`, `/goto {pos,quat?,duration}`, `/pick {pos}`,
-`/place {pos}`, `/gripper {open}`, `/rotate {rad}`, `/say {text}`,
-`/celebrate`. All responses: `{ok: bool, result|error}`.
-Calls are serialized by an internal lock — concurrent requests get
-`{ok:false, error:"busy"}`.
+Endpoints: `GET /health` `/state`, POST `/home` `/park`
+`/goto{pos,quat?,duration}` `/pick{pos}` `/place{pos}` `/gripper{open}`
+`/rotate{rad}` `/say{text}` `/celebrate`; **`/drive{v,w,secs}` staged** for
+approach moves. Responses `{ok, result|error}`; serialized by a lock —
+concurrent calls get `busy`.
 
-Internally: `pick` = approach `+APPROACH_H` above target → descend → close
-gripper → lift. `place` = mirror. Gripper open/close are motor-turn constants
-loaded from the arm's `ranges.calibration.json` — verify direction with
-`POST /gripper` before stacking anything. `DOWN_QUAT` is the top-down EE
-orientation — TUNE on robot.
+pick = approach +APPROACH_H → descend → grip → lift; place = mirror. TUNE on
+robot: `grip_open`/`grip_closed` direction (test `POST /gripper`), `DOWN_QUAT`
+top-down orientation, `APPROACH_H`. Add endpoints, don't rename.
 
-Working on this module: you own `Arm`/`Body` and the endpoint handlers. You
-may add endpoints (e.g. `/handoff`, `/wiggle`) — add, don't rename. Anyone
-testing needs the robot or `MOCK=1`.
+## structure_src / structure_rx — the Minecraft side
 
-## structure_src — the Minecraft side (no robot needed)
+- `structure_rx.py` (staged, new file — anyone can grab): TCP :5005 server,
+  read-to-EOF, wire payload → `save_structure`. Run as thread in main.py or
+  standalone. Empty scan never connects — silence isn't data.
+- `load_structure(path)`: `.json` or `.nbt` (nbtlib).
+- `serve_grid_ui(:8005)`: click-grid → `fixtures/structure.json`. Guaranteed
+  fallback if mod plumbing stalls — judges can't tell the difference.
 
-`load_structure(path)`: `.json` -> parse, `.nbt` -> parse structure-block
-export (nbtlib; skips air/structure_void, maps `minecraft:foo` -> `foo`).
+## planner.py — one-shot fallback
 
-`serve_grid_ui(port=8005)`: standalone click-grid web page (`uv run
-structure_src.py`) — place blocks on an 8x8 grid with a layer selector, SAVE
-writes `fixtures/structure.json`. This is the guaranteed input path; a live
-mod/websocket hook is a stretch goal that just writes the same file.
-
-## perception — box detection (Readers only, live-safe)
-
-`detect_boxes(mock=False) -> list[Detection]`: grabs `camera.head.rgb` (split
-to left via `Config("cam_head").split`) + `camera.points`, runs ArUco
-detection (`cv2.aruco`, `DICT_4X4_50`; marker id == box id), takes the median
-base-frame position of pointcloud samples under each marker's pixel mask.
-
-`scan_all(skills, mock, sweeps)`: repeat detect + optional `/rotate` between
-sweeps to cover more of the room; merges by id.
-
-Prep: print ArUco markers 0..7, tape one face of each box. Fallbacks if
-fiducials fail: color/contour blob segmentation, or hardcoded box positions.
-Offline dev: `python perception.py --mock` serves `fixtures/world_state.json`.
-
-VERIFY on first live run: that `camera.points` is pixel-aligned to the left
-half of the head image (check shapes; swap or index differently if off).
-
-## planner — reasoning (pure functions, laptop-only)
-
-`plan_build(structure, boxes, backend="auto") -> Plan`:
-- `"deterministic"`: sorts target cells bottom-up (y, then x, z), assigns the
-  nearest unused box by XY distance. Zero dependencies — the demo always has
-  this path.
-- `"llm"`: one OpenAI call (`OPENAI_API_KEY` env). Prompt gives the block
-  list + box positions; response is `{"steps":[{box_id, cell, say}]}`. Output
-  is *validated* (legal cells, existing ids, support ordering) and ANY failure
-  falls back to deterministic.
-
-Rule: the LLM chooses *which box goes where* and writes narration. It never
-emits positions or joint values — coordinates come from `cell_center()` and
-IK inside mc_skills. LLM = planner, not controller.
+`plan_build(structure, boxes, backend="auto")` — used by `--mode oneshot`.
+LLM call validated (legal cells, existing ids, support order); any failure →
+deterministic. Keep it: it's the safety net under the agent loop.
 
 ## orchestrator — main.py
 
-State machine: load structure -> `skills.home()` -> `scan_all` ->
-`plan_build` -> loop (say -> pick(box.pos) -> place(cell_center(cell))) ->
-`celebrate`. Missing boxes are skipped with a warning, not fatal.
+`--mode agent|oneshot` (agent staged): load structure → `skills.home()` →
+loop or `plan_build` → execute → celebrate. Missing boxes warn, don't die.
 
 ```bash
-uv run main.py --mock                                   # whole pipeline, no robot
-uv run main.py --structure fixtures/structure_house.json
-uv run main.py --grid-ui                                # browser build first
-uv run main.py --planner deterministic                  # no API key needed
-uv run main.py --sweeps 4                               # rotate between scans
+uv run main.py --mock        # whole pipeline, no robot — DO THIS FIRST
 ```
 
-## Parallel-dev rules (the whole point of this layout)
+## Parallel-dev rules (the point of this layout)
 
-1. **Only mc_skills opens hardware Writers.** Everything else calls
-   `SkillsClient`/`MockSkills`. If your code needs the robot to do something,
-   it calls HTTP — or the capability gets added as an endpoint in mc_skills.
-2. Readers are fair game anywhere, anytime, in any number of processes.
-3. `contracts.py` is frozen unless the team agrees; it has no bbos import so
-   it works on laptops.
-4. Every module runs without the robot: `--mock` / `MockSkills` / fixtures.
-   Do not block on robot time to develop.
-5. Own your file. Cross-file edits go through the owner or a message —
-   especially `main.py` (the merge point) and `contracts.py` (the contract).
-6. Robot hardware time is serialized by nature — coordinate it in chat; use
-   the running mc_skills server rather than launching your own arm code.
+1. **Only mc_skills opens hardware Writers.** Everything else → SkillsClient.
+2. Readers are fair game — any process, any time.
+3. `contracts.py` frozen; `main.py` is the merge point — both need owner
+   sign-off for edits. New functionality = new file or your own file.
+4. Self-contained modules: types you need but can't put in contracts yet live
+   in YOUR file with a "candidate for contracts.py" note (see perception.py).
+5. Every module runs robot-free: `--mock`/`MockSkills`/fixtures. Don't block
+   on robot time — it's serialized; coordinate in chat and use the running
+   mc_skills server.
 
-## Runbook (real run)
+## Runbook
 
 ```bash
-# terminal 1 — the body (leave running all session)
-uv run ~/bbapps/mc_skills/main.py
-curl -XPOST localhost:8006/home          # energize + home arms once
-
-# terminal 2 — input (pick one)
-uv run ~/bbapps/minecraft/structure_src.py     # grid UI on :8005, or use .nbt/.json
-
-# terminal 3 — the brain
-cd ~/bbapps/minecraft
-uv run main.py --structure fixtures/structure_house.json
+# body — leave running
+uv run ~/bbapps/mc_skills/main.py && curl -XPOST localhost:8006/home
+# perception debug (safe alongside body)
+uv run ~/crafter/bot-code/perception.py --viz        # :8007
+# pipeline
+cd ~/crafter/bot-code && uv run main.py --mock       # then real args
 ```
 
 ## Tune-before-demo checklist
 
-- [ ] `POST /gripper {"open":true}` actually opens (flip `grip_open`/
-      `grip_closed` in mc_skills if backwards)
-- [ ] `POST /goto` reaches the build zone; set `DOWN_QUAT` so the gripper is
-      flat/down
-- [ ] `contracts.py`: `BOX_SIZE` = real box edge; `GRID_ORIGIN` = measured
-      position of cell (0,0,0) center
-- [ ] ArUco markers printed + taped, ids 0..N-1
-- [ ] `camera.points` alignment sanity-checked against a known box position
-- [ ] `OPENAI_API_KEY` set if using the llm backend
+- [ ] `POST /gripper` direction; `DOWN_QUAT`; `APPROACH_H`
+- [ ] `BOX_SIZE`, anchor marker placement at cell (0,0)
+- [ ] `camera.points`↔rgb alignment vs tape measure
+- [ ] ArUco printed: boxes 0..N-1 + anchor 99
+- [ ] receiver listening on :5005 before the mod right-click
+- [ ] `OPENAI_API_KEY` if llm/agent backend used
 
-## Fallback ladder (if something stalls, move down, don't get stuck)
+## Fallback ladder — move down, don't get stuck
 
-- structure: live MC hook -> `.nbt` export -> grid UI -> fixture json
-- detection: ArUco -> color blobs -> hardcoded positions
-- planner: llm -> deterministic -> hand-ordered plan.json
-- motion: IK pick/place -> /goto waypoints driven by curl -> mimic
-  record/playback of a demonstrated pick
+- structure: mod TCP → grid UI → fixture json
+- detection: ArUco → color blobs → hardcoded positions
+- reasoning: agent loop → oneshot planner → hand-ordered plan.json
+- motion: IK pick/place → curl /goto waypoints → mimic record/playback

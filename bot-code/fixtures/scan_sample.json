@@ -1,0 +1,22 @@
+{
+  "schema_version": 2,
+  "description": "World-frame geometry only. Mock visibility, robot pose and the live world classifier determine all labels. Anchor axes follow printed marker right/up; the build origin is offset from the marker.",
+  "anchor": {
+    "id": 49,
+    "world": [0.6, 0.25, 0.7],
+    "col": [0.0, -1.0, 0.0],
+    "row": [1.0, 0.0, 0.0]
+  },
+  "observations": [
+    {"id": 0, "world": [0.5, -0.35, 0.725]},
+    {"id": 1, "world": [0.55, 0.55, 0.725]},
+    {"id": 2, "world": [-0.65, 0.15, 0.725]},
+    {"id": 3, "world": [0.4, -0.4, 0.725]},
+    {"id": 4, "world": [-0.3, -0.7, 0.725]},
+    {"id": 5, "world": [0.82, 0.05, 0.725]},
+    {"id": 6, "world": [0.0, 0.8, 0.725]},
+    {"id": 7, "world": [-0.55, -0.5, 0.725]}
+  ],
+  "initial_step": 2,
+  "stack_sequence": [3, 7, 2]
+}
