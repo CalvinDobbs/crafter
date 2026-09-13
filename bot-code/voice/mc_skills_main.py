@@ -50,7 +50,7 @@ import hook
 import moves
 try:
     from packs import set_pack
-    set_pack(os.environ.get("VOICE_PACK", "neutral"))
+    set_pack(os.environ.get("VOICE_PACK", "boxing"))
 except Exception as e:
     print(f"[mc_skills] voice pack init: {e}", flush=True)
 

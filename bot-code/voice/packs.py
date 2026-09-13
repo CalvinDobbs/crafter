@@ -17,6 +17,7 @@ class VoicePack:
     pair: str = "{kind} block, layer {y}, going in"
 
 
+# Telemetry fallback — hardware-true, no personality.
 NEUTRAL = VoicePack(
     id="neutral",
     style="Plain, factual, calm robot telemetry. No jokes.",
@@ -25,30 +26,33 @@ NEUTRAL = VoicePack(
     pair="{kind} block, layer {y}.",
 )
 
+# Demo personality (locked 2026-09-12):
+# calm engineer + light puns + first person + audience-friendly (not J0/J7).
+# Startup catchphrase only: "It's boxing time!"
 BOXING = VoicePack(
     id="boxing",
     style=(
-        "Energetic pit-crew hype for a cardboard-box stacking robot. "
-        "Short punches, sports-announce energy, never mean. "
-        "May reference boxing / boxes wordplay lightly."
+        "Calm first-person engineer narrating a cardboard-box build. "
+        "Audience-friendly words (claw, lift, layer) — never joint names. "
+        "Light wordplay only; stay short and steady. No hype yelling."
     ),
     startup="It's boxing time!",
     templates={
-        "scan.start": "Scouting the ring for boxes.",
-        "plan.ready": "{n} rounds on the card.",
-        "home.start": "Gloves on. Arms waking up.",
-        "pick.approach": "Closing in on box {id}.",
-        "pick.descend": "Dropping in for the grab.",
-        "pick.grasp": "Clamped. Box secured.",
-        "pick.lift": "Up and clear.",
-        "place.approach": "Heading to layer {y}.",
+        "scan.start": "I'm scanning for boxes.",
+        "plan.ready": "{n} boxes on the list.",
+        "home.start": "Waking my arms up.",
+        "pick.approach": "Heading for box {id}.",
+        "pick.descend": "Dropping in carefully.",
+        "pick.grasp": "Got it — claws closed.",
+        "pick.lift": "Lifting clear.",
+        "place.approach": "Taking this to layer {y}.",
         "place.descend": "Lining up the drop.",
-        "place.release": "And it's planted.",
-        "place.retreat": "Backing out clean.",
-        "build.done": "Card done. Still balanced.",
-        "fail": "Slip! Resetting the grip.",
+        "place.release": "And that's planted.",
+        "place.retreat": "Backing off.",
+        "build.done": "Build's done. Still steady.",
+        "fail": "Missed that — opening claws.",
     },
-    pair="{kind} on layer {y} — going in hot.",
+    pair="{kind} for layer {y} — my turn.",
 )
 
 PACKS: dict[str, VoicePack] = {
@@ -56,11 +60,11 @@ PACKS: dict[str, VoicePack] = {
     BOXING.id: BOXING,
 }
 
-_active: str = NEUTRAL.id
+_active: str = BOXING.id
 
 
 def get_pack(name: str | None = None) -> VoicePack:
-    key = (name or _active).strip().lower() or NEUTRAL.id
+    key = (name or _active).strip().lower() or BOXING.id
     if key not in PACKS:
         raise KeyError(f"unknown voice pack {key!r}; have {sorted(PACKS)}")
     return PACKS[key]

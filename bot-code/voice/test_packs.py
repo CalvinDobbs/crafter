@@ -19,9 +19,9 @@ def test_pack_switch_changes_lines() -> None:
     flavor.clear_script()
     b = narrator.line("pick.grasp", {"id": 3})
     assert n == "Closing the J7 gripper.", n
-    assert b == "Clamped. Box secured.", b
+    assert b == "Got it — claws closed.", b
     assert n != b
-    packs.set_pack("neutral")
+    packs.set_pack("boxing")
     print("  ok")
 
 
@@ -31,8 +31,10 @@ def test_template_prewrite() -> None:
     events = events_from_plan(plan)
     script = flavor.prewrite(events, pack="boxing", flavor="template")
     assert script
-    assert any("boxing" in v.lower() or "box" in v.lower() or "Clamped" in v
-               or "rounds" in v.lower() for v in script.values())
+    assert any(
+        "claw" in v.lower() or "box" in v.lower() or "layer" in v.lower()
+        or "scanning" in v.lower() or "planted" in v.lower()
+        for v in script.values()), script
     # narrator should prefer script overrides
     text = narrator.line("plan.ready", {"n": 2})
     assert text == script[flavor.script_key("plan.ready", {"n": 2})]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 from typing import Callable
 
 from narrator import EVENTS, line
@@ -128,6 +129,19 @@ def _openai_rewrite(
     return out
 
 
+def _resolve_openai_key() -> str | None:
+    """Env first, then shared bot file ~/.config/crafter/openai_api_key."""
+    value = os.environ.get("OPENAI_API_KEY", "").strip()
+    if value:
+        return value
+    path = Path.home() / ".config" / "crafter" / "openai_api_key"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        return text or None
+    except OSError:
+        return None
+
+
 def prewrite(
     events: list[tuple[str, dict]],
     pack: str | VoicePack | None = None,
@@ -141,7 +155,7 @@ def prewrite(
 
     flavor:
       - template: pack templates only
-      - openai: one OpenAI rewrite pass (needs OPENAI_API_KEY); else templates
+      - openai: one OpenAI rewrite pass (needs OPENAI_API_KEY or saved bot key); else templates
     """
     vp = pack if isinstance(pack, VoicePack) else get_pack(pack)
     from packs import set_pack
@@ -152,10 +166,13 @@ def prewrite(
         load_script(script)
         return script
 
-    if client_factory is None and not os.environ.get("OPENAI_API_KEY"):
-        print("[voice] OPENAI_API_KEY missing; using templates", flush=True)
-        load_script(script)
-        return script
+    if client_factory is None:
+        key = _resolve_openai_key()
+        if not key:
+            print("[voice] OPENAI_API_KEY missing; using templates", flush=True)
+            load_script(script)
+            return script
+        os.environ["OPENAI_API_KEY"] = key
 
     try:
         script = _openai_rewrite(

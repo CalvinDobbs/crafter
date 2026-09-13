@@ -124,25 +124,31 @@ def _write_preview(text: str) -> Path | None:
 
 
 def prebuild() -> None:
-    """Pre-generate all neutral event wavs so robot does not need local synthesis."""
+    """Pre-generate pack template wavs so robot does not need local synthesis."""
     from narrator import EVENTS, line
+    from packs import PACKS, set_pack
+
     WAVS.mkdir(parents=True, exist_ok=True)
     CACHE.mkdir(parents=True, exist_ok=True)
     voice = os.environ.get("SAY_VOICE", "")
 
-    texts = set()
-    for ev in EVENTS:
-        texts.add(line(ev))
-    for n in range(1, 9):
-        texts.add(line("plan.ready", {"n": n}))
-    for box_id in range(10):
-        texts.add(line("pick.approach", {"id": box_id}))
-    for layer in range(5):
-        texts.add(line("place.approach", {"y": layer}))
+    texts: set[str] = set()
+    for pack_id, pack in PACKS.items():
+        set_pack(pack_id)
+        if pack.startup:
+            texts.add(pack.startup)
+        for ev in EVENTS:
+            texts.add(line(ev))
+        for n in range(1, 9):
+            texts.add(line("plan.ready", {"n": n}))
+        for box_id in range(10):
+            texts.add(line("pick.approach", {"id": box_id}))
+        for layer in range(5):
+            texts.add(line("place.approach", {"y": layer}))
+            texts.add(pack.pair.format(kind="block", y=layer, id=0))
+            texts.add(pack.pair.format(kind="dirt", y=layer, id=1))
 
-    for t in sorted(texts):
-        if not t:
-            continue
+    for t in sorted(x for x in texts if x):
         h = hashlib.sha1(f"{voice}\0{t}".encode()).hexdigest()[:16]
         c_dest = CACHE / f"{h}.wav"
         w_dest = WAVS / f"{h}.wav"

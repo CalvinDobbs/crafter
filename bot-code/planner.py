@@ -100,8 +100,14 @@ def _attach_voice(plan: Plan, structure: Structure,
     Never changes actions. Fail-open to pack templates.
     Env defaults: VOICE_PACK=neutral, VOICE_FLAVOR=template|openai.
     """
-    pack_id = (voice_pack or os.environ.get("VOICE_PACK", "neutral")).strip()
-    flavor = (voice_flavor or os.environ.get("VOICE_FLAVOR", "template")).strip()
+        pack_id = (voice_pack or os.environ.get("VOICE_PACK", "boxing")).strip()
+        flavor = (voice_flavor or os.environ.get("VOICE_FLAVOR", "template")).strip()
+        # AGENTS.md: mock never contacts the model unless explicitly allowed.
+        if (flavor == "openai" and os.environ.get("MOCK") == "1"
+                and os.environ.get("ALLOW_API_WITH_MOCK") != "1"):
+            print("[planner] voice openai skipped under MOCK (set ALLOW_API_WITH_MOCK=1)",
+                  flush=True)
+            flavor = "template"
     try:
         from pathlib import Path
         import sys
