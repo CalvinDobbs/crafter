@@ -333,7 +333,13 @@ class Rig:
     # -- base --------------------------------------------------------------
 
     def measured_yaw(self):
-        """Body yaw in radians from the IMU, or None when it is unavailable.
+        """Body yaw in RADIANS from the IMU, or None when it is unavailable.
+
+        imu.orientation.rpy is published in DEGREES, and unbounded rather than wrapped. Reading it
+        as radians makes every increment ~57x too large, which is how a survey once accumulated
+        tens of thousands of degrees from a quarter turn. Measured on bracketbot-184: a stationary
+        robot's yaw moved 2.5 degrees over 4 seconds, so this is precise enough to close a loop on
+        a quarter turn and not precise enough to trust over a long one.
 
         Read-only: readers are unlimited, so this competes with nothing.
         """
@@ -342,7 +348,7 @@ class Rig:
         try:
             if not self._r_imu.ready():
                 return None
-            return float(np.asarray(self._r_imu.data["rpy"], dtype=np.float64)[2])
+            return math.radians(float(np.asarray(self._r_imu.data["rpy"], dtype=np.float64)[2]))
         except Exception:
             return None
 
