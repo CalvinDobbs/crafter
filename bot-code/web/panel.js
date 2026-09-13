@@ -14,6 +14,12 @@ class VoxelView {
     this.blocks = [];
     this.placed = new Set();
     this.active = null;
+    this.action = null;
+    this.loose = [];
+    this.carried = 0;        // eased toward the action's reported fraction, which arrives in steps
+    this.flashes = new Map();
+    this.animating = false;
+    this.spin = 0;
     this.selected = null;
     this.identity = null;
     this.mode = 'design';
@@ -67,7 +73,7 @@ class VoxelView {
     this.zoom = 1;
     this.invalidate();
   }
-  set(design, mode, placed, active) {
+  set(design, mode, placed, active, action, loose) {
     const identity = design ? design.id : 'empty';
     if (identity !== this.identity) {
       this.identity = identity;
@@ -76,12 +82,62 @@ class VoxelView {
     }
     this.blocks = design ? design.blocks : [];
     this.extents = design ? design.size : [3, 2, 3];
-    this.center = [this.extents[0] / 2, this.extents[1] / 2 - .15, this.extents[2] / 2];
+    this.loose = loose || [];
+    // Frame the whole workspace, not just the target: the pile has to be on screen for a box to
+    // be watched leaving it.
+    const points = this.blocks.map(b => [b.x, b.y, b.z]).concat(this.loose);
+    if (!points.length) points.push([0, 0, 0], [this.extents[0] - 1, this.extents[1] - 1, this.extents[2] - 1]);
+    const low = [0, 1, 2].map(i => Math.min(...points.map(p => p[i])));
+    const high = [0, 1, 2].map(i => Math.max(...points.map(p => p[i])) + 1);
+    this.center = [(low[0] + high[0]) / 2, (low[1] + high[1]) / 2 - .15, (low[2] + high[2]) / 2];
+    this.span = Math.max(high[0] - low[0], high[1] - low[1], high[2] - low[2], 2);
     this.mode = mode;
-    this.placed = new Set((placed || []).map(p => cellKey(p.cell)));
+    const settled = new Set((placed || []).map(p => cellKey(p.cell)));
+    for (const key of settled) if (!this.placed.has(key)) this.flashes.set(key, performance.now());
+    this.placed = settled;
     this.active = active ? cellKey(active) : null;
+    if (!action || !this.action || action.operation !== this.action.operation) this.carried = action ? action.fraction : 0;
+    this.action = action || null;
     this.invalidate();
   }
+
+  animate(on) {
+    if (on === this.animating) return;
+    this.animating = on;
+    if (!on) return;
+    const step = () => {
+      if (!this.animating) return;
+      // A slow orbit while the agent works, surrendered the moment the viewer takes hold.
+      if (!this.drag) this.yaw += .0015;
+      if (this.action) this.carried += (this.action.fraction - this.carried) * .06;
+      this.draw();
+      this.spin = requestAnimationFrame(step);
+    };
+    this.spin = requestAnimationFrame(step);
+  }
+  inFlight() {
+    // The one box in hand: resting, rising off the pile, crossing to the site, or descending.
+    const a = this.action;
+    if (this.mode !== 'build' || !a || !a.origin) return null;
+    const ease = t => t * t * (3 - 2 * Math.max(0, Math.min(1, t)));
+    const clamp01 = t => Math.max(0, Math.min(1, t));
+    const from = a.origin, to = a.cell, LIFT = 2.6;
+    if (a.operation === 'pickup') {
+      // Nothing leaves the floor until the grasp has it; the lift is the second half of the move.
+      const rise = a.phase === 'lifting' ? ease(clamp01((this.carried - .5) * 2)) : 0;
+      return {x: from[0], y: from[1] + LIFT * rise, z: from[2], flying: true};
+    }
+    if (a.operation === 'move_to_build' && to) {
+      const t = ease(clamp01(this.carried));
+      return {x: from[0] + (to[0] - from[0]) * t, y: to[1] + LIFT, z: from[2] + (to[2] - from[2]) * t, flying: true};
+    }
+    if (a.operation === 'place' && to) {
+      // Seated a little before the motion ends: what is left is releasing and retreating.
+      return {x: to[0], y: to[1] + LIFT * (1 - ease(clamp01(this.carried * 1.35))), z: to[2], flying: true};
+    }
+    return null;
+  }
+
   invalidate() {
     if (this.pending) return;
     this.pending = true;
@@ -115,8 +171,9 @@ class VoxelView {
     const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.fillStyle = '#f7f3ee'; ctx.fillRect(0, 0, this.width, this.height);
-    const span = Math.max(...this.extents, 2);
-    this.scale = Math.min(this.width, this.height) * .68 / (span + 1.6) * this.zoom;
+    const span = this.span || Math.max(...this.extents, 2);
+    const fill = this.loose.length ? .84 : .68, pad = this.loose.length ? .8 : 1.6;
+    this.scale = Math.min(this.width, this.height) * fill / (span + pad) * this.zoom;
     this.distance = span * 4 + 12;
     const radius = Math.min(Math.ceil(span / 2) + 4, 40);
     const cx = this.center[0], cz = this.center[2];
@@ -135,7 +192,11 @@ class VoxelView {
       {v: [0, 3, 7, 4], color: '#ba8246'}, {v: [1, 5, 6, 2], color: '#ce9857'}
     ];
     const faces = [];
-    for (const block of this.blocks) {
+    const carried = this.inFlight();
+    const drawn = this.blocks
+      .concat(this.loose.map(c => ({x: c[0], y: c[1], z: c[2], loose: true})))
+      .concat(carried ? [carried] : []);
+    for (const block of drawn) {
       const x = block.x + .025, y = block.y + .015, z = block.z + .025, s = .95, h = .97;
       const vertices = [[x,y,z],[x+s,y,z],[x+s,y+h,z],[x,y+h,z],[x,y,z+s],[x+s,y,z+s],[x+s,y+h,z+s],[x,y+h,z+s]].map(p => this.project(p));
       const key = cellKey([block.x, block.y, block.z]);
@@ -144,8 +205,12 @@ class VoxelView {
         const edge1 = [points[1][0] - points[0][0], points[1][1] - points[0][1]];
         const edge2 = [points[2][0] - points[0][0], points[2][1] - points[0][1]];
         if (edge1[0] * edge2[1] - edge1[1] * edge2[0] < 0) continue;
+        const flying = block.flying === true, loose = block.loose === true;
         faces.push({points, depth: points.reduce((sum, p) => sum + p[2], 0) / 4, color: def.color, block, key, face: i,
-          ghost: this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key), active: key === this.active || key === this.selected});
+          ghost: !flying && !loose && this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key),
+          loose,
+          flying, flash: this.flashes.has(key) ? Math.max(0, 1 - (performance.now() - this.flashes.get(key)) / 1400) : 0,
+          active: key === this.active || key === this.selected});
       }
     }
     faces.sort((a, b) => a.depth - b.depth);
@@ -154,8 +219,9 @@ class VoxelView {
       this.path(face.points);
       ctx.fillStyle = face.ghost ? (face.active ? '#b8494630' : '#aa92821a') : face.color;
       ctx.fill();
-      ctx.strokeStyle = face.active ? '#b84946' : face.placed ? '#397253' : face.ghost ? '#9f897a' : '#533c2690';
-      ctx.lineWidth = face.active ? 2 : 1;
+      if (face.flash > 0) { ctx.fillStyle = `rgba(57,114,83,${(face.flash * .45).toFixed(3)})`; ctx.fill(); }
+      ctx.strokeStyle = face.flying || face.active ? '#b84946' : face.placed ? '#397253' : face.loose ? '#8a6f5e' : face.ghost ? '#9f897a' : '#533c2690';
+      ctx.lineWidth = face.flying || face.active ? 2 : 1;
       ctx.stroke();
       if (!face.ghost && (face.face === 3 || face.face === 0 || face.face === 1)) {
         const p = face.points;
@@ -195,10 +261,6 @@ const views = {
 };
 
 function text(id, value) { const node = byId(id); if (node.textContent !== String(value)) node.textContent = value; }
-function elapsed(start, end) {
-  const seconds = Math.max(0, Math.floor(((end || Date.now() / 1000) - start)));
-  return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
-}
 function notice(message) {
   clearTimeout(toastTimer);
   text('toast', message); byId('toast').hidden = false;
@@ -217,11 +279,11 @@ async function command(path, data) {
   } catch (error) { notice(error.message); }
   finally { submitting = false; if (state) render(state); }
 }
-function scene(name, design, mode, placed, active) {
-  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null]);
+function scene(name, design, mode, placed, active, action, loose) {
+  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null, action || null, loose || []]);
   if (lastScene[name] !== signature) {
     lastScene[name] = signature;
-    views[name].set(design, mode, placed, active);
+    views[name].set(design, mode, placed, active, action, loose);
     if (name === 'main') byId('selection').hidden = true;
   }
 }
@@ -230,7 +292,7 @@ function eventRows(events) {
   for (const event of events) {
     const d = event.data;
     if (event.type === 'llm_start') {
-      const row = {id: d.call_id, at: event.at, kind: 'model', status: 'running', title: 'Choosing the next step', detail: 'Waiting for the model response.', data: d.input};
+      const row = {id: d.call_id, at: event.at, kind: 'model', status: 'running', title: 'Choosing the next step', detail: 'Choosing the next step.', data: d.input};
       rows.push(row); pending.set(d.call_id, row);
     } else if (event.type === 'llm_result') {
       let row = pending.get(d.call_id);
@@ -239,17 +301,17 @@ function eventRows(events) {
     } else if (event.type === 'llm_error') {
       let row = pending.get(d.call_id);
       if (!row) { row = {id: d.call_id, at: event.at, kind: 'model'}; rows.push(row); }
-      Object.assign(row, {status: 'error', title: 'Model request failed', detail: d.error, data: null});
+      Object.assign(row, {status: 'error', title: 'Decision failed', detail: d.error, data: null});
     } else if (event.type === 'tool_start') {
-      const row = {id: d.request_id, at: event.at, kind: 'tool', status: 'running', title: `${d.operation}()`, detail: 'Simulating this action. No hardware will move.', data: d.arguments};
+      const row = {id: d.request_id, at: event.at, kind: 'tool', status: 'running', title: `${d.operation}()`, detail: 'Running this action.', data: d.arguments};
       rows.push(row); pending.set(d.request_id, row);
     } else if (event.type === 'tool_result') {
       const row = pending.get(d.request_id);
-      if (row) { row.status = 'complete'; row.detail = 'Simulated success'; }
+      if (row) { row.status = 'complete'; row.detail = 'Succeeded'; }
     } else if (event.type === 'placement_confirmed') {
-      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: `Box ${d.box_id} placed`, detail: `Cell [${d.cell.join(', ')}] verified in the simulated scene.`});
+      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: `Box ${d.box_id} placed`, detail: `Cell [${d.cell.join(', ')}] verified.`});
     } else if (event.type === 'site_selected') {
-      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: 'Build spot selected', detail: `${d.site_id} / simulated clear floor`});
+      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: 'Build spot selected', detail: `${d.site_id} / clear floor`});
     } else if (event.type === 'model_rejected') {
       rows.push({id: String(event.id), at: event.at, kind: 'model', status: 'error', title: 'Decision rejected', detail: `${d.error}. Retrying within the request budget.`});
     }
@@ -269,9 +331,8 @@ function renderFeed(job) {
     const article = document.createElement('article'); article.className = `event ${row.kind} ${row.status}`;
     const dot = document.createElement('span'); dot.className = 'event-dot'; article.append(dot);
     const meta = document.createElement('div'); meta.className = 'event-meta';
-    const kind = document.createElement('span'); kind.className = 'event-kind'; kind.textContent = row.kind === 'model' ? 'LLM DECISION' : row.kind === 'tool' ? 'TOOL CALL / MOCK' : 'SCENE UPDATE';
-    const stamp = document.createElement('time'); stamp.textContent = elapsed(job.started_at, row.at);
-    meta.append(kind, stamp); article.append(meta);
+    const kind = document.createElement('span'); kind.className = 'event-kind'; kind.textContent = row.kind === 'model' ? 'DECISION' : row.kind === 'tool' ? 'TOOL CALL' : 'SCENE UPDATE';
+    meta.append(kind); article.append(meta);
     const title = document.createElement('h3'); title.textContent = row.title; article.append(title);
     const detail = document.createElement('p'); detail.textContent = row.detail || ''; article.append(detail);
     if (row.status === 'running' || row.status === 'error' || row.duration !== undefined) {
@@ -296,15 +357,8 @@ function renderFeed(job) {
 function render(s) {
   const screen = s.view || 'main', design = s.design, job = s.job;
   for (const section of document.querySelectorAll('[data-screen]')) section.hidden = section.dataset.screen !== screen;
-  const order = ['main', 'build', 'complete'];
-  for (const step of document.querySelectorAll('[data-step]')) {
-    step.classList.toggle('active', step.dataset.step === screen);
-    step.classList.toggle('passed', order.indexOf(step.dataset.step) < order.indexOf(screen));
-  }
-  const connection = byId('connection');
-  connection.classList.toggle('offline', !connected);
-  connection.lastChild.textContent = connected ? 'Panel online' : 'Disconnected';
-  text('main-title', design ? 'A shape worth building.' : 'Your next build starts here.');
+  if (window.debugScreen) window.debugScreen.sync(s);
+  byId('connection').hidden = connected;
   byId('configuration-warning').hidden = s.llm_ready;
   byId('save-api-key').disabled = submitting || s.worker_busy;
   byId('waiting').hidden = !!design;
@@ -313,44 +367,35 @@ function render(s) {
   const enabled = !!(connected && design && design.buildable && s.llm_ready && !s.worker_busy && !submitting);
   byId('start-build').disabled = !enabled;
   byId('clear-blueprint').disabled = !connected || !design || submitting;
-  text('start-hint', s.worker_busy && screen === 'main' ? 'Finishing the cancelled model request. You can start again shortly.' : !design ? 'Receive a design to get started.' : !s.llm_ready ? 'Configure your API key to enable real reasoning.' : !design.buildable ? 'Adjust the schematic and scan it again.' : 'Uses the model API. Physical actions are simulated.');
-  byId('load-example').disabled = submitting;
-  text('receiver-detail', s.receiver.listening ? `Minecraft receiver ready on TCP :${s.receiver.port} · latest design only` : s.receiver.error || 'Minecraft receiver is starting');
-  document.querySelector('.receiver-port').textContent = `TCP :${s.receiver.port}`;
-  const receiveLabel = document.querySelector('#main-screen .live-label');
-  receiveLabel.lastChild.textContent = s.receiver.listening ? 'Listening for designs' : 'Receiver unavailable';
   byId('receive-notice').hidden = !s.notice;
   if (s.notice) text('receive-notice', s.notice);
   scene('main', design, 'design', [], null);
   if (job) {
     const total = job.design.count, placed = job.placed.length, percent = Math.round(placed / total * 100);
     const running = job.status === 'running';
-    text('build-title', job.status === 'failed' ? 'The build needs attention.' : 'Making the shape happen.');
     byId('cancel-build').hidden = !running; byId('cancel-build').disabled = submitting;
     byId('failed-back').hidden = running; byId('failed-back').disabled = submitting;
     byId('build-error').hidden = !job.error;
-    if (job.error) text('build-error', `${job.error} No robot hardware was involved. You can return to the design and try again.`);
+    if (job.error) text('build-error', `${job.error} You can return to the design and try again.`);
     byId('new-design-notice').hidden = !design || job.design.id === design.id;
     text('reasoning-text', job.reasoning);
     text('phase-label', phases[job.phase] || job.phase);
     const rows = eventRows(job.events), latest = rows.length ? rows[rows.length - 1] : null;
     const thinking = running && latest && latest.kind === 'model' && latest.status === 'running';
     byId('thinking-indicator').classList.toggle('busy', !!thinking);
-    text('thinking-label', thinking ? 'ASKING THE MODEL' : 'AGENT REASONING');
+    text('thinking-label', thinking ? 'CHOOSING THE NEXT STEP' : 'AGENT REASONING');
     text('progress-label', `${placed} / ${total} boxes placed`);
     text('progress-percent', `${percent}%`);
     byId('progress-fill').style.width = `${percent}%`;
     document.querySelector('.progress-track').setAttribute('aria-valuenow', String(percent));
-    text('current-action', job.current_tool ? labels[job.current_tool] || job.current_tool : thinking ? 'Waiting for model response' : running ? 'Checking the next step' : job.status === 'completed' ? 'Build verified' : 'Build stopped');
-    text('elapsed', elapsed(job.started_at, job.finished_at));
+    text('current-action', job.current_tool ? labels[job.current_tool] || job.current_tool : thinking ? 'Choosing the next step' : running ? 'Checking the next step' : job.status === 'completed' ? 'Build verified' : 'Build stopped');
     text('llm-count', job.llm_calls); text('tool-count', job.tool_calls);
     byId('feed-live').hidden = !running;
-    scene('build', job.design, 'build', job.placed, job.current_cell);
+    scene('build', job.design, 'build', job.placed, job.current_cell, job.action, job.loose);
+    views.build.animate(running && screen === 'build');
     scene('complete', job.design, 'complete', job.placed, null);
     renderFeed(job);
-    text('complete-description', `Your ${total}-box shape is complete. Every placement has been verified in the simulated scene.`);
-    text('complete-boxes', placed); text('complete-time', elapsed(job.started_at, job.finished_at)); text('complete-tools', job.tool_calls);
-    text('complete-next', design && design.id !== job.design.id ? 'A newer Minecraft design is ready on the main screen.' : 'Ready for the next idea.');
+    text('complete-boxes', placed); text('complete-tools', job.tool_calls);
     byId('back-main').disabled = submitting;
   }
   if (views[screen]) views[screen].invalidate();
@@ -368,7 +413,6 @@ byId('clear-blueprint').addEventListener('click', () => { if (state && state.des
 byId('cancel-build').addEventListener('click', () => command('/api/cancel', {job_id: state.job.id}));
 byId('failed-back').addEventListener('click', () => command('/api/main'));
 byId('back-main').addEventListener('click', () => command('/api/main'));
-byId('load-example').addEventListener('click', () => command('/api/example'));
 byId('api-key-form').addEventListener('submit', async event => {
   event.preventDefault();
   const input = byId('api-key');
@@ -388,7 +432,7 @@ async function poll() {
   } catch (error) {
     connected = false;
     if (state) render(state);
-    else { byId('connection').classList.add('offline'); byId('connection').lastChild.textContent = 'Disconnected'; }
+    else byId('connection').hidden = false;
   } finally { setTimeout(poll, 350); }
 }
 poll();

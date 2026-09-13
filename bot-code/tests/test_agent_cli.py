@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -44,6 +45,28 @@ class CliTests(unittest.TestCase):
                                  capture_output=True, text=True, timeout=10)
         self.assertNotEqual(process.returncode, 0)
         self.assertIn("allow-api-with-mock", process.stderr)
+
+    def test_the_panel_refuses_to_start_off_the_robot(self):
+        """The key, the cameras and the arms are all on the bot; a panel here has none of them.
+
+        Both directions are forced with a stub rather than read off this machine, so the check
+        means the same thing whether it runs on a developer PC or on the robot itself.
+        """
+        with tempfile.TemporaryDirectory() as stub:
+            (pathlib.Path(stub) / "bbos.py").write_text("# stand-in for the robot runtime\n")
+            def panel(*extra, robot):
+                environment = dict(os.environ, PYTHONPATH=stub if robot else "")
+                return subprocess.run([sys.executable, "-B", "-S", str(ROOT / "main.py"), "--ui", *extra],
+                                      cwd=tempfile.gettempdir(), capture_output=True, text=True,
+                                      timeout=10, env=environment)
+
+            refused = panel(robot=False)
+            self.assertEqual(refused.returncode, 2)
+            self.assertIn("the panel runs on the robot", refused.stderr)
+            self.assertIn("-L 127.0.0.1:8005:127.0.0.1:8005", refused.stderr)
+            self.assertNotIn("Traceback", refused.stderr)
+            for allowed in (panel(robot=True), panel("--ui-without-robot", robot=False)):
+                self.assertNotIn("the panel runs on the robot", allowed.stderr)
 
     def test_help_and_incomplete_build(self):
         help_result = subprocess.run([sys.executable, "-B", "-S", str(ROOT / "main.py"), "--help"],

@@ -1,6 +1,7 @@
 package com.calvin.posstream;
 
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
@@ -36,6 +37,10 @@ public class StructureScannerItem extends Item {
 	private static final int MIN_Y = 1;
 	private static final int MAX_Y = 64;
 
+	/** Ring of sparks thrown up on a right click, so a scan is visible from outside the chat line. */
+	private static final int PARTICLE_COUNT = 48;
+	private static final double PARTICLE_RADIUS = 1.6;
+
 	private static final Logger LOGGER = LoggerFactory.getLogger("posstream");
 
 	public StructureScannerItem(Properties properties) {
@@ -64,6 +69,8 @@ public class StructureScannerItem extends Item {
 	}
 
 	private void scanAndSend(Level level, Player player) {
+		spawnScanParticles(level, player);
+
 		List<String> palette = new ArrayList<>();
 		Map<Block, Integer> paletteIndices = new HashMap<>();
 		List<int[]> blocks = new ArrayList<>();
@@ -113,6 +120,16 @@ public class StructureScannerItem extends Item {
 				maxX - minX + 1, maxY - minY + 1, maxZ - minZ + 1);
 
 		send(player, json, blocks.size());
+	}
+
+	private void spawnScanParticles(Level level, Player player) {
+		for (int i = 0; i < PARTICLE_COUNT; i++) {
+			double angle = (Math.PI * 2 / PARTICLE_COUNT) * i;
+			double x = player.getX() + Math.cos(angle) * PARTICLE_RADIUS;
+			double z = player.getZ() + Math.sin(angle) * PARTICLE_RADIUS;
+
+			level.addParticle(ParticleTypes.END_ROD, x, player.getY() + 0.2, z, 0.0, 0.12, 0.0);
+		}
 	}
 
 	private String toJson(List<String> palette, List<int[]> blocks,
