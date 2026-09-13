@@ -72,6 +72,7 @@ GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open
 YAW_COMMAND_SIGN = 1.0
 
 YAW_TOL = 0.03          # rad; a turn is finished within this of its target
+IMU_STALE_S = 0.5       # hold the last heading this long; past it the stream is dead
 YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believed
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
@@ -244,6 +245,7 @@ class Rig:
         self.arms = [Arm(s) for s in sides]
         self.by_side = {a.side: a for a in self.arms}
         self.w_drive = Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)
+        self._yaw = None
         try:
             self._r_imu = Reader("imu.orientation", keeptime=False)
         except Exception:       # no IMU: turns fall back to open-loop timing
@@ -352,11 +354,18 @@ class Rig:
         if self._r_imu is None:
             return None
         try:
-            if not self._r_imu.ready():
-                return None
-            return math.radians(float(np.asarray(self._r_imu.data["rpy"], dtype=np.float64)[2]))
+            if self._r_imu.ready():
+                self._yaw = (math.radians(float(np.asarray(self._r_imu.data["rpy"],
+                                                           dtype=np.float64)[2])), time.monotonic())
         except Exception:
+            pass
+        if self._yaw is None:
             return None
+        # ready() is edge-triggered: it is True once per new sample, so a loop polling faster than
+        # the IMU publishes sees False most ticks. Hold the last reading rather than reporting the
+        # heading as unknown between samples, but stop trusting it if the stream actually dies.
+        value, seen = self._yaw
+        return value if time.monotonic() - seen <= IMU_STALE_S else None
 
     def turn_by(self, radians, rate, cancel=None, log=None):
         """Rotate by a measured angle rather than for a computed duration.
