@@ -14,11 +14,13 @@ blocking, which is the intended behaviour.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 
 import numpy as np
 
+from agent import CapabilityError
 from agent_adapters import AgentProviders, FunctionActions, FunctionResult
 from agent_types import ExecutorState, Holding
 
@@ -349,11 +351,26 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
                     voxel_size=None, log=print):
     """Factory for ``--provider actions.provider:build_providers``.
 
-    ``geometry`` resolves an ActionRequest's world-frame site/box against a fresh pose. Without it
-    no operation can be registered, because acting on unresolved geometry would mean moving against
-    a remembered pose. ``observations`` is the perception provider; the agent needs one that
-    advertises sites, occupancy and monitoring before any of this can run.
+    ``load_providers`` calls this with no arguments, so a bare call has to stand up the whole live
+    stack itself: the rig, perception in this same process, the geometry seam and possession. The
+    arguments exist for tests and for callers that already hold those pieces.
+
+    The box edge has to be stated, never guessed: eligibility compares a detected box's size
+    against it within 1%, so a wrong value silently makes every box ineligible. It must match the
+    ``--box-size`` the agent is run with.
     """
+    if voxel_size is None:
+        edge = os.environ.get("CRAFTER_BOX_SIZE")
+        if edge is None:
+            raise CapabilityError(
+                "set CRAFTER_BOX_SIZE to the box edge in metres, matching --box-size; "
+                "it is a measurement, not a default")
+        voxel_size = (float(edge),) * 3
+    if observations is None:
+        from observations import RobotObservations
+        observations = RobotObservations(
+            voxel_size=voxel_size,
+            mock=os.environ.get("CRAFTER_PERCEPTION_MOCK") == "1")
     rig = rig or armctl.Rig(log=log)
     rig.start()
     if geometry is None and observations is not None:
@@ -380,7 +397,10 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
         max_box_size=(0.25, 0.25, 0.25), max_height=1.0, action_timeout=60.0)
 
     def close():
-        """Transports only. Never parks, releases, or torques off a possibly loaded robot."""
+        """Transports and sensors only. Never parks, releases, or torques off a loaded robot."""
         executor.stop()
+        shut = getattr(observations, "close", None)
+        if callable(shut):
+            shut()
 
     return AgentProviders(actions=actions, observations=observations, close=close)
