@@ -354,6 +354,7 @@ def _wrap(executor, routine, resolve):
         try:
             args = resolve(request)
         except Exception as exc:
+            executor.log(f"[provider] {request.step.operation} rejected before moving: {exc}")
             executor.end("rejected")
             return FunctionResult(False, "rejected", type(exc).__name__, effects_started="no")
         try:
@@ -367,6 +368,14 @@ def _wrap(executor, routine, resolve):
             # outcome is what lets the agent retry instead of stopping for an operator.
             executor.end("blocked")
             return FunctionResult(False, "blocked", "blocked_motion", effects_started="unknown")
+        except Exception as exc:
+            # Anything else is an unknown outcome and stays one -- the robot moved and nobody can
+            # say how far it got. But only the exception's class name survives upstream, and the
+            # causes behind one class can need completely different fixes, so say it here.
+            executor.log(f"[provider] {request.step.operation} failed mid-motion: "
+                         f"{type(exc).__name__}: {exc}")
+            executor.end("unknown")
+            raise
         executor.end(phase)
         return FunctionResult(True, phase, effects_started="yes")
     return call
