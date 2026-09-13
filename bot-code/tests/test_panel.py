@@ -449,6 +449,10 @@ class PanelAssetsTests(unittest.TestCase):
                             const background=getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).map(Number);
                             if(Math.min(...background)<230)problems.push('page background is not light');
                             if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
+                            // The screen's own box, not its descendants: content inside a scrolling
+                            // pane is meant to continue past the fold.
+                            const shown=document.querySelector('[data-screen]:not([hidden])').getBoundingClientRect();
+                            if(innerHeight-shown.bottom<8)problems.push('no bottom gutter: '+Math.round(innerHeight-shown.bottom)+'px');
                             const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
                             controls.push('.brand-logo','.header-status');
                             const logo=document.querySelector('.brand-logo'),brand=logo.getBoundingClientRect(),status=document.querySelector('.header-status').getBoundingClientRect();

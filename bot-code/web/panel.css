@@ -230,7 +230,7 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .topbar{flex:none;height:clamp(58px,10.5dvh,96px);padding-inline:clamp(16px,3vw,40px)}
 .brand{min-width:0;height:100%;padding-block:4px}
 .brand-logo{display:block;width:auto;height:clamp(46px,9dvh,84px);max-width:40vw;max-height:100%;object-fit:contain}
-.shell{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;margin:0 auto;padding:clamp(10px,2dvh,22px) clamp(16px,3vw,40px) 0;overflow:hidden}
+.shell{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;margin:0 auto;padding:clamp(10px,2dvh,22px) clamp(16px,3vw,40px);overflow:hidden}
 [data-screen]{flex:1;min-height:0;display:flex;flex-direction:column}
 .page-heading{flex:none;gap:16px;padding:clamp(12px,2.5dvh,24px) 0}
 .page-heading>div{min-width:0}
@@ -269,8 +269,8 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .activity-feed{min-height:0;padding:16px 16px 0;overscroll-behavior:contain}
 .activity-footer{padding:8px 16px}
 .completion-layout{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);align-items:stretch;padding:16px 0 0;gap:clamp(16px,4vw,48px)}
-.completion-copy{min-width:0;min-height:0;display:flex;flex-direction:column;gap:16px}
-.completion-details{flex:1;min-height:0;overflow:auto;scrollbar-width:thin;scrollbar-color:#c4b4a9 transparent;overscroll-behavior:contain}
+.completion-copy{min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:16px}
+.completion-details{flex:0 1 auto;min-height:0;overflow:auto;scrollbar-width:thin;scrollbar-color:#c4b4a9 transparent;overscroll-behavior:contain}
 .complete-check{width:48px;height:48px;margin-bottom:14px}
 .completion-copy h1{font-size:clamp(28px,6dvh,54px);margin-bottom:12px}
 .completion-details>p{color:var(--muted);font-size:12px;line-height:1.7;max-width:330px}
