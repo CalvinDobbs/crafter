@@ -348,6 +348,26 @@ def spread_direction(arm):
     return -pinch_direction(arm)
 
 
+def hook_direction(arm):
+    """Joint-space step that rotates J5 inward toward the box, pitch and claw untouched.
+
+    Yaw alone can change hand height, which is why this is prepared while raised rather
+    than swept across the box at floor level.
+    """
+    d = np.zeros(arm.dof)
+    d[WRIST_YAW] = inward_sign(arm.cfg, arm.cmd, WRIST_YAW)
+    return d
+
+
+def j0_low_target(arm, margin):
+    """J0's calibrated bottom held ``margin`` turns back toward the top.
+
+    That margin is a lift offset, not a measured floor clearance: nothing here senses the floor.
+    """
+    top, bottom = arm.top, arm.bottom
+    return float(bottom + np.sign(top - bottom) * min(margin, abs(top - bottom)))
+
+
 def creep_to_contact(arms, direction, speed, contact_err, squeeze, max_travel, label,
                      cancel=None, log=print):
     """Creep every arm along its joint-space ``direction`` until it meets the box, then hold a

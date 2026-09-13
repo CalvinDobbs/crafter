@@ -40,6 +40,27 @@ RETREAT_SPEED = 0.6     # turns/s lifting J0 clear once the box is free
 RETREAT_TURNS = 1.0     # turns of J0 lift after release
 SETTLE_S = 0.5          # let each stage stop moving before the next one starts
 
+# pickup: mirrors actions/pickup.py's stage order. That script stays the prototype and the place
+# these values get tuned; it cannot be imported (it installs a SIGINT handler at import time) and
+# must not be edited, so the sequence is rebuilt here on armctl primitives. Re-read its docstring
+# after any upstream change — the prose here is a copy, and copies drift.
+INITIALIZE_SPEED = 0.08  # turns/s returning J1/J2/J4/J5/J6 to their configured home angles
+J0_SPEED = 0.4           # turns/s along the lift
+J0_BOTTOM_MARGIN = 0.80  # turns back toward the top from the calibrated bottom; NOT floor clearance
+ELBOW_SPEED = 0.15       # turns/s bending the elbow
+SPREAD_SPEED = 0.15      # turns/s swinging the whole arm out (J2 carries the arm, so ease it)
+PINCH_SPEED = 0.05       # turns/s J2 creep toward the box
+PINCH_CONTACT_ERR = 0.015  # turns of J2 tracking error that counts as touching the box
+PINCH_SQUEEZE = 0.03     # turns commanded past contact: a steady spring squeeze. TUNE on box
+HOOK_SPEED = 0.08        # turns/s wrist creep, hand turning in across the front of the box
+HOOK_MAX_TRAVEL = 0.22   # turns of wrist travel when nothing stops the hand earlier
+HOOK_CONTACT_ERR = 0.015
+HOOK_SQUEEZE = 0.01      # turns past the hook contact point. TUNE on box
+CRADLE_TILT = 0.03       # turns of extra elbow flex past 90 deg, lifting the box's front edge. TUNE
+CRADLE_SPEED = 0.05      # turns/s; slow so the box rolls back onto the forearms, not out of them
+LIFT_SPEED = 1.2         # turns/s for the final shoot-up
+HOME_JOINTS = (1, 2, 4, 5, 6)   # returned to configured home while raised, during initialize
+
 # look_around: an in-place survey, stationed rather than continuous. Perception rejects frames
 # older than its 0.8 s freshness window, so a frame grabbed mid-rotation ages out before it can be
 # used; the robot has to actually stop to buy a usable observation.
@@ -107,7 +128,7 @@ def look_around(executor, request):
     """Survey in place: rotate through a full turn in stations, dwelling at each one.
 
     The dwell is the point. A twist is a velocity that expires in 100 ms, so the rig's publisher
-    keeps it alive while turning, but perception cannot use anything measured mid-rotation — every
+    keeps it alive while turning, but perception cannot use anything measured mid-rotation â€” every
     usable frame comes from a station. The base is zeroed on every exit path, including cancel;
     the daemon's command timeout is the backstop, not the brake.
 
@@ -130,6 +151,71 @@ def look_around(executor, request):
     executor.phase("settling")
     armctl.dwell(SURVEY_SETTLE_S, cancel)
     return "completed"
+
+
+def pickup(executor, request):
+    """Cage a box between both forearms and lift it.
+
+    Mirrors actions/pickup.py: initialize to a calibrated reference pose, spread the arms wider
+    than the box, turn the wrists in while still raised, lower, squeeze to contact, grip, cradle,
+    and lift. Contact is a rise in joint tracking error — which says something resisted the joint,
+    not that a box is held. Possession comes from the executor's evidence source, never from here.
+    """
+    arms, cancel = executor.rig.arms, executor.cancel
+    log = executor.log
+
+    executor.phase("grasping")
+    # 1. initialize: the same calibrated reference pose every run, while raised and unloaded.
+    armctl.ramp_joint(arms, armctl.ELBOW, [a.elbow_90 for a in arms], ELBOW_SPEED,
+                      ease=armctl.smootherstep, cancel=cancel)
+    armctl.settle_joint(arms, armctl.ELBOW, cancel=cancel, log=log)
+    armctl.ramp_joint(arms, armctl.GRIPPER, [a.grip_open for a in arms], GRIP_SPEED, cancel=cancel)
+    armctl.ramp_joint(arms, armctl.J0, [a.top for a in arms], J0_SPEED, cancel=cancel)
+    armctl.settle_joint(arms, armctl.J0, cancel=cancel, log=log)
+    for joint in HOME_JOINTS:
+        armctl.ramp_joint(arms, joint, [float(a.cfg.home[joint]) for a in arms],
+                          INITIALIZE_SPEED, ease=armctl.smootherstep, cancel=cancel)
+        armctl.settle_joint(arms, joint, cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    # 2. spread wider than the box, out to each arm's own calibrated edge.
+    out = [float(a.edge(armctl.SWING, armctl.spread_direction(a)[armctl.SWING])) for a in arms]
+    armctl.ramp_joint(arms, armctl.SWING, out, SPREAD_SPEED, ease=armctl.smootherstep, cancel=cancel)
+    armctl.settle_joint(arms, armctl.SWING, cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    # 3. turn the wrists in while still at the top: yaw alone can change hand height, so this
+    #    must not happen down at box level.
+    armctl.creep_to_contact(arms, armctl.hook_direction, HOOK_SPEED, HOOK_CONTACT_ERR,
+                            HOOK_SQUEEZE, HOOK_MAX_TRAVEL, "hook", cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    # 4. down to the calibrated bottom, held back by a lift offset that does not sense the floor.
+    armctl.ramp_joint(arms, armctl.J0, [armctl.j0_low_target(a, J0_BOTTOM_MARGIN) for a in arms],
+                      J0_SPEED, cancel=cancel)
+    armctl.settle_joint(arms, armctl.J0, cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    # 5. squeeze until each forearm independently meets its side of the box, so an off-centre
+    #    box is still held from both sides.
+    armctl.creep_to_contact(arms, armctl.pinch_direction, PINCH_SPEED, PINCH_CONTACT_ERR,
+                            PINCH_SQUEEZE, float("inf"), "pinch", cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    armctl.ramp_joint(arms, armctl.GRIPPER, [a.grip_closed for a in arms], GRIP_SPEED, cancel=cancel)
+    armctl.dwell(SETTLE_S, cancel)
+
+    # 6. cradle: the elbows flex past 90 deg so the box tilts back and its weight rests on the
+    #    forearms rather than on the squeeze alone.
+    armctl.ramp_joint(arms, armctl.ELBOW, [a.cradle(CRADLE_TILT) for a in arms], CRADLE_SPEED,
+                      ease=armctl.smootherstep, cancel=cancel)
+    armctl.settle_joint(arms, armctl.ELBOW, cancel=cancel, log=log)
+    armctl.dwell(SETTLE_S, cancel)
+
+    executor.phase("lifting")
+    armctl.ramp_joint(arms, armctl.J0, [a.top for a in arms], LIFT_SPEED, cancel=cancel)
+    armctl.settle_joint(arms, armctl.J0, cancel=cancel, log=log)
+    return "lifted"
 
 
 def place(executor, request):
@@ -224,7 +310,8 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
         geometry = Geometry(observations, carry_height=rig.carry_height)
 
     # look_around needs no target geometry: it surveys where it stands.
-    functions = {"look_around": _wrap(executor, look_around, lambda r: {})}
+    functions = {"look_around": _wrap(executor, look_around, lambda r: {}),
+                 "pickup": _wrap(executor, pickup, lambda r: {})}
     if geometry is not None:
         functions["place"] = _wrap(executor, place, geometry.place)
 

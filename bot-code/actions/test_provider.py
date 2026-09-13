@@ -52,14 +52,18 @@ class FakeArm(armctl.Arm):
         self.dof = 8
         self.lo = np.full(self.dof, -4.0)
         self.hi = np.full(self.dof, 4.0)
+        self.lo[armctl.SWING], self.hi[armctl.SWING] = -0.3, 0.3
+        self.lo[armctl.WRIST_YAW], self.hi[armctl.WRIST_YAW] = -0.3, 0.3
         self.top, self.bottom = 0.0, 2.0
         self.elbow_90 = self.sign * 0.25
         self.grip_open, self.grip_closed = self.sign * 0.3, 0.0
         self.cmd = np.zeros(self.dof)
         self.cmd[armctl.ELBOW] = self.elbow_90 + self.sign * 0.03   # cradled, as pickup leaves it
         self.cmd[armctl.J0] = 0.2
+        home = np.zeros(self.dof)
+        home[armctl.ELBOW] = self.elbow_90
         self.cfg = SimpleNamespace(q2urdf=lambda q: q, ik=SimpleNamespace(fk=self.fk),
-                                   wheel_radius=0.0465)
+                                   wheel_radius=0.0465, home=home)
         self.published = []
         self.torque = []
         self.closed = False
@@ -213,6 +217,64 @@ class LookAroundTests(unittest.TestCase):
     def test_dwell_outlasts_perception_freshness(self):
         # perception rejects frames older than 0.8 s, so a shorter dwell buys no usable observation
         self.assertGreater(provider.SURVEY_SETTLE_S, 0.8)
+
+
+class PickupTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        for patcher in (patch.object(armctl, "time", self.clock),
+                        patch.object(provider, "time", self.clock)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.rig = FakeRig()
+        self.executor = provider.Executor(self.rig, log=lambda *a: None)
+        self.phases = []
+        real = self.executor.phase
+        self.executor.phase = lambda n: (self.phases.append(n), real(n))[1]
+        self.order = []
+        real_ramp = armctl.ramp_joint
+        patcher = patch.object(armctl, "ramp_joint", lambda arms, joint, *a, **k: (
+            self.order.append(joint), real_ramp(arms, joint, *a, **k))[1])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_phase_order_and_terminal_phase(self):
+        terminal = provider.pickup(self.executor, {})
+        self.assertEqual(self.phases, ["grasping", "lifting"])
+        self.assertEqual(terminal, "lifted")
+
+    def test_spreads_before_it_lowers(self):
+        provider.pickup(self.executor, {})
+        # the forearms must already straddle the box before the lift descends onto it
+        first_swing = self.order.index(armctl.SWING)
+        j0_moves = [i for i, j in enumerate(self.order) if j == armctl.J0]
+        self.assertLess(first_swing, j0_moves[-1], "spread must precede the descent")
+
+    def test_ends_cradled_closed_and_lifted(self):
+        provider.pickup(self.executor, {})
+        for arm in self.rig.arms:
+            self.assertAlmostEqual(arm.cmd[armctl.J0], arm.top, places=6)
+            self.assertAlmostEqual(arm.cmd[armctl.ELBOW], arm.cradle(provider.CRADLE_TILT), places=6)
+            self.assertAlmostEqual(arm.cmd[armctl.GRIPPER], arm.grip_closed, places=6)
+
+    def test_torque_is_never_disabled_and_no_writer_is_closed(self):
+        provider.pickup(self.executor, {})
+        for arm in self.rig.arms:
+            self.assertEqual(arm.torque, [])
+            self.assertFalse(arm.closed)
+
+    def test_cancel_leaves_the_load_held(self):
+        self.executor.cancel.set()
+        with self.assertRaises(armctl.Cancelled):
+            provider.pickup(self.executor, {})
+        for arm in self.rig.arms:
+            self.assertEqual(arm.torque, [])
+
+    def test_spread_stays_inside_the_calibrated_range(self):
+        provider.pickup(self.executor, {})
+        for arm in self.rig.arms:
+            self.assertLessEqual(arm.cmd[armctl.SWING], arm.hi[armctl.SWING])
+            self.assertGreaterEqual(arm.cmd[armctl.SWING], arm.lo[armctl.SWING])
 
 
 class ExecutorTests(unittest.TestCase):
