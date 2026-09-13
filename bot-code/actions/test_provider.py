@@ -408,6 +408,46 @@ class DriveTests(unittest.TestCase):
         self.assertLess(speed_at(0.5), speed_at(0.02),
                         "a hard correction should ease off the throttle to tighten the arc")
 
+    def drifting_target(self, start=1.5, bearing=0.0, drift=0.0):
+        """A target that closes as the robot drives, turns as it turns, and drifts.
+
+        ``drift`` is yaw the base gains per second that nobody commanded -- the robot not
+        driving perfectly straight. The approach has to absorb it continuously, because it is
+        never corrected by whatever heading the survey finished on.
+        """
+        state = {"range": start, "bearing": bearing}
+        dt = 1.0 / armctl.MOTION_RATE_HZ
+
+        def target_fn():
+            v = float(self.rig._twist[0])
+            w = armctl.YAW_COMMAND_SIGN * float(self.rig._twist[1])
+            state["range"] = max(0.0, state["range"] - v * dt)
+            state["bearing"] -= (w + drift) * dt        # drift pushes the target off-axis
+            return (state["range"] * math.cos(state["bearing"]),
+                    state["range"] * math.sin(state["bearing"]), 0.0)
+
+        target_fn.state = state
+        return target_fn
+
+    def test_an_imperfect_starting_heading_is_absorbed(self):
+        # look_around finishes a couple of degrees off; the approach must not need it to be exact
+        target = self.drifting_target(bearing=0.25)
+        armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertLess(abs(target.state["bearing"]), 0.10,
+                        "the approach should end pointed much closer at the box than it started")
+
+    def test_drift_while_driving_is_corrected_continuously(self):
+        # the base yaws 0.1 rad/s that nobody asked for, for the whole drive
+        target = self.drifting_target(bearing=0.0, drift=0.10)
+        armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertLess(abs(target.state["bearing"]), 0.15,
+                        "constant drift must be absorbed, not accumulated over the approach")
+
+    def test_it_still_arrives_despite_drift(self):
+        target = self.drifting_target(start=1.5, bearing=0.2, drift=0.08)
+        reached = armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertLessEqual(reached, 0.30 + armctl.RANGE_TOL + 1e-6)
+
     def test_stops_at_the_standoff_not_at_the_target(self):
         final = armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)
         self.assertLessEqual(abs(final - 0.45), armctl.RANGE_TOL + 1e-6)
