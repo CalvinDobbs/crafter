@@ -78,6 +78,13 @@ DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
 TURN_FIRST = 0.60       # rad; beyond this, turn in place -- arcing from here swings wide
 STEER_GAIN = 1.5        # rad/s of correction per rad of bearing error while driving
+# Correction authority, deliberately far above the gentle cruising rate. This base yaws
+# constantly without being asked, and a controller whose maximum correction is below the drift it
+# must reject cannot converge at all: measured in simulation, clamping correction to the 0.15
+# rad/s cruise rate held a heading against 0.10 rad/s of drift and then ran away unbounded at
+# 0.20. The cap that matters is the hardware's (drive.max_angular_vel, 0.9), not the speed chosen
+# for comfortable arcs.
+STEER_MAX = 0.55        # rad/s; the most correction a drive may command
 STEER_SLOWING = 0.6     # how much a hard correction cuts forward speed, so the arc stays tight
 RANGE_TOL = 0.02        # m; inside this the standoff is reached
 ARRIVED_MARGIN = 0.15   # m past the standoff within which losing sight counts as arriving
@@ -509,15 +516,17 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
 
             if abs(bearing) > TURN_FIRST:
                 # Badly misaligned: turn in place. Arcing from here swings wide around the
-                # target rather than closing on it.
-                rig.set_twist(0.0, math.copysign(min(omega, abs(bearing)), bearing))
+                # target rather than closing on it. Uses the correction authority, not the
+                # cruise rate: this is also the path a runaway heading falls into, and it has to
+                # be able to win.
+                rig.set_twist(0.0, math.copysign(min(STEER_MAX, max(omega, abs(bearing))), bearing))
             elif distance > standoff + RANGE_TOL:
                 # Roughly aligned: drive and steer together. A box off to one side needs the
                 # heading corrected continuously as the robot closes on it -- stopping to turn
                 # whenever the bearing drifts makes the approach a stutter, and driving straight
                 # at a heading taken seconds ago misses. Forward speed eases off while
                 # correcting hard, which tightens the arc instead of overshooting the line.
-                steer = float(np.clip(STEER_GAIN * bearing, -omega, omega))
+                steer = float(np.clip(STEER_GAIN * bearing, -STEER_MAX, STEER_MAX))
                 easing = 1.0 - STEER_SLOWING * min(1.0, abs(bearing) / TURN_FIRST)
                 rig.set_twist(min(speed, distance - standoff) * easing, steer)
             else:

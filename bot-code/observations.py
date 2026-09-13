@@ -184,6 +184,11 @@ def box_rejection(track, voxel_size):
         return "no confidence score"
     if score < SCORE_SELECT:
         return f"confidence {score:.2f} below {SCORE_SELECT:.2f}"
+    confirmations = track.get("confirmations") or 0
+    if confirmations < MIN_CONFIRMATIONS:
+        # A single frame at this confidence is a guess. Repetition is what makes it evidence,
+        # and it is the half of the bar that went UP when the score half came down.
+        return f"seen {confirmations}x, needs {MIN_CONFIRMATIONS} confirmations at this confidence"
     return None
 
 
@@ -233,6 +238,7 @@ def detector_tracks(scan, site, voxel_size, pose):
             "partial_view": bool(item.get("partial_view")),
             "identity_status": item.get("identity_status"),
             "support_clearance_m": item.get("support_clearance_m"),
+            "confirmations": item.get("confirmations", 0),
         })
     return tracks
 
@@ -581,13 +587,25 @@ CARRY_MIN_POINTS = 8
 # perception handoff asks for exactly that: a higher confidence threshold applied in an
 # adapter/selection policy rather than inside the detector.
 DETECTOR_LABEL = "cardboard_box"
-# The handoff separates two thresholds and they are not interchangeable: "at least 0.25 for
-# target selection, preferably 0.30 before pickup". Selecting a box is reversible -- the agent can
-# approach, look again and abandon it. Closing two arms around one is not. So selection uses the
-# lower bar and the grasp re-checks against the higher one, with fresher evidence than selection
-# ever had. Neither may quietly drop under 0.20.
-SCORE_SELECT = 0.25       # eligible as a target
-SCORE_PICKUP = 0.30       # required again, immediately before closing on it
+# Thresholds, lowered on the robot owner's explicit instruction (2026-09-13) after measuring
+# this robot with the boxes it actually has to work with. Written down because the numbers look
+# alarming without the reason.
+#
+# The handoff recommends 0.25 to select and 0.30 to grasp, and says not to drop under 0.20. On
+# this hardware the boxes are small and the head camera is wide-angle, so a box at working range
+# occupies a small, distorted patch. Measured over a full session, the SAME box scored anywhere
+# from 0.10 to 0.37 -- a mean sitting right on those thresholds with variance straddling them, so
+# eligibility flickered frame to frame. The boxes cannot be changed.
+#
+# Lowering the single-frame bar alone would be exactly the invented confidence this design exists
+# to refuse. So the bar comes down and a second, independent requirement goes up: the track must
+# have been confirmed across several frames. One frame at 0.30 is a guess; thirty consecutive
+# frames at 0.15 is a box. The net evidence required does not fall -- it changes shape, from
+# instantaneous confidence to confidence over time, which is the evidence this detector can
+# actually supply.
+SCORE_SELECT = 0.12       # eligible as a target, WITH the confirmation count below
+SCORE_PICKUP = 0.20       # required again, immediately before closing on it
+MIN_CONFIRMATIONS = 4     # sightings of the same track before it may be selected at all
 DEPTH_OK = frozenset({"surface_supported"})   # has real depth AND rests on a measured plane      # depth returns needed before "nothing there" means empty rather than blind
 
 
