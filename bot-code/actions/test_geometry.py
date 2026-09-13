@@ -59,6 +59,40 @@ class WorldToBaseTests(unittest.TestCase):
             self.assertAlmostEqual(got, want, places=9)
 
 
+class SteeringStalenessTests(unittest.TestCase):
+    """A drive must survive the detector dropping a box for a frame; a grasp must not."""
+
+    def snapshot_with(self, box_id=7, current=True, age=0.0, now=100.5):
+        from agent_types import BoxObservation
+        snap = snapshot()
+        box = BoxObservation(id=box_id, position=(1.0, 0.0, 0.1), size=None,
+                             last_seen=now - age, current=current)
+        return SimpleNamespace(**{**snap.__dict__, "boxes": (box,)})
+
+    def test_a_current_box_steers(self):
+        g = geometry(snapshot())
+        pos = g.box_in_base(request(), snapshot=self.snapshot_with(current=True))
+        self.assertEqual(len(pos), 3)
+
+    def test_a_briefly_lost_box_still_steers(self):
+        g = geometry(snapshot())
+        pos = g.box_in_base(request(), snapshot=self.snapshot_with(current=False, age=1.0))
+        self.assertEqual(len(pos), 3)
+
+    def test_a_long_lost_box_stops_the_drive(self):
+        g = geometry(snapshot())
+        stale = self.snapshot_with(current=False, age=geometry(snapshot()).__class__ and 99.0)
+        with self.assertRaises(StaleGeometry) as caught:
+            g.box_in_base(request(), snapshot=stale)
+        self.assertIn("beyond", str(caught.exception))
+
+    def test_a_box_absent_entirely_stops_the_drive(self):
+        g = geometry(snapshot())
+        empty = SimpleNamespace(**{**snapshot().__dict__, "boxes": ()})
+        with self.assertRaises(StaleGeometry):
+            g.box_in_base(request(), snapshot=empty)
+
+
 class ResolveTests(unittest.TestCase):
     def test_place_measures_the_drop_from_the_carry_height(self):
         # cell (0,0,0) centre is origin + up*0.5*voxel -> z = 0.1; its bottom face is z = 0.0

@@ -14,6 +14,9 @@ from __future__ import annotations
 import math
 
 
+STEER_MAX_AGE = 3.0     # s; how stale a sighting may be and still serve as a heading to drive on
+
+
 class StaleGeometry(RuntimeError):
     """The live pose cannot authorize this request's geometry."""
 
@@ -68,21 +71,32 @@ class Geometry:
         world = request.site.cell_center(request.step.cell, voxel)
         return world_to_base(world, snapshot.base_position, snapshot.base_yaw)
 
-    def box_in_base(self, request, snapshot=None):
-        """Base-frame position of the request's target box, as currently observed.
+    def box_in_base(self, request, snapshot=None, max_age=None):
+        """Base-frame position of the request's target box.
 
-        The carried box's remembered pre-grasp position is never used: the box must still be
-        current in this snapshot, or there is nothing to approach.
+        ``max_age`` bounds how stale a sighting may be. Steering allows a few seconds: this
+        detector runs near 9 fps on marginal scores and drops a box for a frame or two
+        constantly, so demanding a current sighting every cycle makes any drive fail within
+        centimetres. A sighting seconds old is still a good heading, because perception tracks
+        the box in world coordinates and re-projects it through the current pose.
+
+        That tolerance stops at the grasp. confirm_graspable asks for a current sighting and a
+        higher score before anything closes on it, so continuing toward a remembered box never
+        becomes grasping a remembered one.
         """
         snapshot = snapshot or self._fresh_snapshot(request)
         if request.step.box_id is None:
             raise StaleGeometry("request carries no box to resolve")
+        limit = STEER_MAX_AGE if max_age is None else max_age
         for box in snapshot.boxes:
-            if box.id == request.step.box_id:
-                if not box.current:
-                    raise StaleGeometry(f"box {box.id} is remembered, not currently observed")
-                return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
-        raise StaleGeometry(f"box {request.step.box_id} is not in the current snapshot")
+            if box.id != request.step.box_id:
+                continue
+            age = self.clock() - box.last_seen
+            if not box.current and age > limit:
+                raise StaleGeometry(f"box {box.id} last seen {age:.1f}s ago, beyond the "
+                                    f"{limit:.1f}s a heading may be trusted")
+            return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
+        raise StaleGeometry(f"box {request.step.box_id} is not in the snapshot at all")
 
     def confirm_graspable(self, request):
         """Re-check the box immediately before closing on it, against the higher bar.
