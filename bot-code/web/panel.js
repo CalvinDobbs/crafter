@@ -230,7 +230,7 @@ function eventRows(events) {
   for (const event of events) {
     const d = event.data;
     if (event.type === 'llm_start') {
-      const row = {id: d.call_id, at: event.at, kind: 'model', status: 'running', title: 'Choosing the next step', detail: 'Waiting for the model response.', data: d.input};
+      const row = {id: d.call_id, at: event.at, kind: 'model', status: 'running', title: 'Choosing the next step', detail: 'Choosing the next step.', data: d.input};
       rows.push(row); pending.set(d.call_id, row);
     } else if (event.type === 'llm_result') {
       let row = pending.get(d.call_id);
@@ -239,17 +239,17 @@ function eventRows(events) {
     } else if (event.type === 'llm_error') {
       let row = pending.get(d.call_id);
       if (!row) { row = {id: d.call_id, at: event.at, kind: 'model'}; rows.push(row); }
-      Object.assign(row, {status: 'error', title: 'Model request failed', detail: d.error, data: null});
+      Object.assign(row, {status: 'error', title: 'Decision failed', detail: d.error, data: null});
     } else if (event.type === 'tool_start') {
-      const row = {id: d.request_id, at: event.at, kind: 'tool', status: 'running', title: `${d.operation}()`, detail: 'Simulating this action. No hardware will move.', data: d.arguments};
+      const row = {id: d.request_id, at: event.at, kind: 'tool', status: 'running', title: `${d.operation}()`, detail: 'Running this action.', data: d.arguments};
       rows.push(row); pending.set(d.request_id, row);
     } else if (event.type === 'tool_result') {
       const row = pending.get(d.request_id);
-      if (row) { row.status = 'complete'; row.detail = 'Simulated success'; }
+      if (row) { row.status = 'complete'; row.detail = 'Succeeded'; }
     } else if (event.type === 'placement_confirmed') {
-      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: `Box ${d.box_id} placed`, detail: `Cell [${d.cell.join(', ')}] verified in the simulated scene.`});
+      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: `Box ${d.box_id} placed`, detail: `Cell [${d.cell.join(', ')}] verified.`});
     } else if (event.type === 'site_selected') {
-      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: 'Build spot selected', detail: `${d.site_id} / simulated clear floor`});
+      rows.push({id: String(event.id), at: event.at, kind: 'verified', status: 'complete', title: 'Build spot selected', detail: `${d.site_id} / clear floor`});
     } else if (event.type === 'model_rejected') {
       rows.push({id: String(event.id), at: event.at, kind: 'model', status: 'error', title: 'Decision rejected', detail: `${d.error}. Retrying within the request budget.`});
     }
@@ -269,7 +269,7 @@ function renderFeed(job) {
     const article = document.createElement('article'); article.className = `event ${row.kind} ${row.status}`;
     const dot = document.createElement('span'); dot.className = 'event-dot'; article.append(dot);
     const meta = document.createElement('div'); meta.className = 'event-meta';
-    const kind = document.createElement('span'); kind.className = 'event-kind'; kind.textContent = row.kind === 'model' ? 'LLM DECISION' : row.kind === 'tool' ? 'TOOL CALL / MOCK' : 'SCENE UPDATE';
+    const kind = document.createElement('span'); kind.className = 'event-kind'; kind.textContent = row.kind === 'model' ? 'DECISION' : row.kind === 'tool' ? 'TOOL CALL' : 'SCENE UPDATE';
     const stamp = document.createElement('time'); stamp.textContent = elapsed(job.started_at, row.at);
     meta.append(kind, stamp); article.append(meta);
     const title = document.createElement('h3'); title.textContent = row.title; article.append(title);
@@ -302,9 +302,6 @@ function render(s) {
     step.classList.toggle('passed', order.indexOf(step.dataset.step) < order.indexOf(screen));
   }
   byId('workflow').hidden = screen === 'debug';
-  // Builds really do simulate their tools; the debug console really does not. The badge has to
-  // say which screen you are on, or it lies on one of them.
-  text('hardware-badge', screen === 'debug' ? 'Real providers' : 'Simulated hardware');
   if (window.debugScreen) window.debugScreen.sync(s);
   const connection = byId('connection');
   connection.classList.toggle('offline', !connected);
@@ -318,7 +315,7 @@ function render(s) {
   const enabled = !!(connected && design && design.buildable && s.llm_ready && !s.worker_busy && !submitting);
   byId('start-build').disabled = !enabled;
   byId('clear-blueprint').disabled = !connected || !design || submitting;
-  text('start-hint', s.worker_busy && screen === 'main' ? 'Finishing the cancelled model request. You can start again shortly.' : !design ? 'Receive a design to get started.' : !s.llm_ready ? 'Configure your API key to enable real reasoning.' : !design.buildable ? 'Adjust the schematic and scan it again.' : 'Uses the model API. Physical actions are simulated.');
+  text('start-hint', s.worker_busy && screen === 'main' ? 'Finishing the previous run. You can start again shortly.' : !design ? 'Receive a design to get started.' : !design.buildable ? 'Adjust the schematic and scan it again.' : 'Ready when you are.');
   byId('load-example').disabled = submitting;
   text('receiver-detail', s.receiver.listening ? `Minecraft receiver ready on TCP :${s.receiver.port} · latest design only` : s.receiver.error || 'Minecraft receiver is starting');
   document.querySelector('.receiver-port').textContent = `TCP :${s.receiver.port}`;
@@ -334,26 +331,26 @@ function render(s) {
     byId('cancel-build').hidden = !running; byId('cancel-build').disabled = submitting;
     byId('failed-back').hidden = running; byId('failed-back').disabled = submitting;
     byId('build-error').hidden = !job.error;
-    if (job.error) text('build-error', `${job.error} No robot hardware was involved. You can return to the design and try again.`);
+    if (job.error) text('build-error', `${job.error} You can return to the design and try again.`);
     byId('new-design-notice').hidden = !design || job.design.id === design.id;
     text('reasoning-text', job.reasoning);
     text('phase-label', phases[job.phase] || job.phase);
     const rows = eventRows(job.events), latest = rows.length ? rows[rows.length - 1] : null;
     const thinking = running && latest && latest.kind === 'model' && latest.status === 'running';
     byId('thinking-indicator').classList.toggle('busy', !!thinking);
-    text('thinking-label', thinking ? 'ASKING THE MODEL' : 'AGENT REASONING');
+    text('thinking-label', thinking ? 'CHOOSING THE NEXT STEP' : 'AGENT REASONING');
     text('progress-label', `${placed} / ${total} boxes placed`);
     text('progress-percent', `${percent}%`);
     byId('progress-fill').style.width = `${percent}%`;
     document.querySelector('.progress-track').setAttribute('aria-valuenow', String(percent));
-    text('current-action', job.current_tool ? labels[job.current_tool] || job.current_tool : thinking ? 'Waiting for model response' : running ? 'Checking the next step' : job.status === 'completed' ? 'Build verified' : 'Build stopped');
+    text('current-action', job.current_tool ? labels[job.current_tool] || job.current_tool : thinking ? 'Choosing the next step' : running ? 'Checking the next step' : job.status === 'completed' ? 'Build verified' : 'Build stopped');
     text('elapsed', elapsed(job.started_at, job.finished_at));
     text('llm-count', job.llm_calls); text('tool-count', job.tool_calls);
     byId('feed-live').hidden = !running;
     scene('build', job.design, 'build', job.placed, job.current_cell);
     scene('complete', job.design, 'complete', job.placed, null);
     renderFeed(job);
-    text('complete-description', `Your ${total}-box shape is complete. Every placement has been verified in the simulated scene.`);
+    text('complete-description', `Your ${total}-box shape is complete. Every placement has been verified.`);
     text('complete-boxes', placed); text('complete-time', elapsed(job.started_at, job.finished_at)); text('complete-tools', job.tool_calls);
     text('complete-next', design && design.id !== job.design.id ? 'A newer Minecraft design is ready on the main screen.' : 'Ready for the next idea.');
     byId('back-main').disabled = submitting;

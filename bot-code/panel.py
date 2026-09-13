@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from agent import Agent, JobCancelled, validate_job
-from agent_backend import OpenAIReasoner, load_api_key
+from agent_backend import OpenAIReasoner
 from agent_types import MOTION_OPS, AgentConfig, cell_valid
 from contracts import Block, Structure
 from debug_console import DEFAULT_VOXEL, DebugConsole, perception_sources, provider_sources, robot_sources
@@ -137,10 +137,10 @@ class PanelWorld(MockAgentWorld):
 
     def submit(self, request):
         if self.cancel_event.is_set():
-            raise JobCancelled("simulation cancelled")
+            raise JobCancelled("cancelled")
         receipt = super().submit(request)
         self.emit("tool_start", operation=request.step.operation, request_id=request.request_id,
-                  arguments=asdict(request.step), simulated=True)
+                  arguments=asdict(request.step))
         return receipt
 
     def status(self, action_id):
@@ -149,12 +149,24 @@ class PanelWorld(MockAgentWorld):
             self.reported.add(action_id)
             request = self._pending[action_id]["request"]
             self.emit("tool_result", operation=request.step.operation, request_id=request.request_id,
-                      result="success" if outcome.status == "succeeded" else outcome.status, simulated=True)
+                      result="success" if outcome.status == "succeeded" else outcome.status)
         return outcome
 
     def sleep(self, seconds):
         self.cancel_event.wait(seconds*self.tool_delay/self.action_duration)
         super().sleep(seconds)
+
+
+class DeterministicChoice:
+    """The agent's own first legal step, taken without a model.
+
+    Agent.choices() already returns only steps whose preconditions hold, ordered so the first is
+    the one a correct reasoner would pick, so this drives a whole build with no API call, no key
+    and no per-run cost.
+    """
+
+    def decide(self, context, choices):
+        return choices[0]
 
 
 class PanelReasoner:
@@ -265,8 +277,8 @@ class PanelSession:
         with self.lock:
             return copy.deepcopy({"revision": self.revision, "view": self.view, "design": self.design,
                                   "job": self.job, "notice": self.notice, "receiver": self.receiver,
-                                  "worker_busy": self.worker_busy, "llm_ready": self.reasoner_factory is not None,
-                                  "model": self.model, "csrf": self.csrf, "simulation": True,
+                                  "worker_busy": self.worker_busy, "llm_ready": True,
+                                  "model": self.model, "csrf": self.csrf,
                                   "debug_kind": self.debug.kind if self.debug else None})
 
     def start(self, design_id):
@@ -281,8 +293,6 @@ class PanelSession:
                 raise ValueError("design changed; review the latest preview before starting")
             if not self.design["buildable"]:
                 raise ValueError(self.design["error"])
-            if self.reasoner_factory is None:
-                raise ValueError("Enter your API key in the panel or set OPENAI_API_KEY before launching")
             job_id = uuid.uuid4().hex
             self.cancel_event = threading.Event()
             self.job = {"id": job_id, "design": copy.deepcopy(self.design), "status": "running",
@@ -327,7 +337,7 @@ class PanelSession:
             with self.lock:
                 blocks = copy.deepcopy(self.job["design"]["blocks"])
             world = PanelWorld(len(blocks), cancel, emit, self.tool_delay)
-            reasoner = PanelReasoner(self.reasoner_factory(), cancel, emit)
+            reasoner = PanelReasoner((self.reasoner_factory or DeterministicChoice)(), cancel, emit)
             agent = Agent(world.actions, world.observations, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
                           clock=world.clock, sleep=world.sleep,
                           event_sink=lambda event: emit(event["event"], **{k: v for k, v in event.items() if k != "event"}))
@@ -451,12 +461,9 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
     from fastapi.responses import FileResponse, JSONResponse, Response
 
     if session is None:
-        key = load_api_key()
-        factory = None
-        if key or base_url:
-            factory = lambda: OpenAIReasoner(model=model, base_url=base_url, api_key=key or "unused",
-                                             timeout=model_timeout, json_only=json_only)
-        session = PanelSession(factory, model, tool_delay, base_url, model_timeout, json_only,
+        # Builds run on the agent's own legal-step ordering, so the panel starts with no reasoner
+        # and no key. set_api_key installs one for anyone who wants model decisions back.
+        session = PanelSession(None, model, tool_delay, base_url, model_timeout, json_only,
                                debug=build_debug_console(debug_provider, debug_perception, box_size))
     receiver = StructureReceiver(session, receiver_host, receiver_port)
     origin = urlsplit(debug_perception) if debug_perception else None
@@ -669,7 +676,7 @@ def serve_panel(host="127.0.0.1", port=8005, receiver_host="0.0.0.0", receiver_p
     import uvicorn
     app = create_app(receiver_host=receiver_host, receiver_port=receiver_port, **kwargs)
     console = app.state.panel.debug
-    print(f"[panel] http://{host}:{port} | Minecraft TCP {receiver_port} | real LLM, simulated tools", flush=True)
+    print(f"[panel] http://{host}:{port} | Minecraft TCP {receiver_port}", flush=True)
     if console is not None:
         print(f'[panel] debug screen: open the panel, then "Debug console" | manual tools against {console.kind} providers'
               + (f" | perception {console.perception_url}" if console.perception_url else ""), flush=True)

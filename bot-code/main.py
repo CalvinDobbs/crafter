@@ -58,7 +58,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Closed-loop floor-box reasoning; mock mode is offline by default.")
     ap.add_argument("--save-api-key", action="store_true",
                     help="save exported OPENAI_API_KEY privately in ~/.config/crafter; never overwrite an existing key")
-    ap.add_argument("--ui", action="store_true", help="Minecraft control panel: real LLM decisions, simulated tools")
+    ap.add_argument("--ui", action="store_true", help="Minecraft control panel: receives Minecraft designs and runs builds")
     ap.add_argument("--ui-host", default="127.0.0.1")
     ap.add_argument("--ui-port", type=int, default=8005)
     ap.add_argument("--debug-perception", metavar="URL",
@@ -116,7 +116,7 @@ def main(argv=None):
             return 0
     if a.ui:
         if a.provider or a.grid_ui or a.mode != "agent" or a.planner == "deterministic":
-            ap.error("the UI uses real LLM decisions with simulated tools; do not select another executor")
+            ap.error("the UI runs its own build loop; do not select another executor")
         if a.debug_provider and a.box_size is None:
             ap.error("--debug-provider drives real hardware and requires an explicit --box-size in meters")
         if not a.ui_without_robot and importlib.util.find_spec("bbos") is None:

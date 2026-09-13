@@ -553,7 +553,7 @@ Before replacing either mock, the component owner must demonstrate:
 8. Passing the focused agent tests through the replacement provider; no hardware
    or paid API calls belong in normal test runs. Supervised live acceptance is separate.
 
-`--mock` never calls a model by default. Real model calls with simulated tools
+`--mock` never calls a model by default. The panel's builds never call one at all. Model calls with simulated tools
 require `--allow-api-with-mock`; the panel's existing `--ui` mode is explicitly
 real-model/simulated-tools. Offline tests inject fake reasoners/SDK clients.
 

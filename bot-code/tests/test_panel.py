@@ -136,16 +136,21 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(len(state["job"]["placed"]), 4)
         self.assertIsNone(state["design"])
 
-    def test_waits_for_design_and_key(self):
+    def test_a_build_waits_for_a_design_but_not_for_a_key(self):
+        """Builds take the agent's own first legal step, so no model and no key are involved."""
         session = PanelSession(tool_delay=0)
         self.addCleanup(session.close)
         self.assertIsNone(session.snapshot()["design"])
         self.assertEqual(session.snapshot()["view"], "main")
+        self.assertIsNone(session.reasoner_factory)
         with self.assertRaises(ValueError):
             session.start("missing")
         session.receive(payload())
-        with self.assertRaisesRegex(ValueError, "OPENAI_API_KEY"):
-            session.start(session.snapshot()["design"]["id"])
+        session.start(session.snapshot()["design"]["id"])
+        self.assertTrue(session.wait(5))
+        state = session.snapshot()
+        self.assertEqual(state["job"]["status"], "completed")
+        self.assertEqual(len(state["job"]["placed"]), 4)
 
     def test_start_freezes_design_and_completes_with_tool_events(self):
         session = self.session()
@@ -222,9 +227,8 @@ class PanelTests(unittest.TestCase):
         self.assertNotIn(key, json.dumps(session.snapshot()))
         self.assertEqual(session.reasoner_factory().api_key, key)
         self.assertIsNone(session.reasoner_factory().client)
-        self.assertFalse(PanelSession().snapshot()["llm_ready"])
         session.close()
-        self.assertFalse(session.snapshot()["llm_ready"])
+        self.assertIsNone(session.reasoner_factory)
 
     def test_invalid_key_and_mid_build_key_change_are_rejected(self):
         session = PanelSession()
@@ -235,7 +239,7 @@ class PanelTests(unittest.TestCase):
         session.worker_busy = True
         with self.assertRaises(ValueError):
             session.set_api_key("sk-test-placeholder-not-a-real-key")
-        self.assertFalse(session.snapshot()["llm_ready"])
+        self.assertIsNone(session.reasoner_factory)
         session.worker_busy = False
 
     def test_returned_state_cannot_mutate_job_or_design(self):
@@ -720,7 +724,7 @@ class PanelHTTPTests(unittest.TestCase):
             headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
             response = client.post("/api/key", json={"api_key": "sk-test-placeholder-not-a-real-key"}, headers=headers)
             self.assertEqual(response.status_code, 403)
-            self.assertFalse(session.snapshot()["llm_ready"])
+            self.assertIsNone(session.reasoner_factory)
 
     def test_debug_console_drives_the_agents_tools_by_hand(self):
         from fastapi.testclient import TestClient

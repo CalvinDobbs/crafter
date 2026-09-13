@@ -20,7 +20,8 @@ instead of structures.
 
 Python for the robot lives in [`bot-code/`](bot-code/): the reasoning agent, perception, the panel
 and receiver, and voice. The `main.py --ui` panel receives Minecraft designs on TCP 5005 and previews
-them before Start. Builds use real LLM calls with simulated tools; this mode does not move the robot.
+them before Start. Builds run on the offline simulator and take the agent's own first legal step, so they
+need no model, no API key and no robot.
 
 Hardware motion is not wired up yet: there is no action provider implementing interface v2, so a live
 build fails preflight by design. See [bot-code/README.md](bot-code/README.md) for the interface and
