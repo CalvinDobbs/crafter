@@ -25,6 +25,7 @@ Usage:
     uv run main.py --planner deterministic|llm|auto
 """
 import argparse
+import importlib.util
 import json
 import os
 import sys
@@ -39,6 +40,20 @@ from structure_src import load_structure
 from skills_client import SkillsClient, MockSkills
 
 
+ROBOT_ONLY = """the panel runs on the robot, not on a developer PC. The saved API key, the
+cameras and the arms are all on the bot, so a panel started here has no key, no perception and
+no actions. Start it there and forward the port instead:
+
+    ssh bracketbot@100.66.148.86 'uv run --offline /home/bracketbot/crafter/bot-code/main.py --ui'
+    ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8005:127.0.0.1:8005 bracketbot@100.66.148.86
+
+then open http://127.0.0.1:8005. Check the bot's ports first with
+    ss -ltnp '( sport = :8005 or sport = :5005 )'
+and reuse a panel that is already running rather than starting a second receiver.
+
+--ui-without-robot starts one here anyway, for browser layout work only."""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Closed-loop floor-box reasoning; mock mode is offline by default.")
     ap.add_argument("--save-api-key", action="store_true",
@@ -46,6 +61,13 @@ def main(argv=None):
     ap.add_argument("--ui", action="store_true", help="Minecraft control panel: real LLM decisions, simulated tools")
     ap.add_argument("--ui-host", default="127.0.0.1")
     ap.add_argument("--ui-port", type=int, default=8005)
+    ap.add_argument("--debug-perception", metavar="URL",
+                    help="panel debug screen reads this perception server; read-only, no actions")
+    ap.add_argument("--debug-provider", metavar="MODULE:FACTORY",
+                    help="panel debug screen drives these providers instead of this robot's own")
+    ap.add_argument("--ui-without-robot", action="store_true",
+                    help="start the panel off the robot for browser work only; it can open neither "
+                         "perception nor actions, and has no API key")
     ap.add_argument("--receiver-host", default="0.0.0.0")
     ap.add_argument("--receiver-port", type=int, default=5005)
     ap.add_argument("--mode", choices=["agent", "oneshot"], default="agent",
@@ -75,8 +97,11 @@ def main(argv=None):
     ap.add_argument("--sweeps", type=int, default=1,
                     help=">1 rotates the base between scans to find more boxes")
     a = ap.parse_args(argv)
+    if (a.debug_perception or a.debug_provider or a.ui_without_robot) and not a.ui:
+        ap.error("--debug-perception, --debug-provider and --ui-without-robot configure the --ui panel")
     if a.observe_perception:
-        if a.mock or a.ui or a.provider or a.grid_ui or a.mode != "agent" or a.save_api_key or a.sweeps != 1:
+        if (a.mock or a.ui or a.provider or a.grid_ui or a.mode != "agent" or a.save_api_key
+                or a.sweeps != 1 or a.debug_perception or a.debug_provider):
             ap.error("--observe-perception is read-only and cannot select mock, UI, actions or legacy execution")
         return observe_perception(a)
     if a.save_api_key:
@@ -92,10 +117,16 @@ def main(argv=None):
     if a.ui:
         if a.provider or a.grid_ui or a.mode != "agent" or a.planner == "deterministic":
             ap.error("the UI uses real LLM decisions with simulated tools; do not select another executor")
+        if a.debug_provider and a.box_size is None:
+            ap.error("--debug-provider drives real hardware and requires an explicit --box-size in meters")
+        if not a.ui_without_robot and importlib.util.find_spec("bbos") is None:
+            ap.error(ROBOT_ONLY)
         from panel import serve_panel
         return serve_panel(host=a.ui_host, port=a.ui_port, receiver_host=a.receiver_host,
                            receiver_port=a.receiver_port, model=a.model, base_url=a.base_url,
-                           model_timeout=a.llm_timeout, json_only=a.json_only)
+                           model_timeout=a.llm_timeout, json_only=a.json_only,
+                           debug_provider=a.debug_provider, debug_perception=a.debug_perception,
+                           box_size=a.box_size)
     if a.mode == "agent" and a.sweeps != 1:
         ap.error("agent surveys through look_around; --sweeps is a legacy option")
 

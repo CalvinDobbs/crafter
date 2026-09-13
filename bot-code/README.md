@@ -99,6 +99,7 @@ bot-code/
                              (serve_grid_ui defaults to :8005 — the panel's port;
                               pass another port, or the two collide)
   panel.py                   control panel and EOF-framed TCP :5005 receiver
+  debug_console.py           manual tool bench behind the panel's debug screen
   perception.py              independently owned sensing/world model
   planner.py                 legacy one-shot plan_build()
   agent.py                   verified per-step reasoning and monitoring
@@ -110,6 +111,7 @@ bot-code/
     panel.html               markup and controls
     panel.css                responsive viewport layout
     panel.js                 previews, polling and interactions
+    debug.js                 debug screen: perception readouts and tool calls
     assets/
       Crafter-transparent.svg  header logo
   actions/                   independently owned hardware action scripts
@@ -256,6 +258,78 @@ fake model clients; they never contact the bot or a paid API:
 ```bash
 python -B -S -m unittest discover -s bot-code/tests -p test_agent_adapters.py -v
 ```
+
+## The panel runs on the robot, never on a developer PC
+
+`main.py --ui` refuses to start unless `bbos` is importable, because everything the panel needs
+is on the bot: the saved API key, the cameras, the arms, and the TCP:5005 receiver the Minecraft
+mod points at. A panel started on a laptop has none of them — it prompts for an API key that
+already exists on the robot, and its debug screen can open neither perception nor actions.
+
+Start it on the bot and forward the port:
+
+```bash
+ssh bracketbot@100.66.148.86 'uv run --offline /home/bracketbot/crafter/bot-code/main.py --ui'
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8005:127.0.0.1:8005 bracketbot@100.66.148.86
+```
+
+Then open <http://127.0.0.1:8005>. Check the bot's ports first with
+`ss -ltnp '( sport = :8005 or sport = :5005 )'` and reuse a panel that is already running rather
+than starting a second receiver.
+
+`--ui-without-robot` starts one locally anyway. It exists for browser layout work only: no key, no
+perception, no actions.
+
+
+## Debug screen — driving the tools by hand
+
+The panel has a second screen, reached from **Debug console** in the header, for looking at
+everything perception reports and calling each of the agent's operations one at a time. It is
+`debug_console.py` on the server and `web/debug.js` in the browser; the build flow is untouched.
+
+It calls the component interface, not a parallel implementation: `observe`, `find_build_sites`,
+`check_build_site`, and `submit`/`status`/`monitor`/`cancel`/`stop` on the same providers,
+inside the same `ActionRequest` envelope `Agent._execute` builds. Arguments are validated the way
+the agent's are, so a call that is refused here is refused identically inside a build.
+
+**Nothing on this screen is simulated, deliberately.** A fake reading is indistinguishable from a
+real one, and you would tune against it. The default providers are the deployed pair —
+`observations.RobotObservations` in this process, `actions.provider.build_providers` behind the
+arm switch — and off the robot the screen says it cannot open them rather than showing something
+plausible. `test_debug_console` asserts the module cannot even reach a simulator.
+
+The screen shows the whole `ObservationSnapshot`: validity and pose, the camera frame, every
+observed box with its eligibility and age, the selected site and its per-cell occupancy, warnings,
+and the raw world model. `done` measures the target cells the way `FINAL_VERIFY` would and reports
+what the agent would conclude, without confirming anything.
+
+### The two halves open separately
+
+Perception is readers only, so it opens as soon as you look at anything and is safe beside any
+hardware owner. The action provider opens `arm_*.ctrl` and `drive.ctrl` the moment it is
+constructed — this panel becomes the designated owner — so it waits for a deliberate **Arm**. That
+ordering is the reason inspecting perception still works while `mc_skills` holds the writers; if
+arming fails because something else owns them, the page says which PID.
+
+Disarming refuses further motions but does **not** close the provider: releasing `arm_*.ctrl` makes
+the arm daemon cut torque, and a held box would drop. `stop` is never gated, and reports honestly
+that it owns no motors when nothing has been armed.
+
+### Overrides
+
+| Launch | Perception | Motions |
+| --- | --- | --- |
+| `main.py --ui` | this robot, in process | the real arms, once armed |
+| `--ui --debug-perception URL` | a running `perception.py --viz` over HTTP | refused; no action provider |
+| `--ui --debug-provider module:factory --box-size M` | that factory's pair | that factory's actions, once armed |
+
+`--debug-perception` is the remote-development path: `PerceptionObservations` against the existing
+visualizer (default `:8007`), starting no detector and owning no hardware. It also embeds that
+server's own monitor page. `--debug-provider` takes the same `module:factory` spec as `--provider`.
+A build that is running refuses manual motions until it is cancelled.
+
+The shell itself never scrolls, so the two debug panes scroll instead; Stop, Arm and Back sit in
+the page heading, outside both panes, where they stay reachable.
 
 ## Agent component interface v2
 

@@ -27,6 +27,16 @@ build fails preflight by design. See [bot-code/README.md](bot-code/README.md) fo
 [bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md) for how the base and arms
 actually work. Live scans follow [WIRE_FORMAT.md](WIRE_FORMAT.md).
 
+## The panel runs on the bot, never on your PC
+
+`main.py --ui` refuses to start unless it is on the robot. Everything it needs lives there: the
+saved API key, the cameras, the arms, and the TCP:5005 receiver the Minecraft mod points at. A
+panel started on a laptop asks you to paste a key that already exists on the bot, and its debug
+screen can open neither perception nor actions. Run it on the bot and forward port 8005 to your
+browser — the two commands are under [Use the bot-hosted panel from a developer PC](#use-the-bot-hosted-panel-from-a-developer-pc)
+below. `--ui-without-robot` overrides the check for browser layout work only.
+
+
 ## Model key and developer access
 
 ### Store the key on the bot

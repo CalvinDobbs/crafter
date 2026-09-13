@@ -301,6 +301,11 @@ function render(s) {
     step.classList.toggle('active', step.dataset.step === screen);
     step.classList.toggle('passed', order.indexOf(step.dataset.step) < order.indexOf(screen));
   }
+  byId('workflow').hidden = screen === 'debug';
+  // Builds really do simulate their tools; the debug console really does not. The badge has to
+  // say which screen you are on, or it lies on one of them.
+  text('hardware-badge', screen === 'debug' ? 'Real providers' : 'Simulated hardware');
+  if (window.debugScreen) window.debugScreen.sync(s);
   const connection = byId('connection');
   connection.classList.toggle('offline', !connected);
   connection.lastChild.textContent = connected ? 'Panel online' : 'Disconnected';

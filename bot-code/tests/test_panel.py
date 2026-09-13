@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from functools import partial
 from html.parser import HTMLParser
@@ -22,6 +23,17 @@ def payload():
     return {"origin": [0, 1, -1], "size": [1, 2, 3], "count": 4,
             "palette": ["minecraft:oak_planks"],
             "blocks": [[0, 0, 0, 0], [0, 0, 1, 0], [0, 1, 1, 0], [0, 0, 2, 0]]}
+
+
+def debug_console(box_count=4, action_duration=.05):
+    """A DebugConsole over MockAgentWorld. The console itself ships no simulator; tests supply one."""
+    from debug_console import DebugConsole
+    from test_debug_console import real_time_world
+    voxel = (.3, .3, .3)
+    world = real_time_world(box_count, voxel, action_duration)
+    return DebugConsole(lambda: (world.observations, None),
+                        lambda observations: (world.actions, None),
+                        kind="test double", voxel_size=voxel)
 
 
 class FirstChoice:
@@ -344,11 +356,14 @@ class PanelAssetsTests(unittest.TestCase):
         parser = Elements()
         parser.feed((root / "panel.html").read_text())
         self.assertEqual(len(parser.ids), len(set(parser.ids)))
-        script = (root / "panel.js").read_text()
-        referenced = set(re.findall(r"\b(?:byId|text)\('([^']+)'", script))
-        self.assertFalse(referenced-set(parser.ids))
-        self.assertNotIn("innerHTML", script)
-        self.assertNotIn("https://", script)
+        for name in ("panel.js", "debug.js"):
+            with self.subTest(script=name):
+                script = (root / name).read_text()
+                referenced = set(re.findall(r"\b(?:byId|text)\('([^']+)'", script))
+                self.assertTrue(referenced)
+                self.assertFalse(referenced-set(parser.ids))
+                self.assertNotIn("innerHTML", script)
+                self.assertNotIn("https://", script)
 
     def test_clear_button_is_on_main_screen(self):
         html = (PANEL_DIR / "panel.html").read_text()
@@ -483,11 +498,146 @@ class PanelAssetsTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    @unittest.skipUnless(os.environ.get("CRAFTER_LAYOUT_CDP") and shutil.which("node"),
+                         "optional layout check requires Node 22+ and an isolated Chromium CDP endpoint")
+    def test_debug_screen_scrolls_its_panes_inside_the_fixed_shell(self):
+        """The shell never scrolls, so the debug panes must; a clipped pane hides tools entirely."""
+        console = debug_console(6)
+        self.addCleanup(console.close)
+        console.observe()
+        console.find_sites()
+        console.select_site("floor-a")
+        console.observe("floor-a")
+        console.verify()
+        payload = json.dumps(console.state())
+
+        class Assets(SimpleHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Assets, directory=str(PANEL_DIR)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = r"""
+            const cdp = process.env.CRAFTER_LAYOUT_CDP;
+            const target = await fetch(cdp+'/json/new?about:blank', {method:'PUT'}).then(r=>r.json());
+            const ws = new WebSocket(target.webSocketDebuggerUrl);
+            await new Promise((resolve,reject)=>{ws.addEventListener('open',resolve,{once:true});ws.addEventListener('error',reject,{once:true});});
+            let sequence=0;
+            const pending=new Map(), errors=[];
+            ws.addEventListener('message', event=>{
+                const message=JSON.parse(event.data), call=pending.get(message.id);
+                if(message.method==='Runtime.exceptionThrown')errors.push(message.params.exceptionDetails.text);
+                if(!call)return;
+                pending.delete(message.id);clearTimeout(call.timer);
+                message.error?call.reject(new Error(JSON.stringify(message.error))):call.resolve(message.result);
+            });
+            const send=(method,params={})=>new Promise((resolve,reject)=>{
+                const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP timeout: '+method));},8000);
+                pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({id,method,params}));
+            });
+            const evaluate=async expression=>{
+                const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});
+                if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));
+                return r.result.value;
+            };
+            const failures=[];
+            try {
+                await send('Page.enable');
+                await send('Runtime.enable');
+                await send('Network.setCacheDisabled',{cacheDisabled:true});
+                const panel={revision:1,view:'debug',design:null,job:null,notice:'',receiver:{listening:true,port:5005},
+                             worker_busy:false,llm_ready:true,model:'offline-layout-test',csrf:'layout-only',simulation:true,debug_kind:'test double'};
+                await send('Page.addScriptToEvaluateOnNewDocument',{source:
+                    `window.__panel=${JSON.stringify(panel)};window.__console=${process.env.CRAFTER_DEBUG_STATE};`+
+                    `window.fetch=async url=>new Response(JSON.stringify(String(url).includes('/api/debug')?window.__console:window.__panel),{headers:{'Content-Type':'application/json'}});`});
+                for(const [width,height] of [[1600,900],[1280,720],[1024,640],[430,900]]) {
+                    await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+                    await send('Page.navigate',{url:process.env.CRAFTER_LAYOUT_URL+'/panel.html'});
+                    for(let i=0;i<80;i++){
+                        if(await evaluate("document.readyState==='complete' && typeof render==='function'"))break;
+                        await new Promise(r=>setTimeout(r,25));
+                    }
+                    await new Promise(r=>setTimeout(r,1400));
+                    const problems=await evaluate(`(()=>{
+                        const problems=[],root=document.documentElement;
+                        if(document.getElementById('debug-screen').hidden)problems.push('debug screen did not open');
+                        if(!document.getElementById('workflow').hidden)problems.push('build workflow still shown');
+                        if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('shell scrolls: '+root.scrollWidth+'x'+root.scrollHeight);
+                        const scrollers=[...document.querySelectorAll('#debug-screen .debug-column, #debug-screen .debug-layout')]
+                            .filter(node=>/auto|scroll/.test(getComputedStyle(node).overflowY));
+                        if(!scrollers.length)problems.push('no scrolling pane');
+                        for(const card of document.querySelectorAll('#debug-screen .panel-card')){
+                            if(card.hidden)continue;     // empty cards hide rather than stand there saying nothing
+                            const r=card.getBoundingClientRect(),name=(card.querySelector('h2,summary')||card).textContent.slice(0,28);
+                            if(!r.width||!r.height)problems.push(name+' collapsed');
+                            if(r.right>innerWidth+.5||r.left<-.5)problems.push(name+' outside the viewport width');
+                            const pane=scrollers.find(node=>node.contains(card));
+                            if(!pane)problems.push(name+' is not inside a scrolling pane');
+                        }
+                        for(const control of document.querySelectorAll('#debug-screen button:not([hidden]), #debug-screen select')){
+                            const r=control.getBoundingClientRect();
+                            if(control.offsetParent===null)continue;
+                            if(r.right>innerWidth+.5||r.left<-.5)problems.push((control.id||control.textContent.trim()).slice(0,24)+' control outside width');
+                        }
+                        if(!document.getElementById('debug-banner').hidden)problems.push('an alert is standing on an unarmed console');
+                        if(!document.getElementById('debug-monitor-card').hidden)problems.push('the monitor card shows with no monitor configured');
+                        if(!document.querySelectorAll('#debug-tools .tool-row').length)problems.push('no tool rows rendered');
+                        if(!document.querySelectorAll('#debug-box-rows tr').length)problems.push('no observed boxes rendered');
+                        if(!document.querySelectorAll('#debug-log article').length)problems.push('no log entries rendered');
+                        return problems;
+                    })()`);
+                    if(problems.length)failures.push({viewport:[width,height],problems});
+                }
+                console.log(JSON.stringify({failures,errors},null,2));
+                if(failures.length||errors.length)process.exitCode=1;
+            } finally {
+                for(const call of pending.values())clearTimeout(call.timer);
+                ws.close();
+                await fetch(cdp+'/json/close/'+target.id);
+            }
+        """
+        try:
+            result = subprocess.run([shutil.which("node"), "--input-type=module", "-"], input=script,
+                                    capture_output=True, text=True, timeout=90,
+                                    env=dict(os.environ, CRAFTER_DEBUG_STATE=payload,
+                                             CRAFTER_LAYOUT_URL=f"http://127.0.0.1:{server.server_port}"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_debug_screen_is_separate_and_offers_every_agent_operation(self):
+        from agent_types import MOTION_OPS
+        from debug_console import OPERATIONS
+        html = (PANEL_DIR / "panel.html").read_text()
+        self.assertIn('<script defer src="/debug.js"></script>', html)
+        self.assertIn('id="open-debug"', html.split('<main', 1)[0])
+        self.assertRegex(html, r'<section id="debug-screen"[^>]*\bdata-screen="debug"[^>]*\bhidden>')
+        debug = html.split('<section id="debug-screen"', 1)[1].split("</section>", 1)[0]
+        for element in ("debug-tools", "debug-health", "debug-image", "debug-occupancy",
+                        "debug-warnings", "debug-json", "debug-viz", "debug-log", "debug-stop",
+                        "debug-arm", "debug-executor", "debug-capabilities"):
+            with self.subTest(element=element):
+                self.assertIn(f'id="{element}"', debug)
+        for screen in ("main-screen", "build-screen", "complete-screen"):
+            with self.subTest(screen=screen):
+                section = html.split(f'<section id="{screen}"', 1)[1].split("</section>", 1)[0]
+                self.assertNotIn("debug-", section)
+        script = (PANEL_DIR / "debug.js").read_text()
+        offered = set(re.findall(r"\{id: '([a-z_]+)'", script))
+        self.assertTrue(set(OPERATIONS) <= offered, set(OPERATIONS)-offered)
+        for operation in MOTION_OPS:
+            with self.subTest(operation=operation):
+                self.assertRegex(script, rf"\{{id: '{operation}'[^}}]*motion: true")
+
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_javascript_syntax(self):
         import quickjs
-        source = (PANEL_DIR / "panel.js").read_text()
-        quickjs.Context().eval("new Function("+json.dumps(source)+")")
+        for name in ("panel.js", "debug.js"):
+            with self.subTest(script=name):
+                source = (PANEL_DIR / name).read_text()
+                quickjs.Context().eval("new Function("+json.dumps(source)+")")
 
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_3d_preview_draws_visible_top_and_rotates(self):
@@ -571,6 +721,112 @@ class PanelHTTPTests(unittest.TestCase):
             response = client.post("/api/key", json={"api_key": "sk-test-placeholder-not-a-real-key"}, headers=headers)
             self.assertEqual(response.status_code, 403)
             self.assertFalse(session.snapshot()["llm_ready"])
+
+    def test_debug_console_drives_the_agents_tools_by_hand(self):
+        from fastapi.testclient import TestClient
+        from panel import create_app
+        console = debug_console()
+        session = PanelSession(FirstChoice, tool_delay=0, debug=console)
+        with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
+            state = client.get("/api/state").json()
+            headers = {"X-Crafter-Token": state["csrf"]}
+            self.assertEqual(state["debug_kind"], "test double")
+            self.assertEqual(client.get("/debug.js").status_code, 200)
+            self.assertEqual(client.post("/api/debug/observe", json={}).status_code, 403)
+
+            self.assertEqual(client.post("/api/debug/open", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/state").json()["view"], "debug")
+            self.assertEqual(client.get("/api/debug/image?view=rect").status_code, 503)
+
+            snapshot = client.post("/api/debug/observe", json={}, headers=headers).json()["snapshot"]
+            self.assertTrue(snapshot["valid"])
+            self.assertEqual(len(snapshot["boxes"]), 4)
+            image = client.get("/api/debug/image?view=" + snapshot["images"][0]["view"])
+            self.assertEqual(image.status_code, 200)
+            self.assertTrue(image.headers["Content-Type"].startswith("image/"))
+
+            sites = client.post("/api/debug/sites", headers=headers).json()["sites"]
+            self.assertEqual([site["id"] for site in sites], ["obstructed", "floor-a"])
+            selected = client.post("/api/debug/select", json={"site_id": "floor-a"}, headers=headers)
+            self.assertEqual(selected.json()["site"]["id"], "floor-a")
+            client.post("/api/debug/observe", json={"site_id": "floor-a"}, headers=headers)
+
+            for body in ({"operation": "done"}, {"operation": "approach_box", "box_id": -1},
+                         {"operation": "approach_box", "cell": [0, 0]}, {"operation": "look_around", "search": "elsewhere"}):
+                with self.subTest(body=body):
+                    self.assertEqual(client.post("/api/debug/action", json=body, headers=headers).status_code, 400)
+
+            action = {"operation": "approach_box", "box_id": 0, "site_id": "floor-a", "cell": [0, 0, 0]}
+            unarmed = client.post("/api/debug/action", json=action, headers=headers)
+            self.assertEqual(unarmed.status_code, 409)
+            self.assertIn("arm actions", unarmed.json()["detail"])
+            self.assertFalse(client.get("/api/debug").json()["actions_open"])
+
+            self.assertEqual(client.post("/api/debug/arm", json={"armed": "yes"}, headers=headers).status_code, 400)
+            armed = client.post("/api/debug/arm", json={"armed": True}, headers=headers)
+            self.assertEqual(armed.status_code, 200)
+            self.assertTrue(armed.json()["armed"] and armed.json()["actions_open"])
+
+            started = client.post("/api/debug/action", json=action, headers=headers)
+            self.assertEqual(started.status_code, 200)
+            self.assertEqual(started.json()["active"]["operation"], "approach_box")
+            deadline = time.monotonic()+6
+            while client.get("/api/debug").json()["active"] and time.monotonic() < deadline:
+                time.sleep(.02)
+            finished = client.get("/api/debug").json()
+            self.assertIsNone(finished["active"])
+            self.assertEqual(finished["outcome"]["status"], "succeeded")
+            self.assertTrue(any(entry["kind"] == "action" for entry in finished["log"]))
+
+            self.assertEqual(client.post("/api/debug/verify", headers=headers).status_code, 200)
+            self.assertEqual(client.post("/api/debug/stop", headers=headers).status_code, 200)
+            self.assertEqual(client.post("/api/main", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/state").json()["view"], "main")
+
+    def test_a_panel_without_a_console_exposes_no_debug_surface(self):
+        from fastapi.testclient import TestClient
+        from panel import create_app
+        session = PanelSession(FirstChoice, tool_delay=0)
+        with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
+            headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
+            self.assertIsNone(client.get("/api/state").json()["debug_kind"])
+            for path in ("/api/debug", "/api/debug/image?view=rect"):
+                with self.subTest(path=path):
+                    self.assertEqual(client.get(path).status_code, 404)
+            for path in ("/api/debug/open", "/api/debug/observe", "/api/debug/sites", "/api/debug/stop"):
+                with self.subTest(path=path):
+                    self.assertEqual(client.post(path, json={}, headers=headers).status_code, 404)
+
+    def test_a_running_build_keeps_the_manual_tools_out_of_the_way(self):
+        from fastapi.testclient import TestClient
+        from panel import create_app
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Blocking:
+            def decide(self, context, choices):
+                release.wait(5)
+                return choices[0]
+
+        console = debug_console()
+        session = PanelSession(Blocking, tool_delay=0, debug=console)
+        with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
+            headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
+            client.post("/api/example", headers=headers)
+            design_id = client.get("/api/state").json()["design"]["id"]
+            self.assertEqual(client.post("/api/builds", json={"design_id": design_id}, headers=headers).status_code, 200)
+            client.post("/api/debug/open", headers=headers)
+            self.assertEqual(client.get("/api/state").json()["view"], "debug")
+            self.assertEqual(client.post("/api/debug/observe", json={}, headers=headers).status_code, 200)
+            action = {"operation": "look_around", "search": "materials"}
+            refused = client.post("/api/debug/action", json=action, headers=headers)
+            self.assertEqual(refused.status_code, 409)
+            self.assertIn("build is running", refused.json()["detail"])
+            self.assertEqual(client.post("/api/main", headers=headers).status_code, 200)
+            self.assertEqual(client.get("/api/state").json()["view"], "build")
+            release.set()
+            session.cancel()
+            self.assertTrue(session.wait(5))
 
     def test_http_assets_state_protection_and_complete_flow(self):
         from fastapi.testclient import TestClient

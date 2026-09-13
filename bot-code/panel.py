@@ -9,11 +9,13 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from agent import Agent, JobCancelled, validate_job
 from agent_backend import OpenAIReasoner, load_api_key
-from agent_types import AgentConfig, cell_valid
+from agent_types import MOTION_OPS, AgentConfig, cell_valid
 from contracts import Block, Structure
+from debug_console import DEFAULT_VOXEL, DebugConsole, perception_sources, provider_sources, robot_sources
 from mock_agent_world import MockAgentWorld
 
 PANEL_DIR = Path(__file__).parent / "web"
@@ -181,11 +183,12 @@ class PanelReasoner:
 
 class PanelSession:
     def __init__(self, reasoner_factory=None, model="gpt-4o-mini", tool_delay=.65,
-                 base_url=None, model_timeout=15.0, json_only=False):
+                 base_url=None, model_timeout=15.0, json_only=False, debug=None):
         if not math.isfinite(tool_delay) or not 0 <= tool_delay <= 5:
             raise ValueError("simulation delay must be between 0 and 5 seconds")
         self.reasoner_factory, self.model, self.tool_delay = reasoner_factory, model, tool_delay
         self.base_url, self.model_timeout, self.json_only = base_url, model_timeout, json_only
+        self.debug = debug
         self.lock = threading.RLock()
         self.csrf = secrets.token_urlsafe(32)
         self.design = None
@@ -263,7 +266,8 @@ class PanelSession:
             return copy.deepcopy({"revision": self.revision, "view": self.view, "design": self.design,
                                   "job": self.job, "notice": self.notice, "receiver": self.receiver,
                                   "worker_busy": self.worker_busy, "llm_ready": self.reasoner_factory is not None,
-                                  "model": self.model, "csrf": self.csrf, "simulation": True})
+                                  "model": self.model, "csrf": self.csrf, "simulation": True,
+                                  "debug_kind": self.debug.kind if self.debug else None})
 
     def start(self, design_id):
         with self.lock:
@@ -368,9 +372,38 @@ class PanelSession:
     def back(self):
         with self.lock:
             if self.job and self.job["status"] == "running":
-                raise ValueError("cancel the active build before returning")
-            self.view = "main"
+                if self.view != "debug":
+                    raise ValueError("cancel the active build before returning")
+                self.view = "build"      # the debug screen is a detour, not an exit from the build
+            else:
+                self.view = "main"
             self.revision += 1
+
+    def open_debug(self):
+        with self.lock:
+            if self.debug is None:
+                raise ValueError("the debug console is not available in this panel")
+            self.view = "debug"
+            self.revision += 1
+
+    def debug_requirements(self, source):
+        """Requirements the manual tools admit actions against: the live design, or one cell."""
+        if self.debug is None:
+            raise ValueError("the debug console is not available in this panel")
+        if source == "design":
+            with self.lock:
+                design = copy.deepcopy(self.design)
+            if not design:
+                raise ValueError("no Minecraft design has been received yet")
+            config = AgentConfig(voxel_size=self.debug.voxel_size, max_blocks=PANEL_CONFIG.max_blocks)
+            job = validate_job(Structure([Block(**b) for b in design["blocks"]]),
+                               self.debug.job_id, config)
+            return self.debug.set_requirements(job.requirements, f"Minecraft design {design['id']}")
+        if source == "cell":
+            config = AgentConfig(voxel_size=self.debug.voxel_size)
+            job = validate_job(Structure([Block(0, 0, 0)]), self.debug.job_id, config)
+            return self.debug.set_requirements(job.requirements, "single cell at the site origin")
+        raise ValueError("requirements come from the current design or a single cell")
 
     def wait(self, timeout):
         thread = self.worker
@@ -381,16 +414,41 @@ class PanelSession:
     def close(self):
         with self.lock:
             self.closed = True
+            debug = self.debug
         self.cancel()
         self.wait(.1)
+        if debug is not None:
+            debug.close()
         with self.lock:
             self.reasoner_factory = None
 
 
+def build_debug_console(provider=None, perception=None, box_size=None):
+    """The real providers behind the manual tool bench. There is no simulated option by design.
+
+    Default is the deployed shape: perception in this process, actions from the interface-v2
+    provider once armed. The two overrides exist for development against a perception server that
+    is already running, or a different provider factory.
+    """
+    voxel = (box_size,)*3 if box_size else DEFAULT_VOXEL
+    if provider:
+        observations, actions = provider_sources(provider)
+        kind = f"live providers from {provider}"
+    elif perception:
+        observations, actions = perception_sources(perception)
+        kind = "live perception, no motion owner"
+    else:
+        observations, actions = robot_sources(voxel)
+        kind = "this robot, in process"
+    return DebugConsole(observations, actions, kind=kind, voxel_size=voxel,
+                        perception_url=perception)
+
+
 def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model="gpt-4o-mini",
-               base_url=None, model_timeout=15.0, json_only=False, tool_delay=.65):
+               base_url=None, model_timeout=15.0, json_only=False, tool_delay=.65,
+               debug_provider=None, debug_perception=None, box_size=None):
     from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.responses import FileResponse, JSONResponse, Response
 
     if session is None:
         key = load_api_key()
@@ -398,8 +456,11 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
         if key or base_url:
             factory = lambda: OpenAIReasoner(model=model, base_url=base_url, api_key=key or "unused",
                                              timeout=model_timeout, json_only=json_only)
-        session = PanelSession(factory, model, tool_delay, base_url, model_timeout, json_only)
+        session = PanelSession(factory, model, tool_delay, base_url, model_timeout, json_only,
+                               debug=build_debug_console(debug_provider, debug_perception, box_size))
     receiver = StructureReceiver(session, receiver_host, receiver_port)
+    origin = urlsplit(debug_perception) if debug_perception else None
+    frame_src = f"{origin.scheme}://{origin.netloc}" if origin else "'none'"
 
     @asynccontextmanager
     async def lifespan(app):
@@ -425,7 +486,9 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; object-src 'none'"
+        response.headers["Content-Security-Policy"] = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+                                                       "img-src 'self' data:; connect-src 'self'; base-uri 'none'; object-src 'none'; "
+                                                       f"frame-src {frame_src}")
         return response
 
     @app.get("/")
@@ -439,6 +502,10 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
     @app.get("/panel.css")
     def stylesheet():
         return FileResponse(PANEL_DIR / "panel.css", media_type="text/css")
+
+    @app.get("/debug.js")
+    def debug_script():
+        return FileResponse(PANEL_DIR / "debug.js", media_type="text/javascript")
 
     @app.get("/assets/Crafter-transparent.svg")
     def logo():
@@ -507,11 +574,103 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
         session.receive(copy.deepcopy(EXAMPLE), source="Example")
         return {"ok": True}
 
+    def console():
+        if session.debug is None:
+            raise HTTPException(404, "the debug console is not available in this panel")
+        return session.debug
+
+    def run(call, *args, **kwargs):
+        """Every manual tool answers with the console's whole state, so one call refreshes the page."""
+        console()
+        try:
+            call(*args, **kwargs)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return console().state()
+
+    @app.get("/api/debug")
+    def debug_state():
+        return console().state()
+
+    @app.get("/api/debug/image")
+    def debug_image(view: str = "rect"):
+        if not isinstance(view, str) or not 0 < len(view) <= 64:
+            raise HTTPException(400, "unknown image view")
+        image = console().image(view)
+        if image is None:
+            raise HTTPException(503, "no image of that view in the latest observation")
+        media_type, data = image
+        return Response(data, media_type=media_type, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/debug/open")
+    def debug_open():
+        return run(session.open_debug)
+
+    @app.post("/api/debug/arm")
+    def debug_arm(body: dict):
+        if type(body.get("armed")) is not bool:
+            raise HTTPException(400, "armed must be true or false")
+        return run(console().arm, body["armed"])
+
+    @app.post("/api/debug/requirements")
+    def debug_requirements(body: dict):
+        return run(session.debug_requirements, body.get("source"))
+
+    @app.post("/api/debug/observe")
+    def debug_observe(body: dict):
+        site_id = body.get("site_id")
+        if site_id is not None and (not isinstance(site_id, str) or not 0 < len(site_id) <= 128):
+            raise HTTPException(400, "site_id must be a bounded string")
+        return run(console().observe, site_id)
+
+    @app.post("/api/debug/sites")
+    def debug_sites():
+        return run(console().find_sites)
+
+    @app.post("/api/debug/select")
+    def debug_select(body: dict):
+        return run(console().select_site, body.get("site_id"))
+
+    @app.post("/api/debug/verify")
+    def debug_verify():
+        return run(console().verify)
+
+    @app.post("/api/debug/action")
+    def debug_action(body: dict):
+        operation, cell = body.get("operation"), body.get("cell")
+        box_id, site_id, search = body.get("box_id"), body.get("site_id"), body.get("search")
+        if operation not in MOTION_OPS:
+            raise HTTPException(400, "operation must be one of the agent's motion operations")
+        if box_id is not None and (type(box_id) is not int or box_id < 0):
+            raise HTTPException(400, "box_id must be a nonnegative integer")
+        if site_id is not None and (not isinstance(site_id, str) or not 0 < len(site_id) <= 128):
+            raise HTTPException(400, "site_id must be a bounded string")
+        if cell is not None and not cell_valid(cell):
+            raise HTTPException(400, "cell must contain three integers")
+        if search is not None and search not in {"materials", "sites"}:
+            raise HTTPException(400, "search must be materials or sites")
+        if session.snapshot()["worker_busy"]:
+            raise HTTPException(409, "a build is running; cancel it before driving tools by hand")
+        return run(console().submit, operation, box_id=box_id, site_id=site_id,
+                   cell=cell, search=search)
+
+    @app.post("/api/debug/cancel")
+    def debug_cancel():
+        return run(console().cancel)
+
+    @app.post("/api/debug/stop")
+    def debug_stop():
+        return run(console().stop)
+
     return app
 
 
 def serve_panel(host="127.0.0.1", port=8005, receiver_host="0.0.0.0", receiver_port=5005, **kwargs):
     import uvicorn
     app = create_app(receiver_host=receiver_host, receiver_port=receiver_port, **kwargs)
+    console = app.state.panel.debug
     print(f"[panel] http://{host}:{port} | Minecraft TCP {receiver_port} | real LLM, simulated tools", flush=True)
+    if console is not None:
+        print(f'[panel] debug screen: open the panel, then "Debug console" | manual tools against {console.kind} providers'
+              + (f" | perception {console.perception_url}" if console.perception_url else ""), flush=True)
     uvicorn.run(app, host=host, port=port, log_level="warning")
