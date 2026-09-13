@@ -182,8 +182,8 @@ def box_rejection(track, voxel_size):
     score = track.get("score")
     if not isinstance(score, (int, float)) or not math.isfinite(score):
         return "no confidence score"
-    if score < SCORE_MIN:
-        return f"confidence {score:.2f} below {SCORE_MIN:.2f}"
+    if score < SCORE_SELECT:
+        return f"confidence {score:.2f} below {SCORE_SELECT:.2f}"
     return None
 
 
@@ -581,7 +581,13 @@ CARRY_MIN_POINTS = 8
 # perception handoff asks for exactly that: a higher confidence threshold applied in an
 # adapter/selection policy rather than inside the detector.
 DETECTOR_LABEL = "cardboard_box"
-SCORE_MIN = 0.30          # handoff's recommended floor before a pickup; do not quietly go under .20
+# The handoff separates two thresholds and they are not interchangeable: "at least 0.25 for
+# target selection, preferably 0.30 before pickup". Selecting a box is reversible -- the agent can
+# approach, look again and abandon it. Closing two arms around one is not. So selection uses the
+# lower bar and the grasp re-checks against the higher one, with fresher evidence than selection
+# ever had. Neither may quietly drop under 0.20.
+SCORE_SELECT = 0.25       # eligible as a target
+SCORE_PICKUP = 0.30       # required again, immediately before closing on it
 DEPTH_OK = frozenset({"surface_supported"})   # has real depth AND rests on a measured plane      # depth returns needed before "nothing there" means empty rather than blind
 
 

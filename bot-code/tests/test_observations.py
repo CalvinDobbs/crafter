@@ -184,8 +184,20 @@ class EligibilityTests(unittest.TestCase):
         self.assertFalse(observations.eligible_box(proposal(score=0.19), VOXEL))
         self.assertFalse(observations.eligible_box(proposal(score=None), VOXEL))
 
-    def test_the_policy_floor_is_not_quietly_below_the_handoff_minimum(self):
-        self.assertGreaterEqual(observations.SCORE_MIN, 0.20)
+    def test_neither_threshold_drops_below_the_handoff_minimum(self):
+        self.assertGreaterEqual(observations.SCORE_SELECT, 0.20)
+        self.assertGreaterEqual(observations.SCORE_PICKUP, 0.20)
+
+    def test_grasping_demands_more_confidence_than_selecting(self):
+        # selecting a box can be abandoned after a closer look; closing two arms on one cannot
+        self.assertGreater(observations.SCORE_PICKUP, observations.SCORE_SELECT)
+
+    def test_a_box_good_enough_to_approach_may_not_be_good_enough_to_grasp(self):
+        between = (observations.SCORE_SELECT + observations.SCORE_PICKUP) / 2
+        self.assertTrue(observations.eligible_box(proposal(score=between), VOXEL),
+                        "it is worth approaching for a closer look")
+        self.assertLess(between, observations.SCORE_PICKUP,
+                        "but the grasp must ask again with fresher evidence")
 
     def test_a_proposal_without_a_support_plane_is_rejected(self):
         # flat floor or wall reads as box-shaped; the support plane is what separates them
