@@ -13,7 +13,7 @@ claws open. This is a pose reset for an already-homed, unloaded robot, not encod
 homing. By default, prepare the wrists before descent, bring the arms inward, and
 hold the squeeze until Ctrl+C (or --hold SECS). Torque stays on during the hold;
 exiting disables torque and releases the box. --lower-only skips wrist preparation
-and grasping, but not initialization. --pickup adds grip, cradle and lift. The bottom
+and grasping, but not initialization or elbow extension. --pickup adds grip, cradle and lift. The bottom
 margin is a lift offset, not a measured floor distance.
 
 Joint-space, no IK. Stages:
@@ -25,13 +25,15 @@ Joint-space, no IK. Stages:
      so the forearms straddle a box much wider than the shoulders
   3. prepare wrists: rotate J6 inward toward the box while J0 stays at the top, preserving
      the initialized J4 roll, J5 and open J7 claw setpoints; --hook caps J6 travel and 0 skips this stage
-  4. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
+  4. extend elbows (J3) by --elbow-extension turns from home while raised (default: 20 deg);
+     wait for both arms to arrive, then lift (J0) -> bottom minus --bottom-margin turns
+     toward the top; --lower-only holds this extended reach pose
   5. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
           (tracking error rises), then holds --squeeze turns past contact; hold here by default
        b. with --pickup, grip: grippers close (on a rim/corner if there is one; otherwise they just stiffen the
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
-       c. with --pickup, cradle: the elbows flex a little past 90 deg, lifting the front edge of the box so it
+       c. with --pickup, cradle: the elbows flex a little from the reach pose, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
   6. with --pickup, shoot J0 back up to the top (shoulder level) and hold
 All other joints hold their initialized pose. Range edges come from the per-robot
@@ -40,7 +42,7 @@ ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outw
 from FK, never hard-coded.
 
 Usage:  uv run pickup.py [--arm left|right|both] [--speed TURNS_PER_S] [--hold SECS]
-                         [--bottom-margin TURNS] [--spread TURNS] [--squeeze TURNS]
+                         [--bottom-margin TURNS] [--elbow-extension TURNS] [--spread TURNS] [--squeeze TURNS]
                          [--lower-only | --pickup] [--hook TURNS] [--cradle TURNS]
 """
 import argparse
@@ -63,7 +65,9 @@ WRIST_ROLL = 4
 WRIST_ROLL_TURNS = 0.25
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
-J0_BOTTOM_MARGIN = 0.80
+J0_BOTTOM_MARGIN = 1.0
+ELBOW_EXTENSION = 20.0 / 360.0
+ELBOW_EXTENSION_SPEED = 0.05
 INITIALIZE_SPEED = 0.08
 LIFT_SPEED = 1.2        # turns/s for the final shoot-up
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
@@ -89,7 +93,7 @@ HOOK_SQUEEZE = 0.01     # turns past the hook contact point. TUNE on box
 GRIP_SPEED = 0.4        # turns/s closing / opening the gripper (~0.33 turns in <1 s)
 GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open (~quest_teleop's wide-open)
 GRIP_SETTLE_S = 0.5     # let the jaws seat before tilting
-CRADLE_TILT = 0.03      # turns (~11 deg) of extra elbow flex past 90 deg to lift the box's front edge. TUNE
+CRADLE_TILT = 0.03      # turns (~11 deg) of extra elbow flex from the reach pose to lift the box's front edge. TUNE
 CRADLE_SPEED = 0.05     # turns/s; slow so the box rolls back onto the forearms, not out of them
 CRADLE_SETTLE_S = 0.5   # let the load settle on the forearms before lifting
 
@@ -178,9 +182,17 @@ class Arm:
             raise ValueError(f"{self.side}: wrist roll target is too close to a calibrated stop")
         return pose
 
-    def cradle(self, tilt):
-        """Elbow target ``tilt`` turns past 90 deg: 'more flex' is the sign of home[ELBOW] on this arm."""
-        return self.elbow_90 + float(np.sign(self.elbow_90) or 1.0) * tilt
+    def reach_elbow(self, extension):
+        if not 0 <= extension <= abs(self.elbow_90):
+            raise ValueError(f"{self.side}: elbow extension must stay between home and straight")
+        return self.cradle(-extension)
+
+    def cradle(self, tilt, *, start=None):
+        """Flex ``tilt`` turns from ``start`` (default: 90 deg), respecting calibrated elbow stops."""
+        target = (self.elbow_90 if start is None else start) + float(np.sign(self.elbow_90) or 1.0) * tilt
+        if not self.edge(ELBOW, -1) <= target <= self.edge(ELBOW, 1):
+            raise ValueError(f"{self.side}: elbow target is outside calibrated range margins")
+        return target
 
     def live(self):
         while not self.r_state.ready():
@@ -262,7 +274,7 @@ def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False
             all_arrived &= arrived
         if done or now - t0 > timeout:
             if require_arrival and not all_arrived:
-                raise RuntimeError(f"[pickup] initialization: J{joint} did not reach its target on every arm")
+                raise RuntimeError(f"[pickup] J{joint} did not reach its target on every arm")
             break
         time.sleep(dt)
 
@@ -382,16 +394,18 @@ def main():
                     help="max inward J6 wrist rotation in turns before descent; roll, J5 and claws hold, 0 disables (default: %(default)s)")
     ap.add_argument("--squeeze", type=float, default=PINCH_SQUEEZE,
                     help="extra inward J2 turns past detected contact, capped by calibration (default: %(default)s)")
-    ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex in turns after gripping; 0 disables")
+    ap.add_argument("--elbow-extension", type=float, default=ELBOW_EXTENSION,
+                    help="J3 extension from the 90-degree home bend in turns before descent; 0 disables (default: %(default)s)")
+    ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex from the reach pose in turns after gripping; 0 disables")
     args = ap.parse_args()
     for name in ("speed", "bottom_margin"):
         value = getattr(args, name)
         if not np.isfinite(value) or value <= 0:
             ap.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
-    for name in ("hook", "squeeze"):
+    for name in ("hook", "squeeze", "elbow_extension"):
         value = getattr(args, name)
         if not np.isfinite(value) or value < 0:
-            ap.error(f"--{name} must be finite and nonnegative")
+            ap.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
     if args.hold is not None and (not np.isfinite(args.hold) or args.hold < 0):
         ap.error("--hold must be finite and nonnegative")
     hold_description = "until Ctrl+C" if args.hold is None else f"for {args.hold:.1f}s"
@@ -400,6 +414,9 @@ def main():
     arms = [Arm(s) for s in sides]
     try:
         initial_targets = [a.initial_pose() for a in arms]
+        elbow_targets = [a.reach_elbow(args.elbow_extension) for a in arms]
+        cradle_targets = ([a.cradle(args.cradle, start=target) for a, target in zip(arms, elbow_targets)]
+                          if args.pickup and args.cradle > 0 else [])
         # Only an OFF->ON transition reseeds the daemon's command filter, so disable first
         # and flush ctrl to the live pose before energizing.
         for a in arms:
@@ -416,7 +433,7 @@ def main():
         hold(arms, ENABLE_SETTLE_S)
 
         # J3 carries the forearm, so it eases on a quintic (as in homing.py). It is held at
-        # 90 deg by every later stage, which only moves other joints and keeps the rest of the command.
+        # 90 deg during setup, then extended while raised before the lift descends.
         if not initialize_pose(arms, initial_targets, args.speed):
             return
 
@@ -445,6 +462,18 @@ def main():
         if _stop:
             return
 
+        if args.elbow_extension > 0:
+            print(f"[pickup] reach: extend elbows {args.elbow_extension * 360:.1f} deg while raised", flush=True)
+            for a, target in zip(arms, elbow_targets):
+                print(f"[pickup] {a.side}: extend J3 {a.cmd[ELBOW]:+.3f} -> {target:+.3f}", flush=True)
+            ramp_joint(arms, ELBOW, elbow_targets, ELBOW_EXTENSION_SPEED, ease=smootherstep)
+            if _stop:
+                return
+            settle_joint(arms, ELBOW, require_arrival=True)
+            hold(arms, ELBOW_SETTLE_S)
+        if _stop:
+            return
+
         low_targets = [j0_low_target(a.top, a.bottom, args.bottom_margin) for a in arms]
         for a, target in zip(arms, low_targets):
             print(f"[pickup] {a.side}: low J0 target {target:+.3f} (bottom {a.bottom:+.3f}, margin {args.bottom_margin:.3f})", flush=True)
@@ -459,7 +488,7 @@ def main():
             hold(arms, args.hold)
             return
 
-        print("[pickup] grasp: swing elbows inward (J2), keeping elbow bend (J3) at 90 deg", flush=True)
+        print("[pickup] grasp: swing elbows inward (J2), keeping the extended elbow reach pose (J3)", flush=True)
         creep_to_contact(arms, pinch_direction, PINCH_SPEED, PINCH_CONTACT_ERR, args.squeeze,
                          max_travel=np.inf, label="pinch")
         hold(arms, PINCH_SETTLE_S)
@@ -473,9 +502,9 @@ def main():
         ramp_joint(arms, GRIPPER, [a.grip_closed for a in arms], GRIP_SPEED)
         hold(arms, GRIP_SETTLE_S)
 
-        if args.cradle > 0:
-            print("[pickup] cage: cradle tilt", flush=True)
-            ramp_joint(arms, ELBOW, [a.cradle(args.cradle) for a in arms], CRADLE_SPEED, ease=smootherstep)
+        if cradle_targets:
+            print("[pickup] cage: cradle tilt from extended reach pose", flush=True)
+            ramp_joint(arms, ELBOW, cradle_targets, CRADLE_SPEED, ease=smootherstep)
             hold(arms, CRADLE_SETTLE_S)
 
         print("[pickup] J0 -> top (shoot up)", flush=True)

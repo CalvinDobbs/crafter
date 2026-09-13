@@ -118,15 +118,130 @@ class PickupTests(unittest.TestCase):
         for arm, final in zip(arms, holds[-1][1]):
             self.assertAlmostEqual(final[pickup.SWING],
                                    arm.contact_position - arm.sign * pickup.PINCH_SQUEEZE)
-            self.assertAlmostEqual(final[pickup.J0], 1.2)
-            self.assertAlmostEqual(final[pickup.ELBOW], arm.elbow_90)
+            self.assertAlmostEqual(final[pickup.J0], 1.0)
+            self.assertAlmostEqual(final[pickup.ELBOW], arm.elbow_90 - arm.sign * 20 / 360)
             spread = arm.sign * 0.18
-            low_commands = [pos for pos in arm.commands if pos[pickup.J0] == 1.2]
+            low_commands = [pos for pos in arm.commands if pos[pickup.J0] == 1.0]
             self.assertAlmostEqual(low_commands[0][pickup.SWING], spread)
             swings = [arm.sign * pos[pickup.SWING] for pos in low_commands]
             self.assertTrue(all(a >= b - 1e-9 for a, b in zip(swings, swings[1:])))
             self.assertTrue(arm.closed)
             self.assertEqual(arm.torque, [False, True, False])
+
+    def test_elbows_extend_twenty_degrees_before_descent_and_hold_for_grasp(self):
+        for args in ((), ("--lower-only",), ("--hook", "0"),
+                     ("--arm", "left"), ("--arm", "right")):
+            with self.subTest(args=args):
+                arms, _, ramps = self.run_main(*args)
+                self.assertEqual(ramps.count(pickup.ELBOW), 2)
+                for arm in arms:
+                    target = arm.elbow_90 - arm.sign * 20 / 360
+                    extension = next(i for i, pos in enumerate(arm.commands)
+                                     if abs(pos[pickup.ELBOW] - target) < 1e-9)
+                    before, after = arm.commands[extension - 1:extension + 1]
+                    self.assertAlmostEqual(after[pickup.J0], arm.top)
+                    self.assertAlmostEqual(after[pickup.SWING], arm.sign * 0.18)
+                    held = [j for j in range(arm.dof) if j != pickup.ELBOW]
+                    np.testing.assert_array_equal(after[held], before[held])
+                    for pos in arm.commands[extension:]:
+                        self.assertAlmostEqual(pos[pickup.ELBOW], target)
+                    self.assertAlmostEqual(arm.cmd[pickup.J0], 1.0)
+
+    def test_elbow_extension_is_tunable_and_zero_preserves_home_bend(self):
+        for extension in (0.0, 0.025):
+            with self.subTest(extension=extension):
+                arms, _, ramps = self.run_main("--elbow-extension", str(extension))
+                self.assertEqual(ramps.count(pickup.ELBOW), 1 + (extension > 0))
+                for arm in arms:
+                    self.assertAlmostEqual(arm.cmd[pickup.ELBOW], arm.elbow_90 - arm.sign * extension)
+
+    def test_unreachable_elbow_extension_aborts_before_torque_enable(self):
+        initialize = FakeArm.__init__
+        created = []
+
+        def limited_elbow(arm, side):
+            initialize(arm, side)
+            arm.lo[pickup.ELBOW], arm.hi[pickup.ELBOW] = sorted([arm.sign * 0.22, arm.sign * 0.5])
+            created.append(arm)
+
+        with patch.object(FakeArm, "__init__", limited_elbow), self.assertRaisesRegex(ValueError, "elbow"):
+            self.run_main()
+        for arm in created:
+            self.assertNotIn(True, arm.torque)
+            self.assertEqual(arm.commands, [])
+            self.assertTrue(arm.closed)
+
+    def test_elbow_extension_failure_or_stop_prevents_descent_and_pinch(self):
+        for stop in (True, False):
+            created = []
+            initialize = FakeArm.__init__
+
+            def make_arm(arm, side):
+                initialize(arm, side)
+                created.append(arm)
+
+            def settle(arms, joint, **kwargs):
+                if joint == pickup.ELBOW and abs(arms[0].cmd[joint] - arms[0].elbow_90) > 1e-9:
+                    self.assertTrue(kwargs.get("require_arrival"))
+                    if stop:
+                        pickup._sigint()
+                    else:
+                        raise RuntimeError("Elbow extension stalled")
+
+            with self.subTest(stop=stop), patch.object(FakeArm, "__init__", make_arm):
+                pickup._stop = False
+                if stop:
+                    self.run_main(settle_effect=settle)
+                    self.assertTrue(pickup._stop)
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "extension stalled"):
+                        self.run_main(settle_effect=settle)
+            for arm in created:
+                self.assertTrue(all(pos[pickup.J0] == arm.top for pos in arm.commands))
+                self.assertEqual(arm.torque, [False, True, False])
+                self.assertTrue(arm.closed)
+
+    def test_extension_cannot_pass_straight_or_calibrated_stop_margin(self):
+        for side in ("left", "right"):
+            with self.subTest(side=side):
+                arm = FakeArm(side)
+                with self.assertRaisesRegex(ValueError, "straight"):
+                    arm.reach_elbow(0.3)
+                target = arm.elbow_90 - arm.sign * 20 / 360
+                if arm.sign > 0:
+                    arm.lo[pickup.ELBOW] = target - pickup.RANGE_MARGIN / 2
+                else:
+                    arm.hi[pickup.ELBOW] = target + pickup.RANGE_MARGIN / 2
+                with self.assertRaisesRegex(ValueError, "range margins"):
+                    arm.reach_elbow(20 / 360)
+
+    def test_pickup_cradle_is_relative_to_the_extended_elbow_pose(self):
+        for tilt in (0.0, 0.01):
+            with self.subTest(tilt=tilt):
+                arms, _, ramps = self.run_main("--pickup", "--elbow-extension", "0.025", "--cradle", str(tilt))
+                self.assertEqual(ramps.count(pickup.ELBOW), 2 + (tilt > 0))
+                for arm in arms:
+                    self.assertAlmostEqual(arm.cmd[pickup.ELBOW], arm.elbow_90 + arm.sign * (tilt - 0.025))
+                    self.assertAlmostEqual(arm.cmd[pickup.J0], arm.top)
+
+    def test_elbow_extension_interpolates_without_changing_other_joints(self):
+        arms = [FakeArm(side) for side in ("left", "right")]
+        for arm in arms:
+            arm.cmd = arm.initial_pose()
+            arm.cmd[pickup.SWING] = arm.sign * 0.18
+            arm.cmd[pickup.WRIST_PITCH] = -arm.sign * pickup.HOOK_MAX_TRAVEL
+        starts = [arm.cmd.copy() for arm in arms]
+        targets = [arm.reach_elbow(pickup.ELBOW_EXTENSION) for arm in arms]
+        pickup.ramp_joint(arms, pickup.ELBOW, targets, pickup.ELBOW_EXTENSION_SPEED, ease=pickup.smootherstep)
+        self.assertGreaterEqual(self.clock.now, pickup.ELBOW_EXTENSION / pickup.ELBOW_EXTENSION_SPEED)
+        for arm, start, target in zip(arms, starts, targets):
+            held = [j for j in range(arm.dof) if j != pickup.ELBOW]
+            self.assertAlmostEqual(arm.cmd[pickup.ELBOW], target)
+            bends = [arm.sign * pos[pickup.ELBOW] for pos in arm.commands]
+            self.assertTrue(all(a >= b - 1e-9 for a, b in zip(bends, bends[1:])))
+            for pos in arm.commands:
+                np.testing.assert_array_equal(pos[held], start[held])
+                self.assertGreaterEqual(arm.sign * pos[pickup.ELBOW], arm.sign * target - 1e-9)
 
     def test_claws_roll_quarter_turn_while_raised_and_hold_through_pickup(self):
         for args in ((), ("--pickup",), ("--lower-only",), ("--hook", "0"),
@@ -205,7 +320,8 @@ class PickupTests(unittest.TestCase):
             self.assertAlmostEqual(arm.cmd[pickup.SWING],
                                    arm.contact_position - arm.sign * pickup.PINCH_SQUEEZE)
             self.assertAlmostEqual(arm.cmd[pickup.J0], arm.top)
-            self.assertAlmostEqual(arm.cmd[pickup.ELBOW], arm.cradle(pickup.CRADLE_TILT))
+            self.assertAlmostEqual(arm.cmd[pickup.ELBOW],
+                                   arm.elbow_90 + arm.sign * (pickup.CRADLE_TILT - 20 / 360))
             self.assertAlmostEqual(arm.cmd[pickup.GRIPPER], arm.grip_closed)
 
     def test_single_arm_grasps_inward(self):
@@ -284,9 +400,9 @@ class PickupTests(unittest.TestCase):
 
     def test_defaults_increase_squeeze_and_raise_low_pose_on_mirrored_lifts(self):
         self.assertEqual(pickup.PINCH_SQUEEZE, 0.03)
-        self.assertEqual(pickup.J0_BOTTOM_MARGIN, 0.8)
+        self.assertEqual(pickup.J0_BOTTOM_MARGIN, 1.0)
         for sign in (1, -1):
-            self.assertAlmostEqual(pickup.j0_low_target(0, sign * 2, pickup.J0_BOTTOM_MARGIN), sign * 1.2)
+            self.assertAlmostEqual(pickup.j0_low_target(0, sign * 2, pickup.J0_BOTTOM_MARGIN), sign * 1.0)
             self.assertEqual(pickup.j0_low_target(0, sign * 2, 3), 0)
 
     def test_grasp_tuning_options_control_wrist_squeeze_and_height(self):
@@ -298,7 +414,7 @@ class PickupTests(unittest.TestCase):
             self.assertAlmostEqual(arm.cmd[pickup.J0], 0.75)
 
     def test_invalid_wrist_and_squeeze_values_fail_before_hardware_access(self):
-        for option in ("--hook", "--squeeze"):
+        for option in ("--hook", "--squeeze", "--elbow-extension"):
             for value in ("-0.1", "nan", "inf"):
                 with self.subTest(option=option, value=value):
                     with patch.object(pickup, "Arm") as arm, \
@@ -344,7 +460,7 @@ class PickupTests(unittest.TestCase):
             travel = (0.05 if arm.side == "left" else 0.1) + pickup.HOOK_SQUEEZE
             self.assertAlmostEqual(arm.cmd[pickup.WRIST_YAW], 0.0)
             self.assertAlmostEqual(arm.cmd[pickup.WRIST_PITCH], -arm.sign * travel)
-            self.assertAlmostEqual(arm.cmd[pickup.J0], 1.2)
+            self.assertAlmostEqual(arm.cmd[pickup.J0], 1.0)
 
     def test_wrist_preparation_preserves_initialized_roll_j5_and_claw_extension(self):
         initialize = FakeArm.__init__
