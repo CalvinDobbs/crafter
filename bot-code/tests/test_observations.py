@@ -164,7 +164,8 @@ def proposal(**over):
     """A detector proposal that passes every gate, so each test can spoil exactly one."""
     base = {"source": "box_detector", "label": "cardboard_box", "current": True,
             "classification": "loose", "identity_status": "tracked", "partial_view": False,
-            "depth_status": "surface_supported", "score": 0.62, "size": None}
+            "depth_status": "surface_supported", "score": 0.62, "size": None,
+            "confirmations": observations.MIN_CONFIRMATIONS}
     base.update(over)
     return base
 
@@ -181,12 +182,28 @@ class EligibilityTests(unittest.TestCase):
         self.assertTrue(observations.eligible_box(proposal(size=None), VOXEL))
 
     def test_low_confidence_is_rejected(self):
-        self.assertFalse(observations.eligible_box(proposal(score=0.19), VOXEL))
+        # relative to the threshold, so lowering it does not silently stop testing anything
+        self.assertFalse(observations.eligible_box(
+            proposal(score=observations.SCORE_SELECT - 0.01), VOXEL))
         self.assertFalse(observations.eligible_box(proposal(score=None), VOXEL))
 
-    def test_neither_threshold_drops_below_the_handoff_minimum(self):
-        self.assertGreaterEqual(observations.SCORE_SELECT, 0.20)
-        self.assertGreaterEqual(observations.SCORE_PICKUP, 0.20)
+    def test_a_single_confident_frame_is_not_enough(self):
+        # the score bar came down; repetition is the half that went up to pay for it
+        self.assertFalse(observations.eligible_box(proposal(confirmations=1), VOXEL))
+        self.assertIn("confirmations",
+                      observations.box_rejection(proposal(confirmations=1), VOXEL))
+
+    def test_repetition_admits_a_box_a_single_frame_would_not(self):
+        weak = observations.SCORE_SELECT + 0.01
+        self.assertFalse(observations.eligible_box(
+            proposal(score=weak, confirmations=1), VOXEL))
+        self.assertTrue(observations.eligible_box(
+            proposal(score=weak, confirmations=observations.MIN_CONFIRMATIONS), VOXEL))
+
+    def test_repetition_never_rescues_a_score_below_the_floor(self):
+        self.assertFalse(observations.eligible_box(
+            proposal(score=0.01, confirmations=999), VOXEL),
+            "confirmations lower the bar, they do not remove it")
 
     def test_grasping_demands_more_confidence_than_selecting(self):
         # selecting a box can be abandoned after a closer look; closing two arms on one cannot
@@ -225,7 +242,7 @@ class EligibilityTests(unittest.TestCase):
     def test_rejection_names_the_gate_that_stopped_it(self):
         # "nothing was eligible" is useless when a build will not start; this layer knows why
         cases = {
-            "confidence": proposal(score=0.19),
+            "confidence": proposal(score=observations.SCORE_SELECT - 0.01),
             "depth": proposal(depth_status="background_or_flat_surface"),
             "clipped by the frame": proposal(partial_view=True),
             "inside the build footprint": proposal(classification="protected"),

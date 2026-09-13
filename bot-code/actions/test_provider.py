@@ -314,9 +314,9 @@ class FaceBestTests(unittest.TestCase):
         self.assertAlmostEqual(swept, 2 * math.pi + 0.6, delta=0.2)
 
     def test_a_weak_candidate_is_still_worth_facing(self):
-        # 0.18 is far below the selection bar; looking is free, picking is not
-        self.assertLess(0.18, observations_score_select())
-        swept = self.survey(lambda: {"bearing": -0.5, "score": 0.18, "range": 1.5})
+        # below even the selection bar; looking is free and improves the evidence, picking is not
+        weak = observations_score_select() / 2
+        swept = self.survey(lambda: {"bearing": -0.5, "score": weak, "range": 1.5})
         self.assertAlmostEqual(swept, 2 * math.pi - 0.5, delta=0.2)
 
     def test_a_candidate_already_ahead_needs_no_turn(self):
@@ -443,6 +443,19 @@ class DriveTests(unittest.TestCase):
         self.assertLess(abs(target.state["bearing"]), 0.15,
                         "constant drift must be absorbed, not accumulated over the approach")
 
+    def test_correction_authority_exceeds_the_cruise_rate(self):
+        # a controller whose maximum correction is below the drift it must reject cannot
+        # converge; clamping correction to the cruise rate ran the heading away unbounded
+        self.assertGreater(armctl.STEER_MAX, armctl.DRIVE_OMEGA)
+
+    def test_heavy_drift_is_still_absorbed(self):
+        # 0.3 rad/s of uncommanded yaw, twice the old cruise-rate clamp
+        target = self.drifting_target(start=1.5, bearing=0.79, drift=0.30)
+        reached = armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertIsNotNone(reached)
+        self.assertLess(abs(target.state["bearing"]), 0.35,
+                        "heavy drift must be held bounded, not allowed to run away")
+
     def test_it_still_arrives_despite_drift(self):
         target = self.drifting_target(start=1.5, bearing=0.2, drift=0.08)
         reached = armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
@@ -458,8 +471,10 @@ class DriveTests(unittest.TestCase):
         armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.6), 0.45,
                                  log=lambda *a: None, speed=0.05, omega=0.10)
         for v, w in seen:
-            self.assertLessEqual(abs(v), 0.05 + 1e-9)
-            self.assertLessEqual(abs(w), 0.10 + 1e-9)
+            self.assertLessEqual(abs(v), 0.05 + 1e-9, "forward speed is capped by the caller")
+            # correction is capped by STEER_MAX, not the cruise rate: it has to be able to
+            # out-turn drift, and the cruise rate is chosen for comfortable arcs
+            self.assertLessEqual(abs(w), armctl.STEER_MAX + 1e-9)
 
     def test_base_is_zeroed_on_every_exit_path(self):
         armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)
