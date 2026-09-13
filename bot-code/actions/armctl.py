@@ -493,7 +493,7 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
                 raise Cancelled("cancelled while driving")
             try:
                 target = target_fn()
-            except Exception:
+            except Exception as exc:
                 # Losing the target is fatal at range and expected on arrival: a floor-level box
                 # drops out of a forward-looking camera once the robot is nearly on top of it.
                 # Only the second reading counts as arriving, and only because the distance
@@ -502,6 +502,10 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
                     log(f"[armctl] target left view at {last_distance:.2f}m, inside the standoff; "
                         f"treating as arrived")
                     return last_distance
+                # Say WHY before it becomes a bare exception type upstream: lost sighting, stale
+                # evidence and a rolled pose epoch all surface as the same class, and they call
+                # for completely different fixes.
+                log(f"[armctl] drive giving up at {last_distance:.2f}m: {exc}")
                 raise
             bearing = math.atan2(target[1], target[0])
             distance = math.hypot(target[0], target[1])
