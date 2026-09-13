@@ -76,7 +76,7 @@ IMU_STALE_S = 0.5       # hold the last heading this long; past it the stream is
 YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believed
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
-TURN_FIRST = 0.60       # rad; beyond this, turn in place -- arcing from here swings wide
+TURN_FIRST = 0.60       # rad of bearing error at which the throttle is eased the most
 # Correction gain. Kept low because the bearing being corrected is OLD: the detector delivers a
 # sighting 235-284 ms after the fact and refreshes it only ~9 times a second, so a controller that
 # reacts hard is reacting to where the box was, not where it is, and turns past it. On hardware
@@ -530,18 +530,11 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
             if time.monotonic() - t0 > timeout:
                 raise Stuck(f"drive exceeded {timeout:.0f}s")
 
-            if abs(bearing) > TURN_FIRST:
-                # Badly misaligned: turn in place. Arcing from here swings wide around the
-                # target rather than closing on it. Uses the correction authority, not the
-                # cruise rate: this is also the path a runaway heading falls into, and it has to
-                # be able to win.
-                rig.set_twist(0.0, math.copysign(min(STEER_MAX, max(omega, abs(bearing))), bearing))
-            elif distance > standoff + RANGE_TOL:
-                # Roughly aligned: drive and steer together. A box off to one side needs the
-                # heading corrected continuously as the robot closes on it -- stopping to turn
-                # whenever the bearing drifts makes the approach a stutter, and driving straight
-                # at a heading taken seconds ago misses. Forward speed eases off while
-                # correcting hard, which tightens the arc instead of overshooting the line.
+            if distance > standoff + RANGE_TOL:
+                # Drive forward, steering to keep the box near the middle of frame. That is the
+                # whole behaviour. look_around hands this a roughly-centred box, so there is no
+                # separate turn-in-place phase: a bearing error just curves the path, and a large
+                # one eases the throttle so the curve stays tight instead of swinging wide.
                 steer = float(np.clip(STEER_GAIN * bearing, -STEER_MAX, STEER_MAX))
                 easing = 1.0 - STEER_SLOWING * min(1.0, abs(bearing) / TURN_FIRST)
                 rig.set_twist(min(speed, distance - standoff) * easing, steer)
