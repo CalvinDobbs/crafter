@@ -1,5 +1,7 @@
 # Reasoning-layer development
 
+- Commit and push changes regularly at meaningful, verified checkpoints. Stage only intended files; never include secrets or unrelated work.
+- When working from the Windows PC, use SSH for bot-side commands, including pulls and scripts. `/home/bracketbot/...` paths are on the bot, not the PC. Inspect the remote working tree and running services before updating or starting anything.
 - Offline tests: `python -m unittest discover -s bot-code/tests -v` (stdlib only).
 - Four-box demo: `uv run --offline bot-code/main.py --mock --planner deterministic`. Alternatively `python -S bot-code/main.py --mock` works without installed robot or model packages.
 - Agent is the default CLI mode. `--mode oneshot` is the separate legacy fixed-grid pipeline, not a mobile fallback.
