@@ -68,24 +68,37 @@ def _openai_rewrite(
     timeout: float,
     client_factory: Callable | None = None,
 ) -> dict[str, str]:
-    """One chat call → rewritten lines. Raises on any failure."""
+    """One chat call → character lines from the pack prompt. Raises on failure."""
     base = template_lines(events, pack)
     items = []
+    # Always ask for a startup catchphrase in-character.
+    items.append({
+        "key": "startup",
+        "event": "startup",
+        "ctx": {},
+        "meaning": "Said once before the build begins.",
+    })
     for event, ctx in events:
         key = script_key(event, ctx)
-        if key not in base:
-            continue
-        items.append({"key": key, "event": event, "ctx": ctx, "fallback": base[key]})
-    if not items:
+        items.append({
+            "key": key,
+            "event": event,
+            "ctx": ctx,
+            "meaning": _EVENT_HINT.get(event, "Narrate this motion phase."),
+        })
+    if len(items) <= 1 and not base:
         return base
 
-    prompt = {
-        "style": pack.style,
+    max_words = getattr(pack, "max_words", 8)
+    user_prompt = {
+        "persona": pack.style,
         "rules": [
-            "Rewrite each fallback into one spoken line in the given style.",
-            "Keep the same facts (box id, layer y, count n) when present.",
-            "At most 8 words per line.",
-            "No emoji. No quotes in the strings.",
+            "Write ONE spoken line per item in the given persona.",
+            "Do NOT copy bland telemetry. Invent in-character wording.",
+            f"At most {max_words} words per line.",
+            "Keep facts from ctx when present (box id, layer y, count n).",
+            "No emoji. No quotation marks inside the strings.",
+            "No politics, elections, parties, or insults — boxes only.",
             "Return ONLY json: {\"lines\": [{\"key\": str, \"text\": str}, ...]}",
             "Include every key exactly once.",
         ],
@@ -104,11 +117,14 @@ def _openai_rewrite(
         messages=[
             {
                 "role": "system",
-                "content": "You write short robot voice lines. JSON only.",
+                "content": (
+                    "You write short in-character robot demo voice lines. "
+                    "Follow the persona strictly. JSON only."
+                ),
             },
-            {"role": "user", "content": json.dumps(prompt)},
+            {"role": "user", "content": json.dumps(user_prompt)},
         ],
-        temperature=0.6,
+        temperature=0.85,
     )
     elapsed = time.perf_counter() - t0
     if elapsed > timeout:
@@ -120,13 +136,32 @@ def _openai_rewrite(
     out = dict(base)
     for row in lines:
         key = row.get("key")
-        text = (row.get("text") or "").strip()
-        if key in out and text:
-            words = text.split()
-            if len(words) > 8:
-                text = " ".join(words[:8])
-            out[key] = text
+        text = (row.get("text") or "").strip().strip('"').strip("'")
+        if not key or not text:
+            continue
+        words = text.split()
+        if len(words) > max_words:
+            text = " ".join(words[:max_words])
+        out[key] = text
     return out
+
+
+_EVENT_HINT = {
+    "scan.start": "Robot starts looking around for cardboard boxes.",
+    "plan.ready": "Build plan is ready; ctx.n is how many boxes to place.",
+    "home.start": "Arms power on / move to home pose.",
+    "pick.approach": "Moving toward a box; ctx.id is the box id.",
+    "pick.descend": "Lowering down onto the box.",
+    "pick.grasp": "Closing the claw on the box.",
+    "pick.lift": "Lifting the box up off the table.",
+    "place.approach": "Carrying the box toward a stack cell; ctx.y is layer.",
+    "place.descend": "Lowering the box into its cell.",
+    "place.release": "Opening the claw to set the box down.",
+    "place.retreat": "Pulling the arm back after placing.",
+    "build.done": "Whole structure finished successfully.",
+    "fail": "A grasp or place missed; recovering.",
+    "startup": "Cold open before any motion.",
+}
 
 
 def _resolve_openai_key() -> str | None:

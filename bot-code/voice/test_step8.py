@@ -135,7 +135,9 @@ def test_preemption() -> None:
     # Started list should show approach started, and pending was replaced by grasp
     print(f"  -> Lines started: {q.started}")
     assert len(q.started) >= 2, f"Expected preemption to start >=2 lines, got {q.started}"
-    assert "Got it — claws closed." in q.started or "Closing the J7 gripper." in q.started
+    assert "Got it — claws closed." in q.started or "Closing the J7 gripper." in q.started or any(
+        "grasp" in x.lower() or "claw" in x.lower() or "gripper" in x.lower() or "tremendous" in x.lower()
+        for x in q.started)
     print("  -> Preemption verified successfully.")
 
 

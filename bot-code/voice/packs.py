@@ -1,4 +1,4 @@
-"""Personality packs: templates + style for LLM flavor. TTS voice id comes later."""
+"""Personality packs: OpenAI style prompt + bland fail-open templates."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,66 +7,67 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class VoicePack:
     id: str
-    """Short style note fed to the LLM when rewriting lines."""
+    """Full brief for the OpenAI voice-line writer."""
     style: str
-    """Said once at build start (empty = skip)."""
+    """Fixed startup if OpenAI is off; empty = skip or use LLM `startup` key."""
     startup: str = ""
-    """Event → template. Missing keys fall back to narrator.NEUTRAL."""
+    """Fail-open only when OpenAI is unavailable. Keep bland."""
     templates: dict[str, str] = field(default_factory=dict)
-    """One line per pick/place pair when not using phase-level speech."""
-    pair: str = "{kind} block, layer {y}, going in"
+    """Fail-open pair line for orchestrator Plan.narration."""
+    pair: str = "{kind} block, layer {y}."
+    """Soft cap for LLM lines (templates still clipped by narrator.MAX_WORDS)."""
+    max_words: int = 8
 
 
-# Telemetry fallback — hardware-true, no personality.
 NEUTRAL = VoicePack(
     id="neutral",
-    style="Plain, factual, calm robot telemetry. No jokes.",
+    style="Plain, factual robot telemetry. No jokes. No character voice.",
     startup="",
-    templates={},  # use narrator.NEUTRAL defaults
+    templates={},
     pair="{kind} block, layer {y}.",
+    max_words=8,
 )
 
-# Demo personality (locked 2026-09-12):
-# calm engineer + light puns + first person + audience-friendly (not J0/J7).
-# Startup catchphrase only: "It's boxing time!"
-BOXING = VoicePack(
-    id="boxing",
+# Demo personality: Trump-like announcer. Specific lines come from OpenAI.
+# Templates below are bland fail-open only — not the spoken product.
+TRUMP = VoicePack(
+    id="trump",
     style=(
-        "Calm first-person engineer narrating a cardboard-box build. "
-        "Audience-friendly words (claw, lift, layer) — never joint names. "
-        "Light wordplay only; stay short and steady. No hype yelling."
+        "You are the spoken voice of a cardboard-box stacking robot demo. "
+        "Speak in a playful parody of Donald Trump's public speaking style: "
+        "confident, hyperbolic, first person, short punchy clauses, "
+        "superlatives (tremendous, beautiful, the best), rhetorical repetition, "
+        "and folksy asides — but keep it family-friendly and non-political. "
+        "This is about stacking boxes on a table, NOT elections or real people. "
+        "Never insult anyone. Never mention parties, elections, or opponents. "
+        "Channel the cadence of lines like: \"We're gonna build a big beautiful wall.\" "
+        "Audience-friendly words only (box, claw, layer, wall of boxes) — "
+        "never hardware jargon (no J0, J7, IK, gripper index). "
+        "Every line must still match the motion event and keep any given facts "
+        "(box id, layer y, count n)."
     ),
-    startup="It's boxing time!",
-    templates={
-        "scan.start": "I'm scanning for boxes.",
-        "plan.ready": "{n} boxes on the list.",
-        "home.start": "Waking my arms up.",
-        "pick.approach": "Heading for box {id}.",
-        "pick.descend": "Dropping in carefully.",
-        "pick.grasp": "Got it — claws closed.",
-        "pick.lift": "Lifting clear.",
-        "place.approach": "Taking this to layer {y}.",
-        "place.descend": "Lining up the drop.",
-        "place.release": "And that's planted.",
-        "place.retreat": "Backing off.",
-        "build.done": "Build's done. Still steady.",
-        "fail": "Missed that — opening claws.",
-    },
-    pair="{kind} for layer {y} — my turn.",
+    startup="",  # OpenAI writes startup into script key "startup"
+    templates={},  # fall back to narrator.NEUTRAL if API down
+    pair="{kind} on layer {y}.",
+    max_words=12,
 )
+
+# Back-compat alias for env VOICE_PACK=boxing
+BOXING = TRUMP
 
 PACKS: dict[str, VoicePack] = {
     NEUTRAL.id: NEUTRAL,
-    BOXING.id: BOXING,
+    TRUMP.id: TRUMP,
+    "boxing": TRUMP,
 }
 
-_active: str = BOXING.id
+_active: str = TRUMP.id
 
 
 def get_pack(name: str | None = None) -> VoicePack:
-    key = (name or _active).strip().lower() or BOXING.id
+    key = (name or _active).strip().lower() or TRUMP.id
     if key not in PACKS:
-        raise KeyError(f"unknown voice pack {key!r}; have {sorted(PACKS)}")
+        raise KeyError(f"unknown voice pack {key!r}; have {sorted(set(PACKS))}")
     return PACKS[key]
 
 
@@ -78,4 +79,4 @@ def set_pack(name: str) -> VoicePack:
 
 
 def list_packs() -> list[str]:
-    return sorted(PACKS)
+    return sorted({p.id for p in PACKS.values()})

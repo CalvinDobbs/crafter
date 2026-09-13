@@ -7,38 +7,35 @@ from pathlib import Path
 import flavor
 import narrator
 import packs
-from from_plan import events_from_plan, narrate
+from from_plan import events_from_plan
 
 
-def test_pack_switch_changes_lines() -> None:
+def test_pack_switch() -> None:
     print("[1/4] pack switch...")
     packs.set_pack("neutral")
     flavor.clear_script()
     n = narrator.line("pick.grasp", {"id": 3})
-    packs.set_pack("boxing")
+    packs.set_pack("trump")
     flavor.clear_script()
-    b = narrator.line("pick.grasp", {"id": 3})
+    # No hand-written trump templates → falls back to neutral telemetry text
+    t = narrator.line("pick.grasp", {"id": 3})
     assert n == "Closing the J7 gripper.", n
-    assert b == "Got it — claws closed.", b
-    assert n != b
-    packs.set_pack("boxing")
+    assert t == n  # bland fail-open until OpenAI fills script
+    assert "trump" in packs.list_packs()
+    assert "Trump" in packs.get_pack("trump").style
     print("  ok")
 
 
-def test_template_prewrite() -> None:
-    print("[2/4] template prewrite...")
+def test_template_prewrite_failopen() -> None:
+    print("[2/4] template prewrite (fail-open)...")
     plan = json.loads((Path(__file__).parent / "fixture_plan.json").read_text())
     events = events_from_plan(plan)
-    script = flavor.prewrite(events, pack="boxing", flavor="template")
+    script = flavor.prewrite(events, pack="trump", flavor="template")
     assert script
-    assert any(
-        "claw" in v.lower() or "box" in v.lower() or "layer" in v.lower()
-        or "scanning" in v.lower() or "planted" in v.lower()
-        for v in script.values()), script
-    # narrator should prefer script overrides
-    text = narrator.line("plan.ready", {"n": 2})
-    assert text == script[flavor.script_key("plan.ready", {"n": 2})]
-    print(f"  {len(script)} lines ok")
+    # Without OpenAI, trump uses narrator.NEUTRAL fallthrough — not character lines
+    grasp_key = next((k for k in script if k.startswith("pick.grasp")), None)
+    assert grasp_key and "gripper" in script[grasp_key].lower(), script
+    print(f"  {len(script)} fail-open lines ok")
 
 
 def test_openai_fail_open() -> None:
@@ -54,15 +51,14 @@ def test_openai_fail_open() -> None:
     plan = json.loads((Path(__file__).parent / "fixture_plan.json").read_text())
     events = events_from_plan(plan)
     script = flavor.prewrite(
-        events, pack="neutral", flavor="openai",
+        events, pack="trump", flavor="openai",
         client_factory=lambda: Boom())
-    assert script  # templates remain
-    assert flavor.lookup("pick.grasp", {"id": 3}) or flavor.lookup("pick.grasp", {"id": 1})
+    assert script
     print("  ok")
 
 
-def test_openai_rewrite_injected() -> None:
-    print("[4/4] openai rewrite (fake client)...")
+def test_openai_prompt_generates() -> None:
+    print("[4/4] openai prompt (fake client)...")
 
     class FakeResp:
         def __init__(self, content):
@@ -73,28 +69,33 @@ def test_openai_rewrite_injected() -> None:
             class completions:
                 @staticmethod
                 def create(**kwargs):
-                    # echo fallbacks with a marker
                     import json as _json
-                    items = _json.loads(kwargs["messages"][1]["content"])["items"]
-                    lines = [{"key": it["key"], "text": "Hype " + " ".join(it["fallback"].split()[:7])}
+                    body = _json.loads(kwargs["messages"][1]["content"])
+                    assert "persona" in body
+                    assert "We're gonna build a big beautiful wall" in body["persona"]
+                    items = body["items"]
+                    assert any(it["key"] == "startup" for it in items)
+                    lines = [{"key": it["key"],
+                              "text": f"Tremendous {it['event']} folks"}
                              for it in items]
                     return FakeResp(_json.dumps({"lines": lines}))
 
     plan = json.loads((Path(__file__).parent / "fixture_plan.json").read_text())
     events = events_from_plan(plan)
     script = flavor.prewrite(
-        events, pack="boxing", flavor="openai",
+        events, pack="trump", flavor="openai",
         client_factory=lambda: Fake())
-    assert any(v.startswith("Hype ") for v in script.values()), script
+    assert script.get("startup", "").startswith("Tremendous")
+    assert any(v.startswith("Tremendous") for v in script.values())
     print("  ok")
 
 
 def main() -> None:
     print("=== voice packs / flavor ===")
-    test_pack_switch_changes_lines()
-    test_template_prewrite()
+    test_pack_switch()
+    test_template_prewrite_failopen()
     test_openai_fail_open()
-    test_openai_rewrite_injected()
+    test_openai_prompt_generates()
     print("PASS")
 
 

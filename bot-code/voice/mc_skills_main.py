@@ -4,6 +4,7 @@
 #   "fastapi",
 #   "uvicorn",
 #   "numpy",
+#   "openai",
 # ]
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
@@ -50,7 +51,7 @@ import hook
 import moves
 try:
     from packs import set_pack
-    set_pack(os.environ.get("VOICE_PACK", "boxing"))
+    set_pack(os.environ.get("VOICE_PACK", "trump"))
 except Exception as e:
     print(f"[mc_skills] voice pack init: {e}", flush=True)
 

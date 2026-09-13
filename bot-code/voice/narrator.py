@@ -59,17 +59,24 @@ class _Fmt(dict):
 
 
 def line(event: str, ctx: dict | None = None) -> str:
-    """Return a <=8-word line, or '' to skip.
+    """Return a short spoken line, or '' to skip.
 
     Order: ahead-of-time script override → active pack template → NEUTRAL.
     """
+    max_words = MAX_WORDS
+    try:
+        from packs import get_pack
+        max_words = getattr(get_pack(), "max_words", MAX_WORDS)
+    except Exception:
+        pass
+
     try:
         from flavor import lookup
         override = lookup(event, ctx)
         if override:
             text = override.strip()
-            if len(text.split()) > MAX_WORDS:
-                text = " ".join(text.split()[:MAX_WORDS])
+            if len(text.split()) > max_words:
+                text = " ".join(text.split()[:max_words])
             return text
     except Exception:
         pass
@@ -87,8 +94,8 @@ def line(event: str, ctx: dict | None = None) -> str:
     if tmpl is None or not tmpl:
         return ""
     text = tmpl.format_map(_Fmt(ctx or {})).strip()
-    if len(text.split()) > MAX_WORDS:
-        text = " ".join(text.split()[:MAX_WORDS])
+    if len(text.split()) > max_words:
+        text = " ".join(text.split()[:max_words])
     return text
 
 

@@ -97,40 +97,40 @@ def _attach_voice(plan: Plan, structure: Structure,
                   voice_flavor: str | None = None) -> Plan:
     """Personality + optional OpenAI rewrite *after* assignment is fixed.
 
-    Never changes actions. Fail-open to pack templates.
-    Env defaults: VOICE_PACK=neutral, VOICE_FLAVOR=template|openai.
+    Never changes actions. Fail-open to pack / neutral templates.
+    Env: VOICE_PACK=trump|neutral, VOICE_FLAVOR=template|openai.
     """
-        pack_id = (voice_pack or os.environ.get("VOICE_PACK", "boxing")).strip()
-        flavor = (voice_flavor or os.environ.get("VOICE_FLAVOR", "template")).strip()
-        # AGENTS.md: mock never contacts the model unless explicitly allowed.
-        if (flavor == "openai" and os.environ.get("MOCK") == "1"
-                and os.environ.get("ALLOW_API_WITH_MOCK") != "1"):
-            print("[planner] voice openai skipped under MOCK (set ALLOW_API_WITH_MOCK=1)",
-                  flush=True)
-            flavor = "template"
+    pack_id = (voice_pack or os.environ.get("VOICE_PACK", "trump")).strip()
+    flavor = (voice_flavor or os.environ.get("VOICE_FLAVOR", "openai")).strip()
+    # AGENTS.md: mock never contacts the model unless explicitly allowed.
+    if (flavor == "openai" and os.environ.get("MOCK") == "1"
+            and os.environ.get("ALLOW_API_WITH_MOCK") != "1"):
+        print("[planner] voice openai skipped under MOCK (set ALLOW_API_WITH_MOCK=1)",
+              flush=True)
+        flavor = "template"
     try:
         from pathlib import Path
         import sys
         voice_dir = str(Path(__file__).resolve().parent / "voice")
         if voice_dir not in sys.path:
             sys.path.insert(0, voice_dir)
-        from packs import get_pack, set_pack
+        from packs import set_pack
         from from_plan import events_from_plan
-        from flavor import pair_lines_for_plan, prewrite
+        from flavor import pair_lines_for_plan, prewrite, lookup
         from contracts import plan_to_dict
 
         pack = set_pack(pack_id)
         kinds = {(b.x, b.y, b.z): b.kind for b in structure.blocks}
         plan.narration = pair_lines_for_plan(
             [a.__dict__ for a in plan.actions], kinds, pack)
-        if pack.startup and plan.narration:
-            # Keep startup for orchestrator to say before first pick if desired.
-            plan.narration = [pack.startup] + plan.narration
-        # Phase script for mc_skills narrate() path (loaded into flavor overrides).
         events = events_from_plan(plan_to_dict(plan))
-        prewrite(events, pack=pack, flavor=flavor)
+        script = prewrite(events, pack=pack, flavor=flavor)
+        # Prefer LLM startup catchphrase when present.
+        opening = script.get("startup") or pack.startup
+        if opening:
+            plan.narration = [opening] + plan.narration
         print(f"[planner] voice pack={pack.id} flavor={flavor} "
-              f"narration={len(plan.narration)}", flush=True)
+              f"narration={len(plan.narration)} script={len(script)}", flush=True)
     except Exception as e:
         print(f"[planner] voice attach skipped ({e})", flush=True)
     return plan
