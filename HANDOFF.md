@@ -1,6 +1,6 @@
 # Crafter handoff
 
-Current checkpoint: GitHub `main` at `d217bfb` or later. This handoff covers the reasoning/perception integration, documentation audit, panel/key work, speaker research, and motion/arm research begun on 2026-09-12.
+Current checkpoint: GitHub `main` at `aafefd5` or later. This handoff covers the reasoning/perception integration, panel/key work, speaker research, the base/arm guide, and the documentation audit — the last two of which are now complete.
 
 ## Work completed
 
@@ -194,235 +194,53 @@ These are historical checkpoint results. Other developers have since changed rea
 - Preserve uncommitted perception work on the bot. Always inspect the remote tree and services before updating or launching anything.
 - The main panel uses a light theme with warm red accents. Preserve native light controls, canvas colors, and viewport containment.
 
-## Current unfinished task: base movement and arm guide
+## Completed since the last handoff: motion guide and documentation audit
 
-The user requested a Markdown guide in `bot-code/actions/` explaining how to move the base and use the arms, based on the bot's sample apps and `actions/pickup.py`.
+### Base movement and arm guide — done
 
-No guide file has been created yet. Intended destination:
+`bot-code/actions/motion_and_arms.md` exists and is committed. Every claim in the
+previous handoff's research notes was re-verified read-only against the live bot
+before being written down, so the guide supersedes those notes; they are not
+repeated here.
 
-```text
-bot-code/actions/motion_and_arms.md
-```
+It covers the BBOS API surface, `drive.ctrl` (fields, clamps, the 100 ms command
+timeout, publish rate, balance modes, the other apps competing for the topic, and
+`nav/main.py` as the autonomy reference), the arm topics, torque-enable ordering,
+homing/parking, command clipping, motor-turns-vs-URDF conversion and per-arm
+mirroring, the `mc_skills` IK pattern, a walkthrough of `actions/pickup.py`, and
+what all of it means for an interface-v2 action provider.
 
-The source review is substantially complete. Write the guide from the findings below, validate links and snippets without running motion, and commit only that guide.
+Validated without motion: 11 local links resolve, 4 Python snippets parse, and the
+documented `test_pickup.py` command runs clean (17 tests at the time of writing, no
+hardware). No writer was opened and nothing moved.
 
-### Sources reviewed on the bot
+Two facts from that work are worth repeating anywhere else they matter:
 
-- `/home/bracketbot/bbapps/AGENTS.md`
-- `/home/bracketbot/bbapps/teleop.py`
-- `/home/bracketbot/bbapps/examples/view_arms.py`
-- `/home/bracketbot/bbapps/examples/view_ik.py`
-- `/home/bracketbot/bbapps/quest_teleop/main.py`
-- `/home/bracketbot/bbapps/quest_teleop/scripts/homing.py`
-- `/home/bracketbot/bbapps/nav/main.py`
-- `/home/bracketbot/bbapps/mc_skills/main.py`
-- `/home/bracketbot/crafter/bot-code/actions/pickup.py`
-- `/home/bracketbot/bbos/bbos/daemons/base/constants.py`
-- `/home/bracketbot/bbos/bbos/daemons/base/daemon.py`
-- `/home/bracketbot/bbos/bbos/daemons/arm_left/constants.py`
-- `/home/bracketbot/bbos/bbos/daemons/arm_right/constants.py`
-- `/home/bracketbot/bbos/bbos/daemons/arm_left/daemon.py`
+- The arm daemon cuts torque the moment its control writer disappears. **Closing
+  writers drops a held load.** A load-preserving `stop()` cannot be built that way.
+- The two arms do not mirror by a single sign flip — `ik_sign`, `gripper_sign` and
+  the J0 term all differ. Always convert through the arm's own `q2urdf`/`urdf2q`.
 
-The local and bot copies of `actions/pickup.py` matched during review.
+`pickup.py` changed three times during this work (wrist preparation moved before the
+descent, then to J5 yaw alone; `--lower-only` / `--squeeze` / `--hook` were added).
+The action owner is actively developing it. **Read its docstring and `--help` rather
+than any prose description, including the guide's.**
 
-### Base movement findings
+### Documentation audit — done
 
-Core topic:
+| Document | Outcome |
+|---|---|
+| `PLAN.md` | Current-state section rewritten; phases marked done/blocked; now defers to `bot-code/README.md` for what exists. Phase 3 (the action provider) is called out as the critical path. |
+| `LLM_REASONING_PLAN.md` | Banner marking it superseded, with a table mapping each proposal to where it was implemented. |
+| `README.md` | Points at `bot-code/README.md` and `AGENTS.md` instead of treating `PLAN.md` as the status page; states plainly that no action provider exists. |
+| `bot-code/README.md` | Removed a runbook line that chained `POST /home` (real arm motion) onto starting the body server; deleted the non-existent `/drive` endpoint; added the deployed-only `/voice_script`; broadened writer-ownership language; flagged the legacy grid UI's port collision with the panel. |
+| `bot-code/voice/command_map.md` | Rewritten against both mc_skills copies, which have diverged (deployed has 12 routes, the repo copy 11). `/say` is no longer described as a stub; the descend templates exist. |
+| `WIRE_FORMAT.md`, `AGENTS.md` | Preserved. |
 
-```python
-Writer("drive.ctrl", Type("drive_ctrl"))
-```
+`reference/` now vendors a snapshot of the robot's `bbapps` into the repository, so
+the sample apps can be read without SSH. It is a snapshot, not a live mirror —
+re-check the bot before relying on it.
 
-Publish:
-
-```python
-buffer["twist"] = np.array([v, w], dtype=np.float32)
-```
-
-Conventions and limits:
-
-- `v` is forward linear velocity in meters/second.
-- `w` is yaw rate in radians/second.
-- Positive `v` is forward.
-- Positive `w` is intended as CCW/left, but `mc_skills.rotate()` still says to verify the sign on the robot.
-- The base daemon clamps `v` to ±0.3 m/s and `w` to ±1.0 rad/s.
-- `Config("drive").max_angular_vel` was 0.9 rad/s.
-- `nav/main.py` uses much lower autonomous values, approximately 0.08 m/s and 0.15 rad/s.
-
-Safety and timing:
-
-- The baseboard owns the 200 Hz balance loop; apps publish velocity commands.
-- `drive.ctrl` is a 10 ms topic.
-- The base command timeout is 0.1 seconds. Missing or non-finite commands become zero.
-- Publish continuously faster than 10 Hz; the host configuration uses 50 Hz.
-- Explicitly publish `[0, 0]` during cancellation/teardown rather than relying only on timeout.
-- There can be only one `drive.ctrl` writer. `teleop.py`, `nav/main.py`, Quest teleop, and `mc_skills` compete for it.
-- `teleop.py` converts left/right wheel velocity into body twist using half the robot width.
-- `nav/main.py` is the autonomy reference: SLAM/map-frame control, smoothing, obstacle clearance, bounds checks, stuck detection, and a 0.4-second manual dead-man timer.
-- A field named `twist` does not require base `MODE_TWIST`.
-- `MODE_BALANCE=0` is normal balancing mode.
-- `MODE_LEAN=1` is specialized.
-- `MODE_TWIST=2` is explicitly labeled “velocity, NOT balancing.” Do not select it in a generic action provider without platform-owner approval.
-- The base daemon falls back to its configured default mode when mode commands expire.
-
-`mc_skills.rotate(rad)` is an open-loop scan primitive: publish `[0, w]` for a computed duration, then zero. It is not localization-grade navigation.
-
-### Arm control findings
-
-Per-arm topics:
-
-- `<arm>.state`: eight-element position, velocity, torque, temperature, and current arrays
-- `<arm>.ctrl`: `pos[8]`, `vel[8]`, `tau[8]`, and `alpha`
-- `<arm>.torque`: enable flags, torque-mode flags, compliance, homing, and calibration state
-- J0 is the vertical stage.
-- J7/index 7 is the gripper.
-- `<arm>.ctrl.pos` uses motor turns, not URDF radians.
-
-Ownership and enable sequence:
-
-- Use one owner for each `<arm>.ctrl` and `<arm>.torque` topic.
-- Read-only tools must not open writers. `examples/view_arms.py` opens them only with `--control`.
-- Before enabling torque: disable first, wait for fresh state, copy the live pose into `ctrl`, flush it, then enable. The OFF-to-ON transition reseeds the daemon command filter and prevents jumps.
-- Use `staged_home_arms` and `park_arms` from `bbapps/quest_teleop/scripts/homing.py`; do not casually duplicate or simplify homing.
-- The arm daemon disables torque when its control writer disappears.
-- The daemon clips commands near live state and into calibrated ranges, but applications must still generate smooth bounded trajectories.
-
-Cartesian IK pattern used by `mc_skills`:
-
-1. Read live motor turns.
-2. Convert with `cfg.q2urdf(live)`.
-3. Reset IK from the first seven URDF joints.
-4. Call `cfg.ik.solve(position_xyz, quaternion_xyzw)`.
-5. Insert the seven-joint result into the full URDF vector.
-6. Convert back with `cfg.urdf2q(full)`.
-7. Preserve the live J7/gripper setpoint.
-8. Smoothly ramp the complete motor-turn target.
-
-Coordinates and mirroring:
-
-- `mc_skills.Arm.goto()` expects base-frame XYZ meters and XYZW quaternion.
-- Base frame: +x forward, +y left, +z up.
-- The agent uses world positions with frame/epoch metadata. The action provider must transform into the current base frame and reject stale/cross-epoch geometry before IK.
-- Left and right arms have different `ik_sign` arrays.
-- The left gripper uses `gripper_sign=-1`; the right uses `gripper_sign=1`.
-- Use each arm's `Config` conversion methods instead of manually negating motor commands.
-- Load each robot's calibration from `ranges.calibration.json`; do not copy limits between robots.
-- Raw joints, velocities, homing, and arbitrary IK targets must remain behind semantic action operations, not model-visible tools.
-
-### `actions/pickup.py` findings
-
-This is a direct joint-space two-arm cage/lift prototype, not navigation or a complete `ActionProvider`.
-
-Sequence:
-
-1. move J3/elbow to 90 degrees;
-2. open J7 grippers;
-3. raise J0;
-4. spread both arms with J2;
-5. lower J0 near the calibrated bottom;
-6. optionally pinch with J2 until tracking error suggests contact;
-7. hook with an FK-derived J5/J6 blend;
-8. close grippers;
-9. cradle with more elbow flex;
-10. lift J0 and hold.
-
-Properties and limitations:
-
-- It derives inward/outward signs with FK instead of hard-coding mirror signs.
-- It loads per-robot calibration and keeps a range margin.
-- It self-paces at 200 Hz using `keeptime=False`.
-- Contact uses command-versus-live tracking error and bounded travel.
-- Contact thresholds and squeeze values are hardware-tuning assumptions, not independent possession evidence.
-- Default behavior lowers and holds; `--pickup` opts into cage/lift.
-- Torque remains enabled while holding.
-- Its `finally` block disables torque and closes writers. If carrying a box, that releases the load.
-
-Do not call `pickup.py` from the reasoning layer and do not use its cleanup as agent `cancel()`/`stop()`. Interface v2 requires a load-preserving stop and truthful independent possession state.
-
-### Action-provider requirements
-
-The implementation must satisfy interface v2 in `bot-code/agent_types.py` and `bot-code/README.md`.
-
-Semantic operations:
-
-- `look_around`
-- `approach_box`
-- `pickup`
-- `move_to_build`
-- `place`
-
-Lifecycle requirements:
-
-- idempotent admission and receipt lookup;
-- bounded `submit`, `status`, `state`, `cancel`, and `stop`;
-- live phase reporting;
-- independent possession/readiness evidence;
-- no blind replay after unknown/timed-out submission;
-- load-preserving cancellation and stop;
-- immediate rechecks of localization, obstacles, identity, reachability, frame, and epoch before effects;
-- successful command completion is not proof of possession or placement.
-
-`FunctionActions` can adapt ordinary functions, but it does not make a blocking or uninterruptible hardware routine safe. Cooperative cancellation and watchdog behavior remain the action owner's responsibility.
-
-Do not run `pickup.py`, `/home`, `/goto`, `/pick`, `/place`, `/rotate`, or a drive publisher while verifying the guide. Do not include an unguarded copy-paste command that can unexpectedly move the robot. Do not resolve writer conflicts by killing owners or restarting BBOS services.
-
-## Current documentation audit
-
-The user asked to check outdated Markdown files and update or delete them. The audit was started but paused for this handoff. No documentation cleanup edits have been made yet.
-
-Markdown files found:
-
-- `AGENTS.md`
-- `README.md`
-- `PLAN.md`
-- `LLM_REASONING_PLAN.md`
-- `WIRE_FORMAT.md`
-- `bot-code/README.md`
-- `bot-code/voice/command_map.md`
-- `bot-code/voice/speaker_playback.md`
-
-### Confirmed stale documents
-
-#### `PLAN.md`
-
-This plan has extensive obsolete current-state claims:
-
-- It says no process listens on TCP 5005; `panel.StructureReceiver` now does.
-- It says `structure_src` does not consume the wire format; the panel now parses and validates it directly.
-- It describes the stateful reasoning agent, receiver, voice queue, and personality work as future phases even though much of that exists.
-- Its voice section says personality is not chosen and `/say` is a print stub; current voice code has a selected pack and non-blocking speech queue with OpenAI TTS/cache support.
-- It presents the legacy one-shot planner/body-server pipeline as primary instead of interface-v2 providers and the default agent loop.
-
-Recommended action: replace stale current-state/phase details with a concise roadmap linked to `bot-code/README.md`, or explicitly label the document historical.
-
-#### `LLM_REASONING_PLAN.md`
-
-This pre-implementation checkpoint incorrectly says the reasoning framework, typed interfaces, mock world, validation, recovery, and default agent mode are only proposed. Those are implemented in `agent.py`, `agent_types.py`, `agent_backend.py`, `agent_adapters.py`, `mock_agent_world.py`, and `main.py`.
-
-Recommended action: reduce it to a superseded checkpoint linked to current docs, or delete it after confirming historical context is not needed.
-
-#### `bot-code/voice/command_map.md`
-
-Confirmed stale statements:
-
-- `/say` is described as a stub, but local/deployed code uses `hook.say_text` and `SpeechQueue`.
-- It references numbered approval sections that no longer match the current plan.
-- It says `pick.descend` and `place.descend` templates are absent, but both exist.
-- The route count is inconsistent with the implementation.
-- It does not clearly distinguish the default agent from legacy one-shot narration.
-
-Update it against both the current repository copy and deployed `~/bbapps/mc_skills`; do not assume they are identical.
-
-### Documents needing smaller corrections
-
-- `README.md`: point to current interface-v2 status rather than treating `PLAN.md` as authoritative.
-- `bot-code/README.md`: update writer ownership language, legacy grid UI port wording, endpoint list, unsafe auto-home runbook, current perception status, and parallel-development rules.
-- `bot-code/voice/speaker_playback.md`: mostly current; preserve the warning that physical audibility is unverified.
-
-### Documents to preserve
-
-- `WIRE_FORMAT.md`: frozen protocol specification; sampled claims still match scanner behavior.
-- `AGENTS.md`: current project rules; preserve SSH, safety, test, panel, and theme guidance.
 
 ## Operational state and access
 
@@ -464,12 +282,22 @@ This uses real, billable model calls. Do not run it as an automatic regression t
 
 ## Recommended next steps
 
-1. Create `bot-code/actions/motion_and_arms.md` from the completed research in this handoff.
-2. Validate Markdown links and Python/Bash snippets without executing motion.
-3. Stage and commit only that guide; inspect for concurrent changes first.
-4. Continue the documentation audit, starting with root `README.md` and `bot-code/README.md`.
-5. Re-inspect the bot working tree and writer owners before any deployment or physical test.
-6. Coordinate the first physical base, arm, pickup, speaker, and cancellation checks with the robot/action owner.
+The documentation work is finished. What is left is the thing everything else is
+waiting on.
+
+1. **Implement the interface-v2 action provider.** This is the critical path: until
+   it exists, a live build fails preflight by design. Start from
+   `bot-code/actions/motion_and_arms.md` for how the hardware works and the
+   interface-v2 section of `bot-code/README.md` for what the provider must
+   guarantee. Possession and placement evidence must be independent and measured,
+   not inferred from a command completing.
+2. Re-inspect the bot working tree, running services and writer owners before any
+   deployment or physical test. Two sessions edited this repository concurrently
+   during the last block of work; do not assume the bot matches `main`.
+3. Coordinate the first physical base, arm, pickup, speaker and cancellation checks
+   with the robot/action owner. None of these have ever been run.
+4. The yaw sign on `drive.ctrl` (`positive = CCW`) is still documented as unverified
+   in the source. Confirm it on the robot before any autonomous turn.
 
 ## Key files
 
@@ -481,7 +309,9 @@ This uses real, billable model calls. Do not run it as an automatic regression t
 - `bot-code/perception.py` — independently owned live sensing/world model
 - `bot-code/panel.py` — Minecraft receiver and simulated-tools panel backend
 - `bot-code/web/` — current panel frontend and packaged assets
-- `bot-code/actions/pickup.py` — direct joint-space pickup prototype
+- `bot-code/actions/pickup.py` — direct joint-space pickup prototype, actively changing
+- `bot-code/actions/motion_and_arms.md` — source-checked base and arm guide
 - `bot-code/voice/speaker_playback.md` — source-checked speaker guide
-- `bot-code/README.md` — current interface/runbook reference, pending audit corrections
+- `bot-code/README.md` — current interface/runbook reference
+- `reference/bbapps/` — vendored snapshot of the robot's sample apps
 - `AGENTS.md` — operational rules and verified commands
