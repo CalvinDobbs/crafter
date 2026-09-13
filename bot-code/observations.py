@@ -446,8 +446,12 @@ class RobotObservations(ObservationWorker):
             self._sessions.append(session)
             return session
 
+        # A detector session's first poll loads a TensorRT engine, which takes seconds; the worker
+        # would otherwise declare it unclosable while it is merely starting. observe() keeps its
+        # tight bound -- callers retry -- but shutdown has to outlast a cold start.
+        close_timeout = 30.0 if session_kwargs.get("detector") else 3 * timeout + 0.5
         super().__init__(build, interval=interval, timeout=min(timeout, 0.2), clock=clock,
-                         retry_errors=True, close_timeout=3 * timeout + 0.5)
+                         retry_errors=True, close_timeout=close_timeout)
 
     def capabilities(self):
         # possession stays False: there is no holding sensor on this side. The action provider

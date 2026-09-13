@@ -397,10 +397,19 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
         max_box_size=(0.25, 0.25, 0.25), max_height=1.0, action_timeout=60.0)
 
     def close():
-        """Transports and sensors only. Never parks, releases, or torques off a loaded robot."""
+        """Transports and sensors only. Never parks, releases, or torques off a loaded robot.
+
+        Stopping comes first and is the part that matters: the twist is zeroed and the arm targets
+        frozen before anything else is attempted. A sensor that will not shut down cleanly is worth
+        reporting, but raising here would replace whatever actually ended the job with a shutdown
+        error, and would do it AFTER the robot was already safe.
+        """
         executor.stop()
         shut = getattr(observations, "close", None)
         if callable(shut):
-            shut()
+            try:
+                shut()
+            except Exception as exc:
+                log(f"[provider] sensor shutdown did not complete cleanly: {exc!r}")
 
     return AgentProviders(actions=actions, observations=observations, close=close)
