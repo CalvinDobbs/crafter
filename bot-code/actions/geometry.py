@@ -84,6 +84,27 @@ class Geometry:
                 return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
         raise StaleGeometry(f"box {request.step.box_id} is not in the current snapshot")
 
+    def confirm_graspable(self, request):
+        """Re-check the box immediately before closing on it, against the higher bar.
+
+        Selection is reversible and grasping is not, so this asks again with evidence gathered
+        after the approach -- from closer, and after the robot has stopped moving -- rather than
+        trusting the score that justified setting off.
+        """
+        from observations import SCORE_PICKUP
+        snapshot = self._fresh_snapshot(request)
+        world = snapshot.world_model
+        for item in world.get("objects", ()) or ():
+            if item.get("id") != request.step.box_id:
+                continue
+            score = item.get("score")
+            if not isinstance(score, (int, float)) or score < SCORE_PICKUP:
+                raise StaleGeometry(
+                    f"box {request.step.box_id} is only {score} confident at the grasp, "
+                    f"below the {SCORE_PICKUP} required to close on it")
+            return {"box_id": request.step.box_id, "score": score}
+        raise StaleGeometry(f"box {request.step.box_id} is not visible at the grasp")
+
     def approach_box(self, request):
         """A target callable the drive loop re-reads every cycle, never a remembered pose."""
         self._fresh_snapshot(request)       # refuse up front if the request cannot be resolved at all
