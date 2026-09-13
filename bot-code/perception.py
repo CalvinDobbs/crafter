@@ -7,6 +7,7 @@
 #   "uvicorn",
 #   "onnxruntime==1.22.1",
 #   "tokenizers==0.21.4",
+#   "wsproto==1.2.0",
 # ]
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
@@ -16,15 +17,16 @@
 Only this module and fixtures/scan_sample.json belong to perception. No motor
 Writers, HTTP motion calls, agent state, or shared-contract edits belong here.
 Use PerceptionSession for persistent memory; scan() is a one-shot convenience.
-The old main.py still uses fixed-grid contracts and must NOT drive a moving
-build using these snapshots until its
-owner integrates BuildFrame and PerceptionSession. Legacy scan_all(sweeps>1)
-now rejects requests instead of moving the robot or merging stale coordinates.
+Reasoning-layer integration is provider-based; this module supplies observations,
+not action eligibility, possession or validated grasp poses. Scan.tracks and JSON
+now include the same automatic object observations. Legacy scan_all(sweeps>1)
+rejects requests instead of moving the robot or merging stale coordinates.
 
 Frames: base is +x forward, +y left, +z up, meters. Session world starts at the
 first wheel sample. Wheel distances and optional IMU yaw increments estimate
 T_world_base; this is drifting planar dead reckoning, NOT SLAM or a navigation
-safety map. Gaps/reset jumps invalidate the map rather than mixing frames.
+safety map. Each live session starts with a unique JS-safe pose epoch; gaps/reset
+jumps invalidate the map rather than mixing coordinate frames.
 Depth points use the depth daemon's calibrated axes. Perception normalizes
 heading into +x forward using the fixed forward-facing head camera's extrinsic;
 --depth-yaw-deg can override this alignment. Do not apply IMU pitch twice.
@@ -47,21 +49,37 @@ observations; disappearance alone cannot prove a grasp. verify_place reports
 geometric consistency only, not successful execution of a motor command.
 
 Run from anywhere: uv run /home/bracketbot/crafter/bot-code/perception.py --viz --mock
-Live: --viz --pose-source wheel-imu; use --pose-source wheel to exclude IMU yaw.
---self-test runs synthetic regressions without bbos. /scan includes independent
-stream freshness and sensor telemetry. /frame?view=rect|raw|range selects a
-rectified image, the independent wide left head image, or sparse camera range.
---capture /tmp/new-frame.jpg --image-view range saves a diagnostic JPEG without
-overwriting. For local markerless proposals, first run --prepare-detector, then
---viz --detector boxes. Pinned YOLO-World ONNX weights (AGPL-3.0) and CLIP assets
-live in ~/.cache/crafter-perception, not the repo. No images are uploaded.
-Detection uses CPU-only ONNX Runtime in a low-priority spawned process, one
-in-flight frame, full-view plus near-field tile, and timestamp-matched depth.
-The boxes stream is an explicitly delayed snapshot, not a current camera overlay.
+Live GPU: --viz --detector boxes --detector-backend tensorrt --precision fp16.
+Use --pose-source wheel to exclude IMU yaw. On a new robot, --prepare-detector
+fetches pinned ONNX assets; --prepare-gpu-detector builds a resource-guarded engine.
+The engine is keyed by model, vocabulary, input shape, precision and device/runtime.
+--detector-backend cpu is an explicit reference backend, never a silent fallback.
+YOLO weights (AGPL-3.0), cached CLIP embeddings and engines stay under
+~/.cache/crafter-perception. No camera images are uploaded for inference.
+
+A Reader-owning capture thread maintains only the newest immutable frame packet.
+Large IPC reads are paced; the GPU worker receives RGB plus matched depth/indices,
+and performs neural inference and CPU depth localization off the acquisition loop.
+Surface-map rebuilding is capped at 2 Hz, but current depth is retained for queries.
+
+WebSocket /live?view=camera|live|rect|raw|range|boxes pushes a single binary envelope:
+4-byte big-endian JSON-byte-count, UTF-8 JSON metadata, then JPEG bytes. The image
+metadata carries its timestamp/revision and overlays. Slow clients do not create
+an unbounded frame queue. The browser decodes only one image with one latest slot.
+Map updates are less frequent and are reprojected from world coordinates on display.
+The live view uses detector evidence or confidence-checked visual tracking for at
+most 350 ms; visual prediction NEVER updates measured observation timestamps.
+The boxes view remains an explicitly delayed, timestamp-matched diagnostic snapshot.
+/frame?view=live|rect|raw|range|boxes keeps HTTP access; a first unsubscribed request
+may return 503 while requesting the next frame. /scan includes stage timings and
+source/result freshness. --capture /tmp/new-frame.jpg --image-view range saves one
+new diagnostic JPEG without overwriting. --self-test is robot-free.
 GET /objects exposes session-local track IDs, original bboxes, raw detector scores,
 identity status, age, and visible-surface estimates. Null position means missing
 or unreliable geometry. These are NOT box-center/grasp poses; pick_candidate is
-always false for this experimental backend. Legacy scan_all remains unchanged.
+always false for automatic proposals. Use PerceptionSession(detector=True,
+detector_backend="tensorrt") or /objects for automatic detections; scan_all is a
+legacy marker interface. Current means recently observed, not safe to grasp.
 False positives, missed boxes, merge/split events, odometry drift and depth jitter
 remain possible. Camera/base calibration and build-zone setup are still required.
 All sensor reads occur in one worker, not concurrent web handlers. Mock buttons
@@ -398,9 +416,10 @@ class WorldModel:
         self.cfg = settings or Settings()
         self.epoch = None
         self.tracks, self.surfaces = {}, {}
+        self.surface_snapshot = []
         self.anchor = None
 
-    def update(self, observations, pose, ts, anchor=None, points=None, warnings=()):
+    def update(self, observations, pose, ts, anchor=None, points=None, warnings=(), map_update=True):
         cfg = self.cfg
         s = Scan(ts=ts, pose=pose, warnings=list(warnings))
         if points is not None:
@@ -412,6 +431,7 @@ class WorldModel:
         if self.epoch != pose.epoch:
             self.tracks.clear()
             self.surfaces.clear()
+            self.surface_snapshot = []
             self.anchor = None
             self.epoch = pose.epoch
         if anchor is not None:
@@ -451,7 +471,7 @@ class WorldModel:
                 d = Detection(mid, base.tolist(), size=size)
                 getattr(s, {"loose": "boxes", "protected": "protected", "unknown": "unknown"}[label]).append(d)
         s.stacked = list(s.protected)
-        if len(s.points):
+        if len(s.points) and map_update:
             world = pose.to_world(s.points[::4])
             valid = np.isfinite(world).all(axis=1) & (np.linalg.norm(world[:, :2]-[pose.x, pose.y], axis=1) <= cfg.radius)
             world = world[valid]
@@ -462,14 +482,18 @@ class WorldModel:
                 np.maximum.at(hi, inv, world[:, 2])
                 for key, low, high in zip(keys, lo, hi):
                     self.surfaces[tuple(key)] = (float(low), float(high), ts)
-        for key, (low, high, seen) in list(self.surfaces.items()):
-            world = [(key[0]+.5)*cfg.resolution, (key[1]+.5)*cfg.resolution, high]
-            base = pose.to_base(world)
-            if ts-seen > cfg.memory_s or np.linalg.norm(base[:2]) > cfg.radius*1.5:
-                del self.surfaces[key]
-                continue
-            s.surface_cells.append({"world": world, "pos": base.tolist(), "z_min": low,
-                                    "z_max": high, "age": ts-seen})
+        if map_update:
+            self.surface_snapshot = []
+            for key,(low,high,seen) in list(self.surfaces.items()):
+                world = [(key[0]+.5)*cfg.resolution,(key[1]+.5)*cfg.resolution,high]
+                if ts-seen>cfg.memory_s or math.hypot(world[0]-pose.x,world[1]-pose.y)>cfg.radius*1.5:
+                    del self.surfaces[key]
+                    continue
+                self.surface_snapshot.append({"world":world,"z_min":low,"z_max":high,"last_seen":seen})
+        if self.surface_snapshot:
+            positions = pose.to_base([cell["world"] for cell in self.surface_snapshot])
+            s.surface_cells = [{**cell,"pos":pos.tolist(),"age":ts-cell["last_seen"]}
+                               for cell,pos in zip(self.surface_snapshot,positions)]
         return s
 
 
@@ -500,19 +524,27 @@ class LiveSource:
         self.sensor_ts = {"wheel": 0.0, "imu": 0.0}
         drive = Config("drive")
         self.odom = Odometry(drive.wheel_diam, drive.robot_width, source)
+        import secrets
+        self.odom.pose.epoch = secrets.randbits(48)
         extrinsic = np.asarray(Config("depth").camera_to_base_3x4)
         self.depth_rotation, self.depth_yaw_deg = depth_heading_rotation(
             extrinsic, (settings or Settings()).depth_yaw_deg)
         self.camera_origin = self.depth_rotation @ extrinsic[:, 3]
         self.imu_sample = None
         self.last_frame = 0.0
+        self.next_head_poll,self.next_depth_poll = 0.0,0.0
 
     def poll(self):
-        if self.head.ready():
+        now = time.monotonic()
+        head_due = now>=self.next_head_poll
+        if head_due:
+            self.next_head_poll = now+.1
+        if head_due and self.head.ready():
             d = self.head.data
             n = int(d["jpeg_len"])
             if 0 < n <= len(d["jpeg"]):
                 self.raw_jpeg, self.raw_ts = bytes(d["jpeg"][:n]), _stamp(d)
+                self.sensor_ts["camera"] = self.raw_ts
         if self.imu.ready():
             d = self.imu.data
             self.sensor_ts["imu"] = _stamp(d)
@@ -526,6 +558,9 @@ class LiveSource:
             self.odom.update(ts, np.array(d["pos"], dtype=float), yaw)
         if self.odom.pose.valid and time.time()-self.odom.pose.ts > .5:
             self.odom.invalidate("wheel stream stale")
+        if now<self.next_depth_poll:
+            return None
+        self.next_depth_poll = now+.025
         if not self.points.ready():
             return None
         d = self.points.data
@@ -537,6 +572,7 @@ class LiveSource:
         if ts <= self.last_frame or abs(time.time()-ts) > .8:
             return None
         self.last_frame = ts
+        self.sensor_ts["depth"] = ts
         n = int(d["num_points"])
         if not 0 <= n <= len(d["points"]):
             raise ValueError("invalid depth point count")
@@ -546,6 +582,77 @@ class LiveSource:
 
     def close(self):
         self.stack.close()
+
+
+class CaptureWorker:
+    """One Reader-owning thread; a slow consumer only replaces the latest packet."""
+    def __init__(self,source="wheel-imu",settings=None,source_factory=None):
+        from types import SimpleNamespace
+        self.source_factory = source_factory or (lambda: LiveSource(source,settings))
+        self.lock,self.stop = threading.Lock(),threading.Event()
+        self.latest,self.meta,self.error = None,None,None
+        self.sequence,self.consumed,self.dropped = 0,0,0
+        self.raw_jpeg,self.raw_ts,self.sensor_ts = b"",0.0,{}
+        self.camera_origin,self.depth_yaw_deg = np.zeros(3),0.0
+        self.odom = SimpleNamespace(pose=Pose())
+        self.frame_times = deque(maxlen=120)
+        self.arrival_ages = deque(maxlen=120)
+        self.thread = threading.Thread(target=self._run,daemon=True,name="perception-capture")
+        self.thread.start()
+
+    def _run(self):
+        source = None
+        try:
+            source = self.source_factory()
+            while not self.stop.is_set():
+                packet = source.poll()
+                meta = (source.raw_jpeg,source.raw_ts,dict(source.sensor_ts),
+                        Pose(**asdict(source.odom.pose)),source.camera_origin,source.depth_yaw_deg)
+                with self.lock:
+                    self.meta = meta
+                    if packet is not None:
+                        for array in packet[:3]:
+                            array.setflags(write=False)
+                        if self.sequence>self.consumed:
+                            self.dropped += 1
+                        self.latest = packet
+                        self.sequence += 1
+                        self.frame_times.append(time.monotonic())
+                        self.arrival_ages.append(max(0,time.time()-packet[3])*1000)
+                self.stop.wait(.002)
+        except Exception as e:
+            with self.lock:
+                self.error = f"{type(e).__name__}: {e}"
+        finally:
+            if source is not None:
+                source.close()
+
+    def poll(self):
+        with self.lock:
+            if self.error:
+                raise RuntimeError(self.error)
+            if self.meta is not None:
+                raw,ts,sensors,pose,origin,yaw = self.meta
+                self.raw_jpeg,self.raw_ts,self.sensor_ts = raw,ts,sensors
+                self.odom.pose,self.camera_origin,self.depth_yaw_deg = pose,origin,yaw
+            if self.sequence==self.consumed:
+                return None
+            self.consumed = self.sequence
+            return self.latest
+
+    def stats(self):
+        with self.lock:
+            times = list(self.frame_times)
+            fps = (len(times)-1)/(times[-1]-times[0]) if len(times)>1 and times[-1]>times[0] else 0.0
+            return {"capture_fps":fps,"capture_packets":self.sequence,"replaced_packets":self.dropped,
+                    "arrival_age_p50_ms":float(np.percentile(self.arrival_ages,50)) if self.arrival_ages else None,
+                    "arrival_age_p95_ms":float(np.percentile(self.arrival_ages,95)) if self.arrival_ages else None}
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=3)
+        if self.thread.is_alive():
+            raise TimeoutError("read-only capture worker did not stop within its deadline")
 
 
 def _stamp(data):
@@ -1153,6 +1260,65 @@ class ObjectTracker:
         return output
 
 
+class LiveOverlay:
+    """Display-only short-horizon flow; never changes observation/geometry timestamps."""
+    def __init__(self):
+        self.gray,self.objects,self.ts,self.epoch = None,[],0.0,None
+
+    def update(self,rgb,objects,ts,epoch):
+        import cv2
+        self.gray = cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+        self.objects = [{k:o[k] for k in ("id","track_id","bbox","score","identity_status")} for o in objects]
+        self.ts,self.epoch = ts,epoch
+
+    def draw(self,rgb,ts,epoch):
+        import cv2
+        image = cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+        stats = {"source":"none","detected_at":self.ts,"display_frame_at":ts,"count":0}
+        if self.gray is None or epoch!=self.epoch or not 0<=ts-self.ts<=.35:
+            return image,stats
+        same = abs(ts-self.ts)<1e-6
+        current = None if same else cv2.cvtColor(rgb,cv2.COLOR_RGB2GRAY)
+        if not same and current.shape!=self.gray.shape:
+            return image,stats
+        stats["source"] = "detected" if same else "visual_tracking"
+        for obj in self.objects:
+            box = np.asarray(obj["bbox"],float).copy()
+            if not same:
+                if obj["identity_status"]=="ambiguous":
+                    continue
+                x1,y1,x2,y2 = np.rint(box).astype(int)
+                mask = np.zeros(self.gray.shape,np.uint8)
+                mask[max(0,y1):min(mask.shape[0],y2),max(0,x1):min(mask.shape[1],x2)] = 255
+                features = cv2.goodFeaturesToTrack(self.gray,24,.03,3,mask=mask)
+                if features is None or len(features)<4:
+                    continue
+                moved,status,_ = cv2.calcOpticalFlowPyrLK(self.gray,current,features,None,winSize=(15,15),maxLevel=2)
+                if moved is None:
+                    continue
+                back,back_status,_ = cv2.calcOpticalFlowPyrLK(current,self.gray,moved,None,winSize=(15,15),maxLevel=2)
+                if back is None:
+                    continue
+                keep = ((status.ravel()==1)&(back_status.ravel()==1)
+                        &(np.linalg.norm((back-features).reshape(-1,2),axis=1)<1.5))
+                if keep.sum()<4:
+                    continue
+                shifts = (moved-features).reshape(-1,2)[keep]
+                delta = np.median(shifts,axis=0)
+                if not np.isfinite(delta).all() or np.linalg.norm(delta)>max(15,.5*(box[2]-box[0])):
+                    continue
+                if np.median(np.linalg.norm(shifts-delta,axis=1))>2:
+                    continue
+                box += np.tile(delta,2)
+            x1,y1,x2,y2 = np.rint(box).astype(int)
+            color = (80,230,100) if same else (40,195,255)
+            cv2.rectangle(image,(x1,y1),(x2,y2),color,2)
+            suffix = f' {obj["score"]:.2f}' if same else ' tracked'
+            cv2.putText(image,obj["track_id"]+suffix,(max(0,x1),max(14,y1-5)),cv2.FONT_HERSHEY_SIMPLEX,.42,color,1)
+            stats["count"] += 1
+        return image,stats
+
+
 def _detector_process(jobs, results, cache, size, threshold, backend="cpu", precision="fp16"):
     import os
     os.nice(5)
@@ -1164,11 +1330,13 @@ def _detector_process(jobs, results, cache, size, threshold, backend="cpu", prec
             job = jobs.get()
             if job is None:
                 return
-            ts,rgb = job
+            ts,rgb,points,indices,camera_origin = job
             started = time.monotonic()
             detections = detector.detect(rgb)
-            results.put({"ts": ts, "detections": detections,
-                         "inference_s": time.monotonic()-started,"passes":detector.timings})
+            inferred = time.monotonic()
+            localized = [localize_box(d,points,indices,rgb.shape,camera_origin) for d in detections]
+            results.put({"ts":ts,"detections":detections,"localized":localized,
+                         "inference_s":inferred-started,"localize_s":time.monotonic()-inferred,"passes":detector.timings})
     except Exception as e:
         results.put({"error": f"{type(e).__name__}: {e}"})
     finally:
@@ -1184,7 +1352,11 @@ class DetectorWorker:
         self.process = context.Process(target=_detector_process, args=(self.jobs,self.results,cache,size,threshold,backend,precision), daemon=True)
         self.process.start()
         self.pending = None
+        self.max_input_age_s = .8
         self.tracker = ObjectTracker()
+        self.overlay = LiveOverlay()
+        self.debug_image_requested = True
+        self.completions,self.result_ages = deque(maxlen=120),deque(maxlen=120)
         self.image = (b"",0.0)
         self.status = {"enabled": True,"state":"loading","error":"","inference_s":None,"requested_backend":backend}
 
@@ -1205,7 +1377,9 @@ class DetectorWorker:
                 rgb,points,indices,ts,pose = self.pending
                 if result["ts"] != ts:
                     raise ValueError("detector returned a mismatched frame timestamp")
-                localized = [localize_box(d,points,indices,rgb.shape,camera_origin) for d in result["detections"]]
+                localized = result.get("localized")
+                if localized is None:
+                    localized = [localize_box(d,points,indices,rgb.shape,camera_origin) for d in result["detections"]]
                 objects = self.tracker.update(localized,pose,ts)
                 overlay = cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
                 for d in objects:
@@ -1213,17 +1387,31 @@ class DetectorWorker:
                     color = (80,230,100) if d["position_base_m"] is not None else (40,180,255)
                     cv2.rectangle(overlay,(x1,y1),(x2,y2),color,2)
                     cv2.putText(overlay,f'{d["track_id"]} score {d["score"]:.2f}',(max(0,x1),max(13,y1-5)),cv2.FONT_HERSHEY_SIMPLEX,.42,color,1)
-                self.image = (_encode_jpeg(overlay),ts)
+                if self.debug_image_requested:
+                    self.image = (_encode_jpeg(overlay),ts)
+                self.overlay.update(rgb,objects,ts,pose.epoch)
+                self.completions.append(time.monotonic())
+                self.result_ages.append(max(0,time.time()-ts)*1000)
+                duration = self.completions[-1]-self.completions[0]
+                fps = (len(self.completions)-1)/duration if duration>0 else 0.0
                 self.pending = None
                 self.status.update(state="ready",inference_s=result["inference_s"],passes=result.get("passes",[]),frame_ts=ts,
+                                   detector_fps=fps,localize_ms=result.get("localize_s",0)*1000,
+                                   result_age_p50_ms=float(np.percentile(self.result_ages,50)),
+                                   result_age_p95_ms=float(np.percentile(self.result_ages,95)),
                                    detections=len(objects),localized=sum(d["position_base_m"] is not None for d in objects))
         if not self.process.is_alive() and self.status["state"]!="error":
             self.status.update(state="error",error="detector process stopped")
             self.pending = None
+        if data is not None and not -.05<=time.time()-data[3]<=getattr(self,"max_input_age_s",.8):
+            self.status["frames_skipped_stale"] = self.status.get("frames_skipped_stale",0)+1
+            data = None
+        if data is not None and self.pending is not None:
+            self.status["frames_skipped_busy"] = self.status.get("frames_skipped_busy",0)+1
         if data is not None and self.status["state"]=="ready" and self.pending is None:
             rgb,points,indices,ts,pose = data
-            self.pending = (rgb.copy(),points.copy(),indices.copy(),ts,Pose(**asdict(pose)))
-            self.jobs.put_nowait((ts,rgb))
+            self.pending = (rgb,points,indices,ts,Pose(**asdict(pose)))
+            self.jobs.put_nowait((ts,rgb,points.astype(np.float32,copy=False),indices,camera_origin))
         return result is not None
 
     def close(self):
@@ -1275,14 +1463,40 @@ class PerceptionSession:
         if not mock:
             import cv2
             cv2.setNumThreads(1)
-        self.source = None if mock else LiveSource(pose_source, self.settings)
+        self.source = None if mock else CaptureWorker(pose_source,self.settings)
         self.scene = MockSource(self.settings) if mock else None
         self.latest = Scan()
         self.jpeg = b""
-        self.streams = {name: (b"", 0.0) for name in ("rect", "range", "raw", "boxes")}
-        self.detector = DetectorWorker(model_cache,detector_size,detector_threshold,detector_backend,precision) if detector and not mock else None
+        self.streams = {name: (b"", 0.0) for name in ("rect", "range", "raw", "boxes", "live")}
+        self.requested_views = set(self.streams)
+        self.last_packet,self.overlay_info = None,{}
+        self.last_map_ts = 0.0
+        self.processing_ms = deque(maxlen=120)
+        self.detector = None
+        try:
+            if detector and not mock:
+                self.detector = DetectorWorker(model_cache,detector_size,detector_threshold,detector_backend,precision)
+                self.detector.max_input_age_s = self.settings.fresh_s
+        except Exception:
+            if self.source:
+                self.source.close()
+            raise
+
+    def _live_image(self,packet):
+        if packet is None or "live" not in self.requested_views:
+            return
+        rgb,_,_,ts,pose = packet
+        if self.detector:
+            image,self.overlay_info = self.detector.overlay.draw(rgb,ts,pose.epoch)
+        else:
+            import cv2
+            image = cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+            self.overlay_info = {"source":"none","display_frame_at":ts,"count":0}
+        self.streams["live"] = (_encode_jpeg(image),ts)
 
     def poll(self):
+        started = time.monotonic()
+        stages = {}
         if self.mock:
             observations, anchor, points, ts, pose = self.scene.next()
             warnings = ["SIMULATED observations; not camera detection. Same world classifier as live."]
@@ -1290,46 +1504,67 @@ class PerceptionSession:
             data = self.source.poll()
             detector_changed = False
             if self.detector:
+                self.detector.debug_image_requested = "boxes" in self.requested_views
                 detector_changed = self.detector.poll(data, self.source.camera_origin)
                 self.streams["boxes"] = self.detector.image
+            stages['result_handling_ms'] = (time.monotonic()-started)*1000
             import cv2
-            if self.source.raw_ts-self.streams["raw"][1] >= .15 and self.source.raw_jpeg:
+            if "raw" in self.requested_views and self.source.raw_ts-self.streams["raw"][1] >= .15 and self.source.raw_jpeg:
                 raw = cv2.imdecode(np.frombuffer(self.source.raw_jpeg, np.uint8), cv2.IMREAD_COLOR)
                 if raw is not None:
                     self.streams["raw"] = (_encode_jpeg(raw[:, :raw.shape[1]//2]), self.source.raw_ts)
             if data is None:
                 if detector_changed and self.latest.ts:
-                    self.latest = replace(self.latest, objects=self.detector.tracker.snapshot(
-                        self.latest.pose, self.latest.build, time.time(), self.settings))
+                    self._live_image(self.last_packet)
+                    self.latest = _attach_object_tracks(self.latest,self.detector.tracker.snapshot(
+                        self.latest.pose,self.latest.build,time.time(),self.settings))
                     return self.latest
                 return None
+            self.last_packet = data
             rgb, points, indices, ts, pose = data
+            marker_started = time.monotonic()
             observations, anchor, warnings, markers = observe(
                 rgb, points, indices, ts, self.settings, self.source.camera_origin)
+            stages['marker_ms'] = (time.monotonic()-marker_started)*1000
+            encoding_started = time.monotonic()
             import cv2
             image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             for mid, corners in markers:
                 cv2.polylines(image, [corners.astype(np.int32)], True, (0, 210, 255), 1)
                 cv2.putText(image, str(mid), tuple(corners[0].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, .5, (0,210,255), 1)
-            self.jpeg = _encode_jpeg(image)
-            self.streams["rect"] = (self.jpeg, ts)
-            self.streams["range"] = (_encode_jpeg(range_image(points, indices, rgb.shape, self.source.camera_origin)), ts)
-        self.latest = self.world.update(observations, pose, ts, anchor, points, warnings)
+            if "rect" in self.requested_views:
+                self.jpeg = _encode_jpeg(image)
+                self.streams["rect"] = (self.jpeg,ts)
+            if "range" in self.requested_views:
+                self.streams["range"] = (_encode_jpeg(range_image(points,indices,rgb.shape,self.source.camera_origin)),ts)
+            self._live_image(data)
+            stages['encoding_tracking_ms'] = (time.monotonic()-encoding_started)*1000
+        map_started = time.monotonic()
+        update_map = self.mock or ts-self.last_map_ts>=.5 or self.world.epoch!=pose.epoch
+        self.latest = self.world.update(observations,pose,ts,anchor,points,warnings,map_update=update_map)
+        if update_map:
+            self.last_map_ts = ts
+        stages['map_ms'] = (time.monotonic()-map_started)*1000
         if self.detector:
-            self.latest.objects = self.detector.tracker.snapshot(pose, self.latest.build, time.time(), self.settings)
+            self.latest = _attach_object_tracks(self.latest,self.detector.tracker.snapshot(pose,self.latest.build,time.time(),self.settings))
         if not self.mock:
+            self.processing_ms.append((time.monotonic()-started)*1000)
             self.latest.diagnostics = {"depth_yaw_deg": self.source.depth_yaw_deg,
                                        "point_count": len(points), "rect_shape": list(rgb.shape),
                                        "marker_ids": [mid for mid, _ in markers],
                                        "pose_camera_skew_s": abs(pose.ts-ts),
-                                       "imu_units": "publisher degrees -> internal radians"}
+                                       "imu_units": "publisher degrees -> internal radians",
+                                       "capture": self.source.stats(),"overlay":dict(self.overlay_info),"stages":stages,
+                                       "processing_p95_ms":float(np.percentile(self.processing_ms,95))}
         return self.latest
 
     def close(self):
-        if self.source:
-            self.source.close()
-        if self.detector:
-            self.detector.close()
+        try:
+            if self.source:
+                self.source.close()
+        finally:
+            if self.detector:
+                self.detector.close()
 
 
 def scan(mock=False, *, timeout=4.0, settings=None, pose_source="wheel-imu") -> Scan:
@@ -1471,6 +1706,21 @@ class MockSource:
         return observations, anchor, np.asarray(surfaces).reshape(-1, 3), ts, pose
 
 
+def _attach_object_tracks(snapshot,objects):
+    tracks = [dict(t) for t in snapshot.tracks if t.get("source")!="box_detector"]
+    for obj in objects:
+        if obj["position_base_m"] is None or obj["world_position_m"] is None:
+            continue
+        tracks.append({"id":obj["id"],"name":obj["track_id"],"source":"box_detector",
+                       "pos":list(obj["position_base_m"]),"world":list(obj["world_position_m"]),
+                       "age":obj["age_s"],"last_seen":obj["last_seen"],"current":obj["current"],
+                       "classification":"protected" if obj["zone"]=="protected" else
+                       "loose" if obj["zone"]=="outside_build" else "unknown",
+                       "size":0.0,"position_kind":obj["position_kind"],"depth_status":obj["depth_status"],
+                       "identity_status":obj["identity_status"],"score":obj["score"],"pick_candidate":False})
+    return replace(snapshot,objects=objects,tracks=tracks)
+
+
 def scan_to_dict(s, settings=None, mock=False):
     cfg = settings or Settings()
     now = time.time()
@@ -1486,7 +1736,7 @@ def scan_to_dict(s, settings=None, mock=False):
         t = dict(track)
         t["age"] = max(0, now-t["last_seen"])
         t["current"] = t["current"] and not stale
-        t["pick_candidate"] = bool(t["current"] and t["classification"] == "loose" and build and build["valid"])
+        t["pick_candidate"] = bool(t.get("source")!="box_detector" and t["current"] and t["classification"]=="loose" and build and build["valid"])
         tracks.append(t)
     objects = []
     for item in s.objects:
@@ -1497,13 +1747,6 @@ def scan_to_dict(s, settings=None, mock=False):
         if stale:
             o["position_base_m"] = None
         objects.append(o)
-        if o["position_base_m"] is not None:
-            tracks.append({"id": o["id"], "name": o["track_id"], "pos": o["position_base_m"],
-                           "world": o["world_position_m"], "age": o["age_s"], "last_seen": o["last_seen"],
-                           "current": o["current"], "classification": "protected" if o["zone"]=="protected" else
-                           "loose" if o["zone"]=="outside_build" else "unknown",
-                           "size": 0.0, "position_kind": o["position_kind"], "depth_status": o["depth_status"],
-                           "score": o["score"], "pick_candidate": False})
     return {"schema_version": 2, "mock": mock, "ts": s.ts, "stale": stale,
             "frame": "base_at_capture", "pose": asdict(s.pose), "build": build,
             "anchor_seen": s.anchor_seen, "tracks": tracks, "objects": objects,
@@ -1516,17 +1759,28 @@ def scan_to_dict(s, settings=None, mock=False):
 
 # ---- debug visualizer ---------------------------------------------------------
 
-def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", host="127.0.0.1",
-              detector=False, model_cache=MODEL_CACHE, detector_size=512, detector_threshold=.10,
-              detector_backend="cpu", precision="fp16"):
-    from fastapi import FastAPI, HTTPException, Response
+def serve_viz(port=8007,mock=False,settings=None,pose_source="wheel-imu",host="127.0.0.1",
+              detector=False,model_cache=MODEL_CACHE,detector_size=512,detector_threshold=.10,
+              detector_backend="cpu",precision="fp16"):
+    import asyncio
+    import struct
+    from fastapi import FastAPI,HTTPException,Response,WebSocket,WebSocketDisconnect
     from fastapi.responses import HTMLResponse
     import uvicorn
+    globals()["WebSocket"] = WebSocket
     cfg = settings or Settings()
-    lock, stop = threading.Lock(), threading.Event()
-    shared = {"scan": Scan(), "streams": {}, "sensor_ts": {}, "sensor_pose": Pose(),
-              "error": "waiting for sensors", "actions": deque(),
-              "detector_status": {"enabled": detector, "state": "loading" if detector else "disabled"}}
+    lock,stop = threading.RLock(),threading.Event()
+    views = {"camera","live","rect","range","raw","boxes"}
+    clients,leases = {},{}
+    shared = {"scan":Scan(),"streams":{},"revisions":{},"sensor_ts":{},"sensor_pose":Pose(),
+              "error":"waiting for sensors","actions":deque(),"loop":None,"overlay":{},
+              "detector_status":{"enabled":detector,"state":"loading" if detector else "disabled"}}
+
+    def notify():
+        loop = shared["loop"]
+        if loop is not None and not loop.is_closed():
+            for client in list(clients.values()):
+                loop.call_soon_threadsafe(client["event"].set)
 
     def worker():
         session = None
@@ -1537,56 +1791,78 @@ def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", hos
                 with lock:
                     actions = list(shared["actions"])
                     shared["actions"].clear()
+                    active = {c["view"] for c in clients.values()} | {v for v,end in leases.items() if end>time.monotonic()}
+                if "camera" in active:
+                    active.remove("camera")
+                    active.add("live")
+                    with lock:
+                        image,image_ts = shared["streams"].get("live",(b"",0.0))
+                    if not image or time.time()-image_ts>cfg.fresh_s:
+                        active.add("raw")
+                session.requested_views = active
                 for action in actions:
                     session.scene.command(action)
                 result = session.poll()
                 with lock:
+                    changed = False
+                    for name,value in session.streams.items():
+                        old = shared["streams"].get(name,(None,0))
+                        if value[0] is not old[0]:
+                            shared["revisions"][name] = shared["revisions"].get(name,0)+1
+                            changed = True
                     shared["streams"] = dict(session.streams)
+                    shared["overlay"] = dict(session.overlay_info)
                     if session.detector:
                         shared["detector_status"] = dict(session.detector.status)
                     if session.source:
                         shared["sensor_ts"] = dict(session.source.sensor_ts)
                         shared["sensor_pose"] = Pose(**asdict(session.source.odom.pose))
                     if result is not None:
-                        shared.update(scan=result, error="")
-                stop.wait(.2 if mock else .005)
+                        changed = changed or result.ts!=shared["scan"].ts
+                        shared.update(scan=result,error="")
+                    if changed:
+                        notify()
+                stop.wait(.2 if mock else .002)
         except Exception as e:
             with lock:
                 shared["error"] = f"{type(e).__name__}: {e}"
+                notify()
         finally:
             if session:
                 session.close()
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        thread = threading.Thread(target=worker, daemon=True)
+        shared["loop"] = asyncio.get_running_loop()
+        thread = threading.Thread(target=worker,daemon=True)
         thread.start()
         try:
             yield
         finally:
             stop.set()
-            thread.join(timeout=3)
+            thread.join(timeout=5)
 
     app = FastAPI(lifespan=lifespan)
 
-    @app.get("/", response_class=HTMLResponse)
+    @app.get("/",response_class=HTMLResponse)
     def index():
         return _VIZ_PAGE
 
     @app.get("/scan")
     def scan_json():
         with lock:
-            out = scan_to_dict(shared["scan"], cfg, mock)
+            out = scan_to_dict(shared["scan"],cfg,mock)
             now = time.time()
-            out["streams"] = {name: {"ts": ts, "age_s": max(0, now-ts) if ts else None,
-                                      "fresh": bool(data) and 0 <= now-ts <= (3.0 if name=="boxes" else cfg.fresh_s)}
-                              for name, (data, ts) in shared["streams"].items()}
-            out["telemetry"] = {"pose": asdict(shared["sensor_pose"]),
-                                "ages": {name: max(0, now-ts) if ts else None
-                                         for name, ts in shared["sensor_ts"].items()}}
+            out["published_at"] = now
+            out["streams"] = {name:{"ts":ts,"age_s":max(0,now-ts) if ts else None,
+                                     "fresh":bool(data) and 0<=now-ts<=(3.0 if name=="boxes" else cfg.fresh_s)}
+                              for name,(data,ts) in shared["streams"].items()}
+            out["telemetry"] = {"pose":asdict(shared["sensor_pose"]),
+                                "ages":{name:max(0,now-ts) if ts else None for name,ts in shared["sensor_ts"].items()}}
             out["detector"] = "simulated observations" if mock else (
                 f"YOLO-World / requested {detector_backend}; see runtime status for actual backend" if detector else "ArUco only")
             out["detector_status"] = dict(shared["detector_status"])
+            out["live_overlay"] = dict(shared["overlay"])
             if out["detector_status"].get("error"):
                 out["warnings"].append(out["detector_status"]["error"])
             if shared["error"]:
@@ -1596,37 +1872,116 @@ def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", hos
     @app.get("/objects")
     def object_json():
         d = scan_json()
-        return {"schema_version": 1, "snapshot_ts": d["ts"], "pose": d["pose"],
-                "objects": d["objects"], "detector_status": d["detector_status"],
-                "limitations": "surface estimates, not grasp poses; IDs are session-local; ambiguous identity is explicit"}
+        return {"schema_version":1,"snapshot_ts":d["ts"],"pose":d["pose"],"objects":d["objects"],
+                "detector_status":d["detector_status"],
+                "limitations":"surface estimates, not grasp poses; IDs are session-local; predictions never refresh geometry"}
 
     @app.get("/frame")
-    def frame(view: str = "rect"):
-        if view not in {"rect", "range", "raw", "boxes"}:
-            raise HTTPException(400, "view must be rect, range, raw or boxes")
+    def frame(view: str="rect"):
+        if view not in views-{"camera"}:
+            raise HTTPException(400,"unknown image view")
         with lock:
+            leases[view] = time.monotonic()+3
             if mock:
                 return Response(status_code=204)
-            data, ts = shared["streams"].get(view, (b"", 0.0))
-            if not data or not 0 <= time.time()-ts <= (3.0 if view=="boxes" else cfg.fresh_s):
-                return Response(status_code=503)
-            return Response(data, media_type="image/jpeg",
-                            headers={"Cache-Control": "no-store", "X-Frame-Timestamp": str(ts)})
+            data,ts = shared["streams"].get(view,(b"",0.0))
+            if not data or not 0<=time.time()-ts<=(3.0 if view=="boxes" else cfg.fresh_s):
+                return Response(status_code=503,headers={"Retry-After":"1"})
+            return Response(data,media_type="image/jpeg",headers={"Cache-Control":"no-store","X-Frame-Timestamp":str(ts)})
+
+    @app.websocket("/live")
+    async def live(socket: WebSocket):
+        from urllib.parse import urlsplit
+        selected = socket.query_params.get("view","camera")
+        origin = socket.headers.get("origin")
+        allowed_origin = not origin or urlsplit(origin).netloc in {socket.headers.get("host"),socket.headers.get("x-forwarded-host")}
+        if origin and urlsplit(origin).hostname in {"localhost","127.0.0.1","::1"}:
+            allowed_origin = True
+        with lock:
+            accepted = allowed_origin and selected in views and len(clients)<4
+        if not accepted:
+            await socket.close(code=1008)
+            return
+        await socket.accept()
+        token,event = id(socket),asyncio.Event()
+        with lock:
+            accepted = len(clients)<4
+            if accepted:
+                clients[token] = {"view":selected,"event":event}
+        if not accepted:
+            await socket.close(code=1008)
+            return
+        disconnected = asyncio.Event()
+        async def receive_control():
+            try:
+                message = await socket.receive()
+                if message["type"]!="websocket.disconnect":
+                    await socket.close(code=1008)
+            except (WebSocketDisconnect,RuntimeError):
+                pass
+            finally:
+                disconnected.set()
+                event.set()
+        receiver = asyncio.create_task(receive_control())
+        last_key,last_sent,last_map,last_epoch = None,0.0,0.0,None
+        try:
+            while not stop.is_set() and not disconnected.is_set():
+                event.clear()
+                now = time.monotonic()
+                with lock:
+                    out = scan_json()
+                    view = selected
+                    if view=="camera":
+                        view = "live" if out["streams"].get("live",{}).get("fresh") else "raw"
+                    jpeg,ts = shared["streams"].get(view,(b"",0.0))
+                    if not out["streams"].get(view,{}).get("fresh"):
+                        jpeg = b""
+                    key = (view,shared["revisions"].get(view,0),bool(jpeg))
+                    if key==last_key and now-last_sent<.5:
+                        send = False
+                    else:
+                        send = True
+                        out["image"] = {"view":view,"timestamp":ts,"revision":key[1],"bytes":len(jpeg),
+                                        "overlay":dict(shared["overlay"]) if view=="live" else None}
+                        out["transport"] = "websocket"
+                        epoch = out["pose"]["epoch"]
+                        if now-last_map<.5 and last_epoch==epoch:
+                            out.pop("surface_cells",None)
+                        else:
+                            last_map,last_epoch = now,epoch
+                if send:
+                    header = json.dumps(out,separators=(",",":"),allow_nan=False).encode()
+                    await asyncio.wait_for(socket.send_bytes(struct.pack("!I",len(header))+header+jpeg),timeout=.5)
+                    last_key,last_sent = key,now
+                try:
+                    await asyncio.wait_for(event.wait(),timeout=.2)
+                except asyncio.TimeoutError:
+                    pass
+        except (WebSocketDisconnect,asyncio.TimeoutError,RuntimeError):
+            pass
+        finally:
+            receiver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await receiver
+            with lock:
+                clients.pop(token,None)
+            with contextlib.suppress(RuntimeError,WebSocketDisconnect):
+                await socket.close()
 
     @app.post("/mock/{action}")
     def mock_action(action: str):
         if not mock:
-            raise HTTPException(403, "mock controls disabled on live robot")
-        if action not in {"turn_left", "turn_right", "forward", "back", "visibility", "anchor", "pose", "stack_next", "reset"}:
-            raise HTTPException(400, "unknown action")
+            raise HTTPException(403,"mock controls disabled on live robot")
+        if action not in {"turn_left","turn_right","forward","back","visibility","anchor","pose","stack_next","reset"}:
+            raise HTTPException(400,"unknown action")
         with lock:
-            if len(shared["actions"]) >= 16:
-                raise HTTPException(429, "mock command queue full")
+            if len(shared["actions"])>=16:
+                raise HTTPException(429,"mock command queue full")
             shared["actions"].append(action)
-        return {"ok": True, "mock_only": True}
+        return {"ok":True,"mock_only":True}
 
-    print(f"[viz] http://{host}:{port} mock={mock} pose={pose_source}; read-only sensors", flush=True)
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    print(f"[viz] http://{host}:{port} mock={mock} pose={pose_source} backend={detector_backend}; read-only sensors",flush=True)
+    uvicorn.run(app,host=host,port=port,log_level="warning",ws="wsproto")
 
 
 _VIZ_PAGE = r"""<!doctype html>
@@ -1651,7 +2006,7 @@ header,.panelhead,.toolbar,.legend{display:flex;align-items:center;gap:10px;flex
 <div id="notice" class="notice">Camera and depth can be inspected without markers. Box identification is a separate stage.</div>
 <div id="mock" class="mock-controls" hidden><strong>Simulation controls — fixture only, not the robot</strong><div class="toolbar"><button data-action="turn_left">Turn +45°</button><button data-action="turn_right">Turn −45°</button><button data-action="forward">Forward 15 cm</button><button data-action="back">Back 15 cm</button><button data-action="visibility">Toggle visibility</button><button data-action="anchor">Hide / show anchor</button><button data-action="pose">Lose / restore pose</button><button data-action="stack_next">Third box placement</button><button data-action="reset">Reset</button></div></div>
 <main class="workspace">
-<section class="panel"><div class="panelhead"><h2>Robot camera</h2><div class="toolbar"><select id="image-view" aria-label="Camera stream"><option value="camera">Camera · auto</option><option value="rect">Rectified + markers</option><option value="raw">Wide head camera</option><option value="range">Depth range</option><option value="boxes">Box detections · snapshot</option></select><a id="open-image" href="/frame" target="_blank" rel="noopener" class="button">Open image</a></div></div><div class="camera-stage"><div id="camera-empty" class="placeholder"><strong>Waiting for an image</strong>Checking camera and depth streams.</div><img id="cam" hidden alt="Robot camera or depth range image"></div><div id="range-legend" class="range-legend" hidden><div>Distance from camera · not height</div><div class="ramp"></div><div class="range-labels"><span>0 m</span><span>1.5 m</span><span>3 m+</span></div><small>Black pixels have no valid depth measurement.</small></div><div id="cameraLabel" class="camera-caption">Images are read-only. A box visible in RGB is not yet a tracked box.</div></section>
+<section class="panel"><div class="panelhead"><h2>Robot camera</h2><div class="toolbar"><select id="image-view" aria-label="Camera stream"><option value="camera">Live camera · auto</option><option value="live">Live overlays</option><option value="rect">Rectified + markers</option><option value="raw">Wide head camera</option><option value="range">Depth range</option><option value="boxes">Box detections · snapshot</option></select><a id="open-image" href="/frame" target="_blank" rel="noopener" class="button">Open image</a></div></div><div class="camera-stage"><div id="camera-empty" class="placeholder"><strong>Waiting for an image</strong>Checking camera and depth streams.</div><img id="cam" hidden alt="Robot camera or depth range image"></div><div id="range-legend" class="range-legend" hidden><div>Distance from camera · not height</div><div class="ramp"></div><div class="range-labels"><span>0 m</span><span>1.5 m</span><span>3 m+</span></div><small>Black pixels have no valid depth measurement.</small></div><div id="cameraLabel" class="camera-caption">Images are read-only. A box visible in RGB is not yet a tracked box.</div></section>
 <section class="panel"><div class="panelhead"><h2>Surrounding map</h2><div class="toolbar"><select id="view" aria-label="Map frame"><option value="robot">Robot-centered</option><option value="world">Session world</option></select><select id="range" aria-label="Map radius"><option value="2">2 m radius</option><option value="1">1 m radius</option><option value="3">3 m radius</option><option value="fit">Fit objects</option></select></div></div><div class="legend"><span><i style="background:#62dfb6"></i>Loose</span><span><i style="background:#ffbf69"></i>Protected</span><span><i style="background:#c7a5ff"></i>Unknown</span><span>Dashed = memory, not a fresh candidate</span></div><canvas id="map" width="640" height="520"></canvas><div id="map-foot" class="map-foot">Blue cells are surface observations. Empty cells are unknown—not free space.</div></section>
 </main>
 <div class="lower"><section class="panel"><div class="panelhead"><h2>Height inspection</h2><small id="height-mode">Auto-scaled to observations</small></div><canvas id="side" width="640" height="245"></canvas><div class="map-foot">Objects sharing a horizontal position share a column. This is geometry, not proof of a successful placement.</div></section><section class="panel"><div class="panelhead"><h2>Box tracks</h2><span id="track-count" class="pill">0 tracks</span></div><div id="selection">Select a row to highlight its location.</div><div class="table-wrap"><table><thead><tr><th>ID / state</th><th>Age</th><th>Forward x</th><th>Left y</th><th>Height z</th></tr></thead><tbody id="rows"></tbody></table><div id="no-tracks" class="empty">No box tracks yet. Check the camera and detector status.</div></div></section></div>
@@ -1662,11 +2017,14 @@ const $=id=>document.getElementById(id);
 const cv=$('map'),ctx=cv.getContext('2d'),side=$('side'),sc=side.getContext('2d');
 const colors={loose:'#62dfb6',protected:'#ffbf69',unknown:'#c7a5ff'};
 let data=null, selected=null, frameKey='', bounds={w:640,h:520,scale:100}, labels=[];
+let socket=null,pendingBundle=null,decoding=false,imageURL=null,generation=0,surfaceCache=[],surfaceEpoch=null,reconnectTimer=null;
+let clientDrops=0,clientFrames=[],lastCapture=null;
 const fmt=(v,n=2)=>Number.isFinite(v)?v.toFixed(n):'—';
 const age=v=>Number.isFinite(v)?(v<1?Math.round(v*1000)+' ms':v.toFixed(1)+' s'):'no data';
 const objectName=t=>t.name||('#'+t.id);
 function tableTracks(d){return d.tracks.concat((d.objects||[]).filter(o=>!o.position_base_m).map(o=>({id:o.id,name:o.track_id,pos:[null,null,null],age:o.age_s,current:o.current,classification:'2D only',depth_status:o.depth_status,score:o.score,pick_candidate:false})));}
 function prepare(canvas,c){const b=canvas.getBoundingClientRect(),w=Math.max(100,b.width),h=Math.max(100,b.height),dpr=Math.min(window.devicePixelRatio||1,2);if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);}c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);c.font='13px system-ui';return {w,h};}
+function basePoint(world,d){const c=Math.cos(d.pose.yaw),s=Math.sin(d.pose.yaw),x=world[0]-d.pose.x,y=world[1]-d.pose.y;return [c*x+s*y,-s*x+c*y,world[2]];}
 function framePoint(p,d){if($('view').value==='robot')return p;const c=Math.cos(d.pose.yaw),s=Math.sin(d.pose.yaw);return [d.pose.x+c*p[0]-s*p[1],d.pose.y+s*p[0]+c*p[1],p[2]];}
 function radius(d){if($('range').value!=='fit')return Number($('range').value);const points=[[0,0,0],...d.tracks.map(t=>t.pos),...(d.build?d.build.cells:[])];return d.tracks.length?Math.max(.6,Math.min(5,Math.max(...points.map(p=>Math.max(...framePoint(p,d).slice(0,2).map(Math.abs))))+.25)):2;}
 function px(p,d){const q=framePoint(p,d);return [bounds.w/2-q[1]*bounds.scale,bounds.h/2-q[0]*bounds.scale];}
@@ -1676,7 +2034,7 @@ function label(text,p,color){const w=ctx.measureText(text).width+12,h=22;let r;f
 function groups(d){const out=[];for(const t of d.tracks){let g=out.find(g=>Math.hypot(g[0].pos[0]-t.pos[0],g[0].pos[1]-t.pos[1])<.015);if(g)g.push(t);else out.push([t]);}return out;}
 function drawMap(d){bounds=prepare(cv,ctx);const r=radius(d);bounds.scale=(Math.min(bounds.w,bounds.h)-72)/(2*r);labels=[];ctx.lineWidth=1;ctx.strokeStyle='#1b2b40';
 for(let t=-r;t<=r+.001;t+=d.settings.resolution){ctx.beginPath();ctx.moveTo(bounds.w/2+t*bounds.scale,30);ctx.lineTo(bounds.w/2+t*bounds.scale,bounds.h-25);ctx.stroke();ctx.beginPath();ctx.moveTo(20,bounds.h/2+t*bounds.scale);ctx.lineTo(bounds.w-20,bounds.h/2+t*bounds.scale);ctx.stroke();}
-for(const c of d.surface_cells){const height=Math.max(0,Math.min(1,c.z_max/1.8));ctx.fillStyle=`rgba(49,${Math.round(90+height*110)},220,${Math.max(.06,.46*(1-c.age/d.settings.memory_s))})`;const co=Math.cos(d.pose.yaw),si=Math.sin(d.pose.yaw);square(c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
+for(const c of d.surface_cells){const height=Math.max(0,Math.min(1,c.z_max/1.8)),elapsed=c.last_seen?Math.max(0,d.published_at-c.last_seen):c.age;ctx.fillStyle=`rgba(49,${Math.round(90+height*110)},220,${Math.max(.06,.46*(1-elapsed/d.settings.memory_s))})`;const co=Math.cos(d.pose.yaw),si=Math.sin(d.pose.yaw);square(c.world?basePoint(c.world,d):c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
 if(d.build){ctx.lineWidth=1.5;ctx.strokeStyle=d.build.valid?'#ffbf69':'#806c53';for(const c of d.build.cells){square(c,d.build.col,d.build.row,d.settings.cell/2,d);ctx.stroke();}ctx.fillStyle='#ff8087';ctx.beginPath();ctx.arc(...px(d.build.marker,d),5,0,Math.PI*2);ctx.fill();label('Anchor 49',px(d.build.marker,d),'#ff8087');}
 if(d.mock){ctx.strokeStyle='#537694';ctx.setLineDash([5,7]);path([[r*.8*Math.cos(.838),r*.8*Math.sin(.838),0],[0,0,0],[r*.8*Math.cos(.838),-r*.8*Math.sin(.838),0]],d);ctx.stroke();ctx.setLineDash([]);}
 for(const group of groups(d)){const t=group[0],p=px(t.pos,d),color=colors[t.classification],current=group.some(t=>t.current),highlight=group.some(t=>t.id===selected);ctx.globalAlpha=current?1:.45;ctx.strokeStyle=highlight?'#fff':color;ctx.lineWidth=highlight?3:2;ctx.setLineDash(current?[]:[4,3]);ctx.beginPath();ctx.arc(...p,highlight?9:7,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);if(current){ctx.fillStyle=color;ctx.beginPath();ctx.arc(...p,3,0,Math.PI*2);ctx.fill();}ctx.globalAlpha=1;label(group.map(objectName).join(' / '),p,color);}
@@ -1690,25 +2048,35 @@ $('height-mode').textContent=d.objects?.length?'Visible-surface z estimates, not
 if(anchored){sc.strokeStyle='#ffbf69';sc.setLineDash([5,4]);sc.beginPath();sc.moveTo(48,py(0));sc.lineTo(w-12,py(0));sc.stroke();sc.setLineDash([]);sc.fillStyle='#ffbf69';sc.fillText('Build surface',55,py(0)-5);}
 gs.forEach((g,i)=>{const x=60+(w-85)*(i+.5)/gs.length;for(const t of g){const top=py(t.pos[2]+t.size/2-datum),height=t.size*scale;sc.globalAlpha=t.current?1:.4;sc.fillStyle=colors[t.classification];sc.fillRect(x-15,top,30,Math.max(3,height-1));if(t.id===selected){sc.strokeStyle='#fff';sc.strokeRect(x-17,top-2,34,height+3);}if(height>14){sc.fillStyle='#071019';sc.fillText('#'+t.id,x-11,top+Math.min(height-3,16));}sc.globalAlpha=1;}sc.fillStyle='#dbe8f8';sc.fillText(g.map(t=>t.name?t.name.replace('box-','B'):'#'+t.id).join('/'),x-15,h-10);});}
 function setHealth(name,value,detail,tone){$(name+'-state').textContent=value;$(name+'-state').className=tone;$(name+'-detail').textContent=detail;}
-function camera(d){let view=$('image-view').value;if(view==='camera')view=d.detector_status?.enabled&&d.streams?.boxes?.fresh?'boxes':d.streams?.rect?.fresh?'rect':'raw';const s=d.streams?.[view];const image=$('cam'),empty=$('camera-empty');$('range-legend').hidden=view!=='range'||d.mock;
-if(d.mock||!s?.fresh){image.hidden=true;empty.hidden=false;empty.textContent=d.mock?'Simulation has no camera pixels. Use the map controls to exercise memory and classification.':'Selected stream unavailable or stale. Try Camera · auto to inspect the independent head camera.';frameKey='';}else{const key=view+':'+s.ts;if(frameKey!==key){frameKey=key;image.src='/frame?view='+view+'&t='+s.ts;}empty.hidden=true;image.hidden=false;}
+function camera(d){let view=$('image-view').value;if(d.transport==='websocket'&&d.image)view=d.image.view;else if(view==='camera')view=d.streams?.live?.fresh?'live':d.streams?.rect?.fresh?'rect':'raw';const s=d.streams?.[view];const image=$('cam'),empty=$('camera-empty');$('range-legend').hidden=view!=='range'||d.mock;
+if(d.mock||!s?.fresh){image.hidden=true;empty.hidden=false;empty.textContent=d.mock?'Simulation has no camera pixels. Use the map controls to exercise memory and classification.':'Selected stream unavailable or stale. Try Camera · auto to inspect the independent head camera.';frameKey='';}else{const key=view+':'+s.ts;if(d.transport!=='websocket'&&frameKey!==key){frameKey=key;image.src='/frame?view='+view+'&t='+s.ts;}empty.hidden=true;image.hidden=false;}
 $('open-image').href='/frame?view='+view;
-$('cameraLabel').textContent=d.mock?'Mock geometry only; no computer-vision model runs on this scene.':({raw:'Wide left head camera. Independent of depth; no box recognition overlay.',rect:'Rectified 512×384 camera. Marker outlines only; untagged boxes are not identified.',range:'Sparse camera-range image: cool = nearer, warm = farther. Black = no valid depth.',boxes:'DELAYED detection snapshot. Labels, image and depth use the SAME captured frame. Scores are not calibrated probabilities.'}[view])+' Frame age: '+age(s?.age_s);}
+$('cameraLabel').textContent=d.mock?'Mock geometry only; no computer-vision model runs on this scene.':({live:'LIVE rectified frames. Green = detector evidence; amber / tracked = short-lived visual prediction, NOT refreshed 3D evidence.',raw:'Wide left head camera. Independent of depth; no box recognition overlay.',rect:'Rectified 512×384 camera. Marker outlines only; untagged boxes are not identified.',range:'Sparse camera-range image: cool = nearer, warm = farther. Black = no valid depth.',boxes:'DELAYED detection snapshot. Labels, image and depth use the SAME captured frame. Scores are not calibrated probabilities.'}[view])+' Frame age: '+age(s?.age_s);}
 function render(d){$('mode').textContent=d.mock?'SIMULATION':'LIVE · READ ONLY';$('mode').className='pill '+(d.mock?'warn':'ok');$('connection').textContent=d.stale?'Sensor snapshot stale':'Connected';$('connection').className='pill '+(d.stale?'warn':'ok');$('mock').hidden=!d.mock;
-const streams=d.streams||{},cam=streams.raw?.fresh||streams.rect?.fresh,depth=streams.range?.fresh;const p=d.mock?d.pose:(d.telemetry?.pose||d.pose),ages=d.telemetry?.ages||{};
-setHealth('camera',d.mock?'Simulated':cam?'Receiving':'No fresh image',d.mock?'No camera pixels':`Raw ${age(streams.raw?.age_s)} · rectified ${age(streams.rect?.age_s)}`,d.mock?'warn':cam?'ok':'bad');
-setHealth('depth',d.mock?'Simulated':depth?'Receiving':'Unavailable',d.mock?d.surface_cells.length+' fixture surface cells':(d.diagnostics?.point_count||0).toLocaleString()+' points · '+age(streams.range?.age_s),d.mock?'warn':depth?'ok':'bad');
+const streams=d.streams||{},ages=d.telemetry?.ages||{},cam=streams.raw?.fresh||streams.rect?.fresh||streams.live?.fresh||(Number.isFinite(ages.camera)&&ages.camera<d.settings.fresh_s),depth=!d.stale&&(d.diagnostics?.point_count||0)>0;const p=d.mock?d.pose:(d.telemetry?.pose||d.pose);
+setHealth('camera',d.mock?'Simulated':cam?'Receiving':'No fresh image',d.mock?'No camera pixels':`Sensor ${age(ages.camera)} · displayed ${age(streams[d.image?.view||'live']?.age_s)}`,d.mock?'warn':cam?'ok':'bad');
+setHealth('depth',d.mock?'Simulated':depth?'Receiving':'Unavailable',d.mock?d.surface_cells.length+' fixture surface cells':(d.diagnostics?.point_count||0).toLocaleString()+' points · '+age(ages.depth),d.mock?'warn':depth?'ok':'bad');
 setHealth('pose',p.valid?p.source:'Unavailable',`x ${fmt(p.x)} · y ${fmt(p.y)} m · yaw ${fmt(p.yaw*180/Math.PI,1)}°`,p.valid?'ok':'bad');
 setHealth('anchor',d.anchor_seen?'Seen':d.build?.valid?'Remembered':'Not set',d.build?'Last observed '+age(d.build.age):'Only needed for build-zone classification',d.build?.valid?'ok':'warn');
-$('notice').textContent=d.mock?'Mock and live use the same classifier. These buttons only change simulated geometry.':d.detector_status?.enabled?`Local box detector: ${d.detector_status.state} · last inference ${fmt(d.detector_status.inference_s,2)} s. IDs are session-local. Surface estimates are NOT grasp poses; unknown build zone stays unassigned.`:'Camera and depth inspection: active independently of markers. Enable --detector boxes for local markerless box proposals.';
+$('notice').textContent=d.mock?'Mock and live use the same classifier. These buttons only change simulated geometry.':d.detector_status?.enabled?`Detector: ${d.detector_status.runtime?.backend||d.detector_status.requested_backend||'loading'} ${d.detector_status.runtime?.precision||''} · ${fmt(d.detector_status.detector_fps,1)} detections/s · last pass ${fmt((d.detector_status.inference_s||0)*1000,0)} ms · p95 result age ${fmt(d.detector_status.result_age_p95_ms,0)} ms. Visual tracking does not refresh measured geometry.`:'Camera and depth inspection: active independently of markers. Enable --detector boxes for local markerless box proposals.';
 $('track-count').textContent=tableTracks(d).length+' tracks · '+d.tracks.length+' on map';$('no-tracks').hidden=tableTracks(d).length>0;const rows=$('rows');rows.replaceChildren();for(const t of tableTracks(d)){const tr=document.createElement('tr');tr.className=t.id===selected?'selected':'';for(const v of [objectName(t)+' '+(t.name&&t.classification==='unknown'?'zone unassigned':t.classification)+(t.current?'':' / memory'),age(t.age),fmt(t.pos[0],3),fmt(t.pos[1],3),fmt(t.pos[2],3)]){const td=document.createElement('td');td.textContent=v;tr.appendChild(td);}tr.onclick=()=>{selected=t.id;render(data);};rows.appendChild(tr);}
 const chosen=tableTracks(d).find(t=>t.id===selected);$('selection').textContent=chosen?`${objectName(chosen)} ${chosen.depth_status||''} score ${fmt(chosen.score)}: ${chosen.current?'observed now':'remembered only'} · ${chosen.pick_candidate?'candidate, reach/grasp NOT validated':'not a fresh pick candidate'}`:'Select a track row to highlight it in both views.';
 $('warnings').textContent=d.warnings.join(' | ');$('info').textContent=`Capture pose epoch ${d.pose.epoch} · frame ${d.frame}\nWheel age ${age(ages.wheel)} · IMU age ${age(ages.imu)}\nDepth-to-forward yaw ${fmt(d.diagnostics?.depth_yaw_deg,1)}° · pose/camera skew ${age(d.diagnostics?.pose_camera_skew_s)}\n${d.detector||'Observation source: mock'}\n${p.warning||''}\n${d.map_semantics}`;
 camera(d);drawMap(d);drawHeights(d);}
-async function tick(){const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),3000);try{const response=await fetch('/scan',{cache:'no-store',signal:abort.signal});if(!response.ok)throw Error('HTTP '+response.status);data=await response.json();render(data);}catch(e){$('connection').textContent='Disconnected';$('connection').className='pill bad';$('warnings').textContent='No current snapshot: '+e.message;$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='Disconnected. Last map is not live.';}finally{clearTimeout(timer);setTimeout(tick,400);}}
-$('cam').onerror=()=>{frameKey='';$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='Image unavailable or stale; checking again.';};
+async function drain(){if(decoding)return;decoding=true;try{while(pendingBundle){const bundle=pendingBundle;pendingBundle=null;let url=null;
+if(bundle.jpeg.byteLength){url=URL.createObjectURL(new Blob([bundle.jpeg],{type:'image/jpeg'}));const decoded=new Image();decoded.src=url;try{await decoded.decode();}catch(e){URL.revokeObjectURL(url);continue;}}
+if(bundle.generation!==generation||pendingBundle){clientDrops++;if(url)URL.revokeObjectURL(url);continue;}
+if(url){const previous=imageURL;imageURL=url;$('cam').src=url;if(previous)URL.revokeObjectURL(previous);}
+data=bundle.meta;data.surface_cells=surfaceEpoch===data.pose.epoch?surfaceCache:[];render(data);const rendered=performance.now();if(bundle.jpeg.byteLength&&data.image.timestamp!==lastCapture){lastCapture=data.image.timestamp;clientFrames.push(rendered);}clientFrames=clientFrames.filter(t=>rendered-t<3000);const fps=clientFrames.length>1?(clientFrames.length-1)*1000/(clientFrames[clientFrames.length-1]-clientFrames[0]):0;data.client_receive_to_render_ms=rendered-bundle.received;$('connection').textContent=data.stale?'Live push · sensor stale':`Live push · ${fmt(fps,1)} FPS · render ${fmt(data.client_receive_to_render_ms,0)} ms · dropped ${clientDrops}`;
+}}catch(e){disconnected('Render error: '+e.message);}finally{decoding=false;}}
+function disconnected(message){$('connection').textContent='Disconnected';$('connection').className='pill bad';$('warnings').textContent=message;$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='No live stream. Last map is historical.';}
+function connect(){const current=++generation;pendingBundle=null;clientFrames=[];lastCapture=null;if(reconnectTimer)clearTimeout(reconnectTimer);if(socket)socket.close();
+const scheme=location.protocol==='https:'?'wss:':'ws:';socket=new WebSocket(scheme+'//'+location.host+'/live?view='+encodeURIComponent($('image-view').value));socket.binaryType='arraybuffer';
+socket.onmessage=event=>{if(current!==generation)return;try{const bytes=event.data;if(!(bytes instanceof ArrayBuffer)||bytes.byteLength<4||bytes.byteLength>8*1024*1024)throw Error('invalid stream envelope');const length=new DataView(bytes).getUint32(0);if(length>2*1024*1024||length+4>bytes.byteLength)throw Error('invalid metadata length');const meta=JSON.parse(new TextDecoder().decode(new Uint8Array(bytes,4,length)));const jpeg=bytes.slice(4+length);if(jpeg.byteLength!==meta.image.bytes)throw Error('image/metadata length mismatch');if(meta.surface_cells){surfaceCache=meta.surface_cells;surfaceEpoch=meta.pose.epoch;}if(pendingBundle)clientDrops++;pendingBundle={meta,jpeg,generation:current,received:performance.now()};drain();}catch(e){disconnected(e.message);socket.close();}};
+socket.onclose=()=>{if(current!==generation)return;disconnected('Stream closed; reconnecting without queuing old frames.');reconnectTimer=setTimeout(connect,1000);};socket.onerror=()=>{if(current===generation)disconnected('WebSocket unavailable');};}
+$('cam').onerror=()=>{$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='Image decode failed; waiting for a fresh frame.';};
 for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{const r=await fetch('/mock/'+b.dataset.action,{method:'POST'});if(!r.ok)throw Error(await r.text());}catch(e){$('warnings').textContent=e.message;}};
-for(const id of ['view','range','image-view'])$(id).onchange=()=>{frameKey='';if(data)render(data);};window.addEventListener('resize',()=>data&&render(data));tick();
+for(const id of ['view','range'])$(id).onchange=()=>data&&render(data);$('image-view').onchange=connect;window.addEventListener('resize',()=>data&&render(data));window.addEventListener('beforeunload',()=>{generation++;if(socket)socket.close();if(imageURL)URL.revokeObjectURL(imageURL);});connect();
 </script></body></html>"""
 
 
@@ -1774,7 +2142,7 @@ def self_test():
             from types import SimpleNamespace
             raw = np.full((80,160,3), 120, np.uint8)
             fake = SimpleNamespace(raw_jpeg=_encode_jpeg(raw), raw_ts=time.time(), poll=lambda: None, close=lambda: None)
-            with patch(__name__+'.LiveSource', return_value=fake):
+            with patch(__name__+'.CaptureWorker',return_value=fake):
                 session = PerceptionSession()
                 self.assertIsNone(session.poll())
                 encoded, ts = session.streams['raw']
@@ -1893,6 +2261,9 @@ def self_test():
             worker.process = SimpleNamespace(is_alive=lambda: True)
             worker.status = {'state':'ready'}
             worker.tracker = ObjectTracker()
+            worker.overlay = LiveOverlay()
+            worker.debug_image_requested = True
+            worker.completions,worker.result_ages = deque(maxlen=120),deque(maxlen=120)
             worker.pending = (np.zeros((30,30,3),np.uint8),np.empty((0,3)),np.empty(0,dtype=int),self.t,self.pose)
             worker.results.put({'ts':self.t,'inference_s':.5,'detections':[{'bbox':[5,5,20,20],'score':.3,'label':'cardboard_box'}]})
             self.assertTrue(worker.poll(None,np.zeros(3)))
@@ -1945,6 +2316,116 @@ def self_test():
                 detector.assert_called_once_with(Path('/missing'),512,.1,'tensorrt','fp16')
             self.assertIn('engine missing',results.get_nowait()['error'])
             self.assertTrue(results.empty())
+
+        def test_capture_worker_owns_readers_and_drops_old_packets(self):
+            from types import SimpleNamespace
+            ready=threading.Event(); identity={}
+            class FakeSource:
+                def __init__(self):
+                    identity['created']=threading.get_ident()
+                    self.raw_jpeg,self.raw_ts,self.sensor_ts=b'',0.0,{}
+                    self.odom=SimpleNamespace(pose=Pose(valid=True))
+                    self.camera_origin,self.depth_yaw_deg=np.zeros(3),0.0
+                    self.count=0
+                def poll(self):
+                    self.count+=1
+                    if self.count>=5:ready.set()
+                    return (np.zeros((2,2,3),np.uint8),np.ones((1,3)),np.zeros(1,int),float(self.count),Pose(valid=True))
+                def close(self):identity['closed']=threading.get_ident()
+            capture=CaptureWorker(source_factory=FakeSource)
+            try:
+                self.assertTrue(ready.wait(1))
+                packet=capture.poll()
+                self.assertGreaterEqual(packet[3],5)
+                self.assertFalse(packet[0].flags.writeable)
+                self.assertGreater(capture.stats()['replaced_packets'],0)
+            finally:capture.close()
+            self.assertEqual(identity['created'],identity['closed'])
+            self.assertNotEqual(identity['created'],threading.get_ident())
+
+        def test_direct_scan_and_json_share_automatic_tracks(self):
+            tracker=ObjectTracker()
+            d={'bbox':[10,10,30,30],'position_base_m':[.6,.1,.1],'position_kind':'visible_surface_centroid',
+               'depth_status':'surface_supported','score':.3}
+            tracker.update([d],self.pose,self.t)
+            objects=tracker.snapshot(self.pose,None,self.t+.1,self.cfg)
+            s=Scan(ts=self.t,pose=self.pose)
+            attached=_attach_object_tracks(_attach_object_tracks(s,objects),objects)
+            self.assertEqual(len(attached.tracks),1)
+            encoded=scan_to_dict(attached)
+            self.assertEqual(len(encoded['tracks']),1)
+            self.assertEqual(attached.tracks[0]['id'],encoded['tracks'][0]['id'])
+            self.assertEqual(attached.tracks[0]['world'],encoded['tracks'][0]['world'])
+            self.assertFalse(encoded['tracks'][0]['pick_candidate'])
+
+        def test_visual_overlay_expiry_does_not_refresh_evidence(self):
+            overlay=LiveOverlay()
+            rgb=np.zeros((80,80,3),np.uint8)
+            for y in range(20,60,8):
+                for x in range(20,60,8):
+                    if (x+y)//8%2:rgb[y:y+5,x:x+5]=255
+            obj={'id':1000,'track_id':'box-001','bbox':[18,18,63,63],'score':.4,'identity_status':'tracked'}
+            overlay.update(rgb,[obj],self.t,0)
+            _,same=overlay.draw(rgb,self.t,0)
+            self.assertEqual(same['source'],'detected')
+            self.assertEqual(same['count'],1)
+            shifted=cv2.warpAffine(rgb,np.array([[1,0,2],[0,1,1]],np.float32),(80,80))
+            _,tracked=overlay.draw(shifted,self.t+.1,0)
+            self.assertEqual(tracked['source'],'visual_tracking')
+            self.assertEqual(tracked['count'],1)
+            self.assertEqual(overlay.ts,self.t)
+            _,expired=overlay.draw(shifted,self.t+1,0)
+            self.assertEqual(expired['count'],0)
+            _,reset=overlay.draw(shifted,self.t+.1,1)
+            self.assertEqual(reset['count'],0)
+            self.assertEqual(obj['bbox'],[18,18,63,63])
+
+        def test_large_sensor_reads_are_paced(self):
+            from types import SimpleNamespace
+            from unittest.mock import Mock,patch
+            source=LiveSource.__new__(LiveSource)
+            source.next_head_poll=source.next_depth_poll=0.0
+            source.head=SimpleNamespace(ready=Mock(return_value=False))
+            source.points=SimpleNamespace(ready=Mock(return_value=False))
+            source.imu=SimpleNamespace(ready=Mock(return_value=False))
+            source.wheels=SimpleNamespace(ready=Mock(return_value=False))
+            source.odom=SimpleNamespace(pose=Pose())
+            for i in range(101):
+                with patch('time.monotonic',return_value=i/1000):
+                    self.assertIsNone(source.poll())
+            self.assertEqual(source.head.ready.call_count,2)
+            self.assertLessEqual(source.points.ready.call_count,5)
+            self.assertEqual(source.wheels.ready.call_count,101)
+
+        def test_cached_map_reprojects_without_rebuilding(self):
+            world=WorldModel()
+            cloud=np.tile([.61,.11,.2],(20,1))
+            first=world.update([],self.pose,self.t,points=cloud)
+            pose=Pose(.1,.2,.4,self.t+.1,'test',True)
+            second=world.update([],pose,self.t+.1,points=cloud,map_update=False)
+            self.assertEqual(len(first.surface_cells),len(second.surface_cells))
+            self.assertEqual(first.surface_cells[0]['last_seen'],second.surface_cells[0]['last_seen'])
+            np.testing.assert_allclose(second.surface_cells[0]['pos'],pose.to_base(first.surface_cells[0]['world']))
+
+        def test_detector_dispatch_has_matching_depth_and_rejects_stale_input(self):
+            import queue
+            from types import SimpleNamespace
+            worker=DetectorWorker.__new__(DetectorWorker)
+            worker.results,worker.jobs=queue.Queue(),queue.Queue(1)
+            worker.process=SimpleNamespace(is_alive=lambda:True)
+            worker.status={'state':'ready'};worker.pending=None
+            rgb=np.zeros((3,3,3),np.uint8);points=np.ones((2,3));indices=np.array([0,1])
+            stale=(rgb,points,indices,self.t-10,self.pose)
+            worker.poll(stale,np.zeros(3))
+            self.assertTrue(worker.jobs.empty())
+            self.assertEqual(worker.status['frames_skipped_stale'],1)
+            current=(rgb,points,indices,time.time(),self.pose)
+            worker.poll(current,np.zeros(3))
+            payload=worker.jobs.get_nowait()
+            self.assertEqual(payload[0],current[3])
+            np.testing.assert_equal(payload[2],points.astype(np.float32))
+            np.testing.assert_equal(payload[3],indices)
+            self.assertEqual(worker.pending[3],current[3])
 
         def test_sparse_indices_not_reshape(self):
             mask = np.zeros((3, 4), bool)
@@ -2127,7 +2608,7 @@ if __name__ == "__main__":
     ap.add_argument("--build-cols", type=int, default=FOOTPRINT)
     ap.add_argument("--build-rows", type=int, default=FOOTPRINT)
     ap.add_argument("--capture", type=Path, help="save one live debug JPEG; refuses to overwrite")
-    ap.add_argument("--image-view", choices=["rect", "range", "raw", "boxes"], default="rect")
+    ap.add_argument("--image-view", choices=["live", "rect", "range", "raw", "boxes"], default="rect")
     ap.add_argument("--prepare-detector", action="store_true")
     ap.add_argument("--prepare-gpu-detector", action="store_true")
     ap.add_argument("--detector-backend", choices=["cpu","tensorrt"], default="cpu")

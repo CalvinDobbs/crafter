@@ -219,17 +219,20 @@ The reasoning layer works in world positions carrying frame and epoch metadata. 
 
 [pickup.py](pickup.py) is a direct joint-space two-arm cage-and-lift prototype. It is not navigation, and it is not an `ActionProvider`. Its stage order and mode flags are under active development by the action owner — check the module docstring and `--help` rather than trusting any description, including this one.
 
+Every run first resets to a repeatable pose based on each arm's `cfg.home`, with J0 at the calibrated top and J7 open. This assumes an already-homed, unloaded robot; it does not replace the encoder homing procedure in section 3.4. Invalid or out-of-range reference poses are rejected before torque is enabled. Initialization requires actual arrival within `ARRIVE_TOL`; a stall or timeout aborts the pickup instead of accepting an inconsistent starting pose.
+
 Stages, in order:
 
 1. Disable torque, flush ctrl to the live pose, enable torque (section 3.3).
-2. Elbow (J3) to 90 degrees, on a quintic ease, held through the later stages so the forearm clears the table.
-3. Grippers (J7) open to `GRIP_OPEN_FRAC` of the calibrated travel.
-4. J0 to the top.
-5. Spread: both arms swing J2 outward to the calibrated edge, straddling a box wider than the shoulders.
-6. Prepare the wrists **while still at the top**: J5 yaw alone rotates inward toward the box, preserving the J6 pitch and open J7 claw setpoints. `--hook` caps J5 travel; `--hook 0` skips the stage, as does `--lower-only`. Yaw alone can change hand height, so this rotation happens before descent rather than sweeping across the box at floor level.
-7. J0 down to the calibrated bottom plus `--bottom-margin` turns back toward the top (default: 1.0 turns). **That margin is a lift offset, not a measured floor clearance** — nothing here senses the floor. `--lower-only` stops and holds at this pose.
-8. Pinch: J2 creeps inward until per-arm tracking error crosses `PINCH_CONTACT_ERR`, then holds `--squeeze` turns past contact, capped by calibration. **This is the default stopping point** — it holds the squeeze until Ctrl+C or `--hold`.
-9. With `--pickup` only: close the grippers, cradle with extra elbow flex, then shoot J0 back to the top and hold.
+2. Initialize the elbow (J3) to the calibrated 90-degree home angle, on a quintic ease, held through the later stages so the forearm clears the table.
+3. Initialize grippers (J7) open to `GRIP_OPEN_FRAC` of the calibrated travel.
+4. Initialize J0 to the top, waiting for both lifts to arrive before resetting other arm joints.
+5. While raised, initialize J1, J2, J4, J5 and J6 to their configured home angles with slow eased ramps. Recheck the entire reference pose before proceeding. These are per-arm calibrated motor positions, not an all-zero command; the shoulders and wrists no longer inherit offsets from previous pickups.
+6. Spread: both arms swing J2 outward from the initialized pose to the calibrated edge, straddling a box wider than the shoulders.
+7. Prepare the wrists **while still at the top**: J5 yaw alone rotates inward from its initialized angle toward the box, preserving the initialized J6 pitch and open J7 claw setpoints. `--hook` caps J5 travel; `--hook 0` skips this inward rotation, as does `--lower-only`, but neither skips initialization. Yaw alone can change hand height, so this rotation happens before descent rather than sweeping across the box at floor level.
+8. J0 down to the calibrated bottom plus `--bottom-margin` turns back toward the top (default: 1.0 turns). **That margin is a lift offset, not a measured floor clearance** — nothing here senses the floor. `--lower-only` stops and holds at this pose.
+9. Pinch: J2 creeps inward until per-arm tracking error crosses `PINCH_CONTACT_ERR`, then holds `--squeeze` turns past contact, capped by calibration. **This is the default stopping point** — it holds the squeeze until Ctrl+C or `--hold`.
+10. With `--pickup` only: close the grippers, cradle with extra elbow flex, then shoot J0 back to the top and hold.
 
 Properties worth copying:
 

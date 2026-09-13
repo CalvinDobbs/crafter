@@ -45,7 +45,9 @@ class FakeArm(pickup.Arm):
         self.grip_open, self.grip_closed = self.sign * 0.3, 0.0
         self.cmd = np.zeros(self.dof)
         self.contact_position = 0.05 if side == "left" else -0.02
-        self.cfg = SimpleNamespace(q2urdf=lambda q: q, ik=SimpleNamespace(fk=self.fk))
+        home = np.zeros(self.dof)
+        home[pickup.ELBOW] = self.elbow_90
+        self.cfg = SimpleNamespace(home=home, q2urdf=lambda q: q, ik=SimpleNamespace(fk=self.fk))
         self.commands = []
         self.torque = []
         self.closed = False
@@ -82,7 +84,7 @@ class PickupTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def run_main(self, *args, hold_seconds=0.02):
+    def run_main(self, *args, hold_seconds=0.02, settle_effect=None):
         arms, holds, ramps = [], [], []
         hold_args = [] if hold_seconds is None else ["--hold", str(hold_seconds)]
 
@@ -103,7 +105,7 @@ class PickupTests(unittest.TestCase):
 
         with patch.object(pickup, "Arm", side_effect=make_arm), \
                 patch.object(pickup, "ramp_joint", side_effect=ramp), \
-                patch.object(pickup, "settle_joint"), \
+                patch.object(pickup, "settle_joint", side_effect=settle_effect), \
                 patch.object(pickup, "hold", side_effect=hold), \
                 patch.object(sys, "argv", ["pickup.py", *hold_args, *args]):
             pickup.main()
@@ -207,7 +209,7 @@ class PickupTests(unittest.TestCase):
                     for pos in arm.commands[first_low:]:
                         np.testing.assert_allclose(pos[wrist], expected, atol=1e-9)
 
-    def test_hook_can_be_disabled_and_lower_only_never_rotates_wrists(self):
+    def test_hook_disabled_and_lower_only_skip_inward_wrist_preparation(self):
         for args in (("--hook", "0"), ("--lower-only",)):
             with self.subTest(args=args), patch.object(pickup, "hook_direction") as hook:
                 arms, _, _ = self.run_main(*args)
@@ -280,19 +282,21 @@ class PickupTests(unittest.TestCase):
             self.assertAlmostEqual(arm.cmd[pickup.WRIST_PITCH], 0.0)
             self.assertAlmostEqual(arm.cmd[pickup.J0], 1.0)
 
-    def test_wrist_preparation_preserves_existing_pitch_and_claw_extension(self):
+    def test_wrist_preparation_preserves_initialized_pitch_and_claw_extension(self):
         initialize = FakeArm.__init__
 
         def flat_claws(arm, side):
             initialize(arm, side)
-            arm.cmd[pickup.WRIST_PITCH] = arm.sign * 0.07
+            arm.cfg.home[pickup.WRIST_PITCH] = arm.sign * 0.07
+            arm.cmd[pickup.WRIST_PITCH] = -arm.sign * 0.04
 
         with patch.object(FakeArm, "__init__", flat_claws):
             arms, _, ramps = self.run_main()
         self.assertEqual(ramps.count(pickup.GRIPPER), 1)
         for arm in arms:
-            first_open = next(i for i, pos in enumerate(arm.commands) if pos[pickup.GRIPPER] == arm.grip_open)
-            for pos in arm.commands[first_open:]:
+            first_home = next(i for i, pos in enumerate(arm.commands)
+                              if np.array_equal(pos, arm.initial_pose()))
+            for pos in arm.commands[first_home:]:
                 self.assertAlmostEqual(pos[pickup.GRIPPER], arm.grip_open)
                 self.assertAlmostEqual(pos[pickup.WRIST_PITCH], arm.sign * 0.07)
             self.assertAlmostEqual(arm.cmd[pickup.WRIST_YAW], -arm.sign * pickup.HOOK_MAX_TRAVEL)
@@ -374,6 +378,146 @@ class PickupTests(unittest.TestCase):
             for pos in arm.commands:
                 np.testing.assert_array_equal(pos, final)
             self.assertEqual(arm.torque, [True])
+
+    def test_initial_pose_uses_each_arms_home_without_mutating_it(self):
+        for side in ("left", "right"):
+            with self.subTest(side=side):
+                arm = FakeArm(side)
+                arm.cfg.home = arm.sign * np.array([0.2, 0.03, 0.02, 0.25, -0.04, 0.02, -0.01, 0.1])
+                original = arm.cfg.home.copy()
+                arm.cmd[:] = 0.12
+                expected = original.copy()
+                expected[pickup.J0], expected[pickup.GRIPPER] = arm.top, arm.grip_open
+                np.testing.assert_array_equal(arm.initial_pose(), expected)
+                np.testing.assert_array_equal(arm.cfg.home, original)
+
+    def test_initializer_reaches_the_same_pose_from_different_starts(self):
+        results = []
+        for variant in (1, -1):
+            arms = [FakeArm(side) for side in ("left", "right")]
+            targets = []
+            for arm in arms:
+                arm.cfg.home[1] = arm.sign * 0.03
+                arm.cfg.home[4] = -arm.sign * 0.04
+                arm.cfg.home[pickup.WRIST_YAW] = arm.sign * 0.02
+                arm.cfg.home[pickup.WRIST_PITCH] = -arm.sign * 0.01
+                arm.cmd = variant * arm.sign * np.array([0, -0.1, 0.1, 0.1, 0.15, -0.12, 0.1, 0.05])
+                arm.cmd[pickup.J0] = 1.0
+                targets.append(arm.initial_pose())
+            self.assertTrue(pickup.initialize_pose(arms, targets, pickup.J0_SPEED))
+            for arm, target in zip(arms, targets):
+                np.testing.assert_allclose(arm.cmd, target, atol=1e-9)
+                np.testing.assert_allclose(arm.live(), target, atol=1e-9)
+                for previous, pos in zip(arm.commands, arm.commands[1:]):
+                    if not np.array_equal(previous[[1, 2, 4, 5, 6]], pos[[1, 2, 4, 5, 6]]):
+                        self.assertAlmostEqual(pos[pickup.J0], arm.top)
+                        self.assertAlmostEqual(pos[pickup.ELBOW], arm.elbow_90)
+            results.append([arm.cmd.copy() for arm in arms])
+        np.testing.assert_allclose(results[0], results[1], atol=1e-9)
+
+    def test_main_repeats_the_same_grasp_without_accumulating_joint_offsets(self):
+        initialize = FakeArm.__init__
+        results = []
+        for variant in (1, -1, 0):
+            def different_start(arm, side):
+                initialize(arm, side)
+                arm.cfg.home[[1, 2, 4, 5, 6]] = arm.sign * np.array([0.03, 0.02, -0.04, 0.02, -0.01])
+                arm.cmd = (variant * arm.sign * np.array([0, -0.1, 0.1, 0.1, 0.15, -0.12, 0.1, 0.05])
+                           if variant else results[0][0 if side == "left" else 1].copy())
+
+            with patch.object(FakeArm, "__init__", different_start):
+                arms, _, _ = self.run_main("--spread", "0.12", "--hook", "0.1")
+            for arm in arms:
+                self.assertTrue(any(np.array_equal(pos, arm.initial_pose()) for pos in arm.commands))
+                self.assertAlmostEqual(arm.cmd[pickup.WRIST_YAW], arm.cfg.home[pickup.WRIST_YAW] - arm.sign * 0.1)
+                np.testing.assert_array_equal(arm.cmd[[1, 4, 6]], arm.cfg.home[[1, 4, 6]])
+            results.append([arm.cmd.copy() for arm in arms])
+        for result in results[1:]:
+            np.testing.assert_allclose(results[0], result, atol=1e-9)
+
+    def test_invalid_initial_pose_is_rejected_before_enabling_torque(self):
+        initialize = FakeArm.__init__
+        for invalid in (np.zeros(7), np.array([0, 0, 0, 0.25, np.nan, 0, 0, 0]),
+                        np.array([0, 2, 0, 0.25, 0, 0, 0, 0])):
+            with self.subTest(home=invalid):
+                created = []
+
+                def bad_home(arm, side):
+                    initialize(arm, side)
+                    arm.cfg.home = invalid.copy()
+                    created.append(arm)
+
+                with patch.object(FakeArm, "__init__", bad_home), self.assertRaises(ValueError):
+                    self.run_main()
+                for arm in created:
+                    self.assertNotIn(True, arm.torque)
+                    self.assertEqual(arm.commands, [])
+                    self.assertTrue(arm.closed)
+
+    def test_initialization_requires_both_arms_to_arrive_not_just_stall(self):
+        arms = [FakeArm(side) for side in ("left", "right")]
+        for arm in arms:
+            arm.cmd[1] = 0.1
+        for timeout in (pickup.ARRIVE_TIMEOUT_S, 0.02):
+            with self.subTest(timeout=timeout), patch.object(arms[0], "live", return_value=np.zeros(8)):
+                with self.assertRaisesRegex(RuntimeError, "J1"):
+                    pickup.settle_joint(arms, 1, timeout=timeout, require_arrival=True)
+                pickup.settle_joint(arms, 1, timeout=0.02)
+        pickup.settle_joint(arms, 1, require_arrival=True)
+
+    def test_initialization_failure_blocks_wrist_preparation_and_grasp(self):
+        def fail_home(arms, joint, **kwargs):
+            if joint == 1 and kwargs.get("require_arrival"):
+                raise RuntimeError("J1 did not arrive")
+
+        with patch.object(pickup, "creep_to_contact") as creep:
+            with self.assertRaisesRegex(RuntimeError, "J1"):
+                self.run_main(settle_effect=fail_home)
+            creep.assert_not_called()
+
+    def test_initialization_rechecks_the_full_pose_before_pickup(self):
+        arm = FakeArm("left")
+        arm.cfg.home[pickup.WRIST_PITCH] = 0.04
+        target = arm.initial_pose()
+        live = arm.live
+
+        def drifted_shoulder():
+            pos = live()
+            if abs(arm.cmd[pickup.WRIST_PITCH] - target[pickup.WRIST_PITCH]) < 1e-9:
+                pos[1] += 0.1
+            return pos
+
+        with patch.object(arm, "live", side_effect=drifted_shoulder):
+            with self.assertRaisesRegex(RuntimeError, "initialization pose"):
+                pickup.initialize_pose([arm], [target], pickup.J0_SPEED)
+
+    def test_cancellation_during_command_flush_never_enables_torque(self):
+        arms = [FakeArm(side) for side in ("left", "right")]
+        with patch.object(pickup, "Arm", side_effect=arms), \
+                patch.object(pickup, "hold", side_effect=pickup._sigint), \
+                patch.object(sys, "argv", ["pickup.py"]):
+            pickup.main()
+        for arm in arms:
+            self.assertNotIn(True, arm.torque)
+            self.assertEqual(len(arm.commands), 1)
+            self.assertTrue(arm.closed)
+
+    def test_initialization_cancellation_does_not_run_later_stages(self):
+        arm = FakeArm("left")
+        arm.cmd[pickup.J0] = 1.0
+        start = arm.cmd.copy()
+        sleep = self.clock.sleep
+
+        def interrupt_initialization(seconds):
+            sleep(seconds)
+            if self.clock.now >= 0.02:
+                pickup._sigint()
+
+        with patch.object(self.clock, "sleep", side_effect=interrupt_initialization):
+            self.assertFalse(pickup.initialize_pose([arm], [arm.initial_pose()], pickup.J0_SPEED))
+        held = [j for j in range(arm.dof) if j != pickup.ELBOW]
+        for pos in arm.commands:
+            np.testing.assert_array_equal(pos[held], start[held])
 
     def test_stop_prevents_inward_commands(self):
         arm = FakeArm("left")
