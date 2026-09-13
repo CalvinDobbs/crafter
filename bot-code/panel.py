@@ -16,7 +16,7 @@ from agent_types import AgentConfig, cell_valid
 from contracts import Block, Structure
 from mock_agent_world import MockAgentWorld
 
-PANEL_DIR = Path(__file__).parent
+PANEL_DIR = Path(__file__).parent / "web"
 PANEL_CONFIG = AgentConfig(max_blocks=64, max_actions=384, max_steps=512, max_no_progress=12)
 MAX_MESSAGE = 512 * 1024
 EXAMPLE = {"origin": [0, 1, -1], "size": [1, 2, 3], "count": 4,
@@ -439,6 +439,10 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
     @app.get("/panel.css")
     def stylesheet():
         return FileResponse(PANEL_DIR / "panel.css", media_type="text/css")
+
+    @app.get("/assets/Crafter-transparent.svg")
+    def logo():
+        return FileResponse(PANEL_DIR / "assets" / "Crafter-transparent.svg", media_type="image/svg+xml")
 
     @app.get("/api/state")
     def state():

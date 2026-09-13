@@ -97,6 +97,15 @@ bot-code/
   agent_adapters.py          live factory seam and ordinary-function bridge
   mock_agent_world.py        temporary action/perception contract simulator
   main.py                    default agent CLI; explicit legacy oneshot mode
+  web/                       browser-only panel files
+    panel.html               markup and controls
+    panel.css                responsive viewport layout
+    panel.js                 previews, polling and interactions
+    assets/
+      Crafter-transparent.svg  header logo
+  actions/                   independently owned hardware action scripts
+  tests/                     offline component and UI regression tests
+  voice/                     speech packs, playback and voice documentation
   fixtures/                  structure_house.json, world_state.json,
                              scan_sample.json (boxes+anchor+stacked+heights)
 ```

@@ -7,6 +7,7 @@
 html{height:100%}
 body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 .topbar{flex:none;height:clamp(48px,8dvh,70px);padding-inline:clamp(16px,3vw,40px)}
+.brand{min-width:0;height:100%;padding-block:4px}.brand-logo{display:block;width:auto;height:clamp(36px,6.5dvh,56px);max-width:36vw;max-height:100%;object-fit:contain}
 .shell{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;margin:0 auto;padding:clamp(10px,2dvh,22px) clamp(16px,3vw,40px) 0;overflow:hidden}
 .workflow{flex:none}
 [data-screen]{flex:1;min-height:0;display:flex;flex-direction:column}

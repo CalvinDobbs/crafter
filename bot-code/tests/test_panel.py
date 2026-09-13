@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from panel import PanelSession, StructureReceiver, parse_design
+from panel import PANEL_DIR, PanelSession, StructureReceiver, parse_design
 
 
 def payload():
@@ -302,6 +302,17 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PanelAssetsTests(unittest.TestCase):
+    def test_brand_uses_packaged_svg(self):
+        self.assertEqual(PANEL_DIR.name, "web")
+        html = (PANEL_DIR / "panel.html").read_text()
+        self.assertRegex(html, r'<img\b[^>]*class="brand-logo"[^>]*src="/assets/Crafter-transparent\.svg"[^>]*alt="Crafter"')
+        self.assertTrue((PANEL_DIR / "assets" / "Crafter-transparent.svg").is_file())
+        self.assertNotIn('class="brand-mark"', html)
+        self.assertNotIn('class="brand-sub"', html)
+        for asset in ("panel.html", "panel.css", "panel.js", "Crafter-transparent.svg"):
+            with self.subTest(asset=asset):
+                self.assertFalse((PANEL_DIR.parent / asset).exists())
+
     def test_script_dom_references_exist(self):
         class Elements(HTMLParser):
             def __init__(self):
@@ -311,7 +322,7 @@ class PanelAssetsTests(unittest.TestCase):
                 values = dict(attrs)
                 if "id" in values:
                     self.ids.append(values["id"])
-        root = Path(__file__).resolve().parents[1]
+        root = PANEL_DIR
         parser = Elements()
         parser.feed((root / "panel.html").read_text())
         self.assertEqual(len(parser.ids), len(set(parser.ids)))
@@ -322,13 +333,13 @@ class PanelAssetsTests(unittest.TestCase):
         self.assertNotIn("https://", script)
 
     def test_clear_button_is_on_main_screen(self):
-        html = (Path(__file__).resolve().parents[1] / "panel.html").read_text()
+        html = (PANEL_DIR / "panel.html").read_text()
         main = html.split('<section id="main-screen"', 1)[1].split("</section>", 1)[0]
         self.assertRegex(main, r'<button\b[^>]*\bid="clear-blueprint"[^>]*\bdisabled')
         self.assertIn("Clear blueprint", main)
 
     def test_main_screen_omits_design_and_runtime_cards(self):
-        html = (Path(__file__).resolve().parents[1] / "panel.html").read_text()
+        html = (PANEL_DIR / "panel.html").read_text()
         main = html.split('<section id="main-screen"', 1)[1].split("</section>", 1)[0]
         self.assertNotIn("<h2>Latest design</h2>", main)
         self.assertNotIn("<h2>The demo setup</h2>", main)
@@ -343,7 +354,7 @@ class PanelAssetsTests(unittest.TestCase):
         class Assets(SimpleHTTPRequestHandler):
             def log_message(self, *_):
                 pass
-        root = Path(__file__).resolve().parents[1]
+        root = PANEL_DIR
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Assets, directory=str(root)))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -399,6 +410,10 @@ class PanelAssetsTests(unittest.TestCase):
                             const problems=[],root=document.documentElement;
                             if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
                             const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#load-example','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
+                            controls.push('.brand-logo','.header-status');
+                            const logo=document.querySelector('.brand-logo'),brand=logo.getBoundingClientRect(),status=document.querySelector('.header-status').getBoundingClientRect();
+                            if(!logo.complete||!logo.naturalWidth)problems.push('brand logo did not load');
+                            if(brand.right+8>status.left)problems.push('brand logo overlaps header status');
                             if(${JSON.stringify(mode)}==='configuration')controls.push('#api-key','#save-api-key');
                             if(${JSON.stringify(screen)}==='main'){
                                 const layout=document.querySelector('.design-layout').getBoundingClientRect(),preview=document.querySelector('.design-layout>.scene-card').getBoundingClientRect();
@@ -444,13 +459,13 @@ class PanelAssetsTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_javascript_syntax(self):
         import quickjs
-        source = (Path(__file__).resolve().parents[1] / "panel.js").read_text()
+        source = (PANEL_DIR / "panel.js").read_text()
         quickjs.Context().eval("new Function("+json.dumps(source)+")")
 
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_3d_preview_draws_visible_top_and_rotates(self):
         import quickjs
-        source = (Path(__file__).resolve().parents[1] / "panel.js").read_text().split("let state = null")[0]
+        source = (PANEL_DIR / "panel.js").read_text().split("let state = null")[0]
         context = quickjs.Context()
         context.eval("""
             const window = {devicePixelRatio: 1};
@@ -535,10 +550,14 @@ class PanelHTTPTests(unittest.TestCase):
         from panel import create_app
         session = PanelSession(FirstChoice, tool_delay=0)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
-            for path in ("/", "/panel.js", "/panel.css"):
+            for path, media_type in (("/", "text/html"), ("/panel.js", "text/javascript"),
+                                     ("/panel.css", "text/css"), ("/assets/Crafter-transparent.svg", "image/svg+xml")):
                 response = client.get(path)
                 self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.headers["Content-Type"].startswith(media_type))
                 self.assertIn("Content-Security-Policy", response.headers)
+            self.assertEqual(response.content, (PANEL_DIR / "assets" / "Crafter-transparent.svg").read_bytes())
+            self.assertEqual(client.get("/assets/main.py").status_code, 404)
             state = client.get("/api/state").json()
             self.assertIsNone(state["design"])
             self.assertEqual(client.post("/api/example").status_code, 403)
