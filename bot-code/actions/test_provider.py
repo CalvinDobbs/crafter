@@ -373,6 +373,38 @@ class DriveTests(unittest.TestCase):
             self.assertEqual(arm.torque, [], "a carry must not disturb the squeeze holding the box")
 
 
+class OwnershipTests(unittest.TestCase):
+    """The rig must refuse to become the motion owner while somebody else already is."""
+
+    def test_no_owners_means_free(self):
+        with patch.object(armctl, "topic_owners", lambda *a, **k: {}):
+            armctl.Rig.require_free()          # must not raise
+
+    def test_a_live_owner_is_refused_by_name(self):
+        owners = {"arm_left.ctrl": [(11770, "python3 pickup.py")]}
+        with patch.object(armctl, "topic_owners", lambda *a, **k: owners):
+            with self.assertRaises(armctl.HardwareBusy) as caught:
+                armctl.Rig.require_free()
+        message = str(caught.exception)
+        self.assertIn("11770", message)
+        self.assertIn("pickup.py", message)
+        self.assertIn("arm_left.ctrl", message)
+        # the message must steer away from the dangerous fix, not just report the clash
+        self.assertIn("Do NOT kill the owner", message)
+
+    def test_the_check_precedes_opening_any_writer(self):
+        owners = {"drive.ctrl": [(42, "teleop.py")]}
+        opened = []
+        with patch.object(armctl, "topic_owners", lambda *a, **k: owners),              patch.object(armctl, "Arm", lambda side: opened.append(side)):
+            with self.assertRaises(armctl.HardwareBusy):
+                armctl.Rig()
+        self.assertEqual(opened, [], "a busy robot must be detected before any writer is claimed")
+
+    def test_topic_owners_is_read_only_and_portable(self):
+        # returns {} rather than exploding where /proc does not exist
+        self.assertIsInstance(armctl.topic_owners(("drive.ctrl",)), dict)
+
+
 class ExecutorTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()

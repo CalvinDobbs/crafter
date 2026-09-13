@@ -27,6 +27,7 @@ Cancellation is a threading.Event passed in by the caller, never a module global
 """
 import json
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -67,8 +68,49 @@ STUCK_EPS = 0.01        # m of range change that counts as progress
 DRIVE_TIMEOUT_S = 120.0
 
 
+NUL = bytes([0])          # /proc/<pid>/cmdline separates arguments with it
+CONTROL_TOPICS = ("drive.ctrl", "arm_left.ctrl", "arm_right.ctrl",
+                  "arm_left.torque", "arm_right.torque")
+
+
 class Cancelled(Exception):
     """Raised inside a motion routine when its cancel event is set."""
+
+
+class HardwareBusy(RuntimeError):
+    """Another live process already owns a control topic.
+
+    Carries who, so the answer is to go and talk to them. Never kill the owner: its teardown
+    drops whatever its arms are holding, and a daemon restart is worse.
+    """
+
+
+def topic_owners(topics=CONTROL_TOPICS):
+    """Which live processes have each control topic mapped. Read-only; opens nothing.
+
+    Walks /proc for the mapping rather than asking bbos, because bbos only reports a conflict
+    once you have already tried to take the topic -- by which point a long startup has been paid
+    for, and the answer arrives as an opaque pid. Returns {} off Linux so tests can run anywhere.
+    """
+    owners = {}
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return owners
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            maps = (entry / "maps").read_text()
+        except OSError:
+            continue            # the process exited, or is not ours to inspect
+        for topic in topics:
+            if f"/dev/shm/{topic}" in maps:
+                try:
+                    cmd = (entry / "cmdline").read_bytes().replace(NUL, b" ").decode().strip()
+                except OSError:
+                    cmd = "?"
+                owners.setdefault(topic, []).append((int(entry.name), cmd or "?"))
+    return owners
 
 
 def smoothstep(s):
@@ -184,6 +226,7 @@ class Rig:
 
     def __init__(self, sides=("left", "right"), log=print):
         self.log = log
+        self.require_free(sides)
         self.arms = [Arm(s) for s in sides]
         self.by_side = {a.side: a for a in self.arms}
         self.w_drive = Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)
@@ -192,6 +235,27 @@ class Rig:
         self._twist_lock = threading.Lock()
         self._running = threading.Event()
         self._threads = []
+
+    @staticmethod
+    def require_free(sides=("left", "right")):
+        """Refuse to become the motion owner while somebody else already is.
+
+        Checked before a single writer is opened, so a conflict costs a second rather than a
+        detector warmup, and says who holds what instead of naming a bare pid.
+        """
+        wanted = ["drive.ctrl"] + [f"arm_{s}.{k}" for s in sides for k in ("ctrl", "torque")]
+        held = topic_owners(tuple(wanted))
+        if not held:
+            return
+        lines = [f"  {topic}: pid {pid} ({cmd})"
+                 for topic, entries in sorted(held.items()) for pid, cmd in entries]
+        advice = (
+            "Only one process may own these at a time. Coordinate with whoever is running it "
+            "and wait for them to finish. Do NOT kill the owner or restart a bbos daemon: its "
+            "teardown drops whatever its arms are holding.")
+        raise HardwareBusy("another process already owns the robot's control topics:"
+                           + "".join(chr(10) + line for line in lines)
+                           + chr(10) * 2 + advice)
 
     # -- lifecycle ---------------------------------------------------------
 
