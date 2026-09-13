@@ -367,13 +367,39 @@ class DriveTests(unittest.TestCase):
             armctl.drive_to_standoff(self.rig, lambda: (2.0, 0.0, 0.0), 0.45, log=lambda *a: None)
         self.assertEqual(self.rig.twists[-1], (0.0, 0.0))
 
-    def test_a_target_that_cannot_be_resolved_ends_the_drive_and_stops(self):
+    def test_a_target_lost_at_range_ends_the_drive_and_stops(self):
         def gone():
             raise RuntimeError("box is not in the current snapshot")
         with self.assertRaises(RuntimeError):
             armctl.drive_to_standoff(self.rig, gone, 0.45, log=lambda *a: None)
         self.assertEqual(self.rig.twists[-1], (0.0, 0.0),
                          "losing the target must stop the base, not continue blind")
+
+    def test_a_target_lost_on_arrival_counts_as_arriving(self):
+        # a floor-level box drops out of a forward-looking camera once the robot is on top of it
+        state = {"n": 0}
+
+        def target_fn():
+            state["n"] += 1
+            if state["n"] > 3:
+                raise RuntimeError("box is not in the current snapshot")
+            return (0.34, 0.0, 0.0)          # inside standoff + ARRIVED_MARGIN
+
+        got = armctl.drive_to_standoff(self.rig, target_fn, 0.30, log=lambda *a: None)
+        self.assertAlmostEqual(got, 0.34, places=6)
+        self.assertEqual(self.rig.twists[-1], (0.0, 0.0))
+
+    def test_losing_it_just_outside_the_margin_is_still_a_failure(self):
+        state = {"n": 0}
+
+        def target_fn():
+            state["n"] += 1
+            if state["n"] > 3:
+                raise RuntimeError("gone")
+            return (0.30 + armctl.ARRIVED_MARGIN + 0.05, 0.0, 0.0)
+
+        with self.assertRaises(RuntimeError):
+            armctl.drive_to_standoff(self.rig, target_fn, 0.30, log=lambda *a: None)
 
     def test_move_to_build_is_slower_than_an_empty_approach(self):
         self.assertLess(provider.CARRY_SPEED, armctl.DRIVE_SPEED)
