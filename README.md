@@ -1,4 +1,4 @@
-# Crafter
+# [Crafter]
 
 **You build it in Minecraft. Crafter builds it in real life.**
 
