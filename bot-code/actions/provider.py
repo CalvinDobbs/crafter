@@ -351,10 +351,12 @@ def _wrap(executor, routine, resolve):
     """
     def call(request):
         executor.begin()
+        # Logging must never be the thing that breaks an error path.
+        what = getattr(getattr(request, "step", None), "operation", "action")
         try:
             args = resolve(request)
         except Exception as exc:
-            executor.log(f"[provider] {request.step.operation} rejected before moving: {exc}")
+            executor.log(f"[provider] {what} rejected before moving: {exc}")
             executor.end("rejected")
             return FunctionResult(False, "rejected", type(exc).__name__, effects_started="no")
         try:
@@ -372,8 +374,7 @@ def _wrap(executor, routine, resolve):
             # Anything else is an unknown outcome and stays one -- the robot moved and nobody can
             # say how far it got. But only the exception's class name survives upstream, and the
             # causes behind one class can need completely different fixes, so say it here.
-            executor.log(f"[provider] {request.step.operation} failed mid-motion: "
-                         f"{type(exc).__name__}: {exc}")
+            executor.log(f"[provider] {what} failed mid-motion: {type(exc).__name__}: {exc}")
             executor.end("unknown")
             raise
         executor.end(phase)
