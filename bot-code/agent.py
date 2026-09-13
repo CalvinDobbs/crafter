@@ -7,9 +7,10 @@ import uuid
 from dataclasses import asdict, replace
 
 from agent_backend import validate_step
-from agent_types import (MOTION_OPS, ActionRequest, AgentConfig, BuildRequirements,
-                         BuildState, Holding, JobSpec, RunResult, Step,
-                         cell_valid, vector_valid)
+from agent_types import (INTERFACE_VERSION, MAX_SCENE_IMAGES, MOTION_OPS, ActionReceipt,
+                         ActionRequest, AgentConfig, BuildRequirements, BuildState, Holding,
+                         JobSpec, MotionObservation, ObservationSnapshot, RunResult, SceneImage,
+                         Step, cell_valid, vector_valid)
 
 
 class BusyError(RuntimeError):
@@ -77,12 +78,17 @@ class JobManager:
 def preflight(actions, observations, requirements):
     a, p = actions.capabilities(), observations.capabilities()
     missing = sorted(MOTION_OPS - a.operations)
-    missing += [name for name in ("status", "cancellation", "carrying") if not getattr(a, name)]
-    missing += [name for name in ("inventory", "sites", "occupancy") if not getattr(p, name)]
+    missing += [name for name in ("status", "cancellation", "carrying", "idempotency", "emergency_stop")
+                if not getattr(a, name, False)]
+    missing += [name for name in ("inventory", "sites", "occupancy", "monitoring", "images")
+                if not getattr(p, name, False)]
     if not (a.possession or p.possession):
         missing.append("possession evidence")
-    if a.api_version != 1:
-        missing.append("action protocol v1")
+    if a.api_version != INTERFACE_VERSION or getattr(p, "api_version", None) != INTERFACE_VERSION:
+        missing.append(f"action/perception protocol v{INTERFACE_VERSION}")
+    for provider, methods in ((actions, ("submit", "lookup", "status", "state", "cancel", "stop")),
+                              (observations, ("observe", "monitor", "find_build_sites", "check_build_site"))):
+        missing += [name + " method" for name in methods if not callable(getattr(provider, name, None))]
     if missing:
         raise CapabilityError("missing capabilities: " + ", ".join(missing))
     if (not vector_valid(a.max_box_size) or not math.isfinite(a.max_height)
@@ -140,26 +146,44 @@ class Agent:
             return Holding(ts=self.clock(), source="reconciliation")
         return max(known, key=lambda h: h.ts)
 
+    def _snapshot_valid(self, snapshot):
+        return (isinstance(snapshot, ObservationSnapshot) and snapshot.valid and snapshot.pose_valid
+                and isinstance(snapshot.revision, str) and 0 < len(snapshot.revision) <= 128
+                and isinstance(snapshot.frame_id, str) and 0 < len(snapshot.frame_id) <= 128
+                and type(snapshot.epoch) is int and snapshot.epoch >= 0
+                and self._fresh(snapshot.captured_at) and self._fresh(snapshot.received_at)
+                and snapshot.captured_at <= snapshot.received_at+.05
+                and vector_valid(snapshot.base_position)
+                and type(snapshot.base_yaw) in (int, float) and math.isfinite(snapshot.base_yaw)
+                and 0 < len(snapshot.images) <= MAX_SCENE_IMAGES
+                and all(isinstance(image, SceneImage) and self._fresh(image.captured_at)
+                        and (image.epoch, image.frame_id) == (snapshot.epoch, snapshot.frame_id)
+                        for image in snapshot.images))
+
     def _refresh(self, after=0.0):
         s = self.state
-        for attempt in range(self.config.observation_attempts):
+        deadline = self.monotonic()+self.config.observation_timeout
+        attempt = 0
+        while True:
             try:
                 snapshot = self.observations.observe(s.site.id if s.site else None)
                 executor = self.actions.state()
-                valid = (snapshot.valid and snapshot.pose_valid and snapshot.revision
-                         and snapshot.frame_id and type(snapshot.epoch) is int
-                         and self._fresh(snapshot.captured_at) and self._fresh(snapshot.received_at)
-                         and snapshot.captured_at >= after and executor.ts >= after
-                         and self._fresh(executor.ts))
+                valid = (self._snapshot_valid(snapshot) and snapshot.captured_at > after
+                         and executor.ts >= after and self._fresh(executor.ts))
+                if valid and after:
+                    valid = self._holding(executor.holding, snapshot.holding, not_before=after).status != "unknown"
+                    if s.active_request and s.active_request.step.operation == "place":
+                        target = next((item for item in snapshot.occupancy if item.cell == s.target_cell), None)
+                        valid = valid and target is not None and target.ts > after
             except Exception as exc:
                 valid = False
                 self._event("observation_error", error=type(exc).__name__)
             if valid:
                 break
-            if attempt+1 < self.config.observation_attempts:
-                self.sleep(self.config.poll_s)
-        else:
-            raise EvidenceError("fresh observations and executor state unavailable")
+            attempt += 1
+            if self.monotonic() >= deadline or (not after and attempt >= self.config.observation_attempts):
+                raise EvidenceError("fresh observations, images and executor state unavailable")
+            self.sleep(min(self.config.poll_s, max(0.0, deadline-self.monotonic())))
         previous = s.snapshot
         if previous and (previous.epoch, previous.frame_id) != (snapshot.epoch, snapshot.frame_id):
             if s.confirmed or s.target_box is not None or s.active_request:
@@ -265,9 +289,10 @@ class Agent:
                 s.phase = "SELECT_SITE"
                 sites = self.observations.find_build_sites(s.job.requirements)
                 ids = [site.id for site in sites]
+                s.candidate_sites = tuple(site for site in sorted(sites, key=lambda site: (site.cost, site.id))
+                                          if ids.count(site.id) == 1 and self._site_valid(site))[:32]
                 primary = tuple(Step("select_site", "Use a validated feasible footprint", site_id=site.id)
-                                for site in sorted(sites, key=lambda site: (site.cost, site.id))
-                                if ids.count(site.id) == 1 and self._site_valid(site))
+                                for site in s.candidate_sites)
                 if not primary:
                     primary = self._search("sites")
             return primary[:32] + extra
@@ -321,7 +346,17 @@ class Agent:
                 "inventory": [asdict(b) for b in s.inventory.values()],
                 "confirmed": [{"cell": c, "box_id": mid} for c, mid in sorted(s.confirmed.items())],
                 "site": asdict(s.site) if s.site else None,
+                "candidate_sites": [asdict(site) for site in s.candidate_sites
+                                    if self._site_valid(site)],
+                "enabled_operations": sorted(self.capabilities.operations),
                 "observation_revision": s.snapshot.revision,
+                "observation_time": s.snapshot.captured_at,
+                "frame_id": s.snapshot.frame_id, "epoch": s.snapshot.epoch,
+                "base_position": s.snapshot.base_position, "base_yaw": s.snapshot.base_yaw,
+                "images": [asdict(image) for image in s.snapshot.images],
+                "occupancy": [asdict(item) for item in s.snapshot.occupancy
+                              if item.cell in s.job.requirements.cells or item.status != "empty"],
+                "warnings": list(s.snapshot.warnings),
                 "last_outcome": asdict(s.last_outcome) if s.last_outcome else None,
                 "history": list(s.history), "allowed_choices": [asdict(c) for c in choices]}
 
@@ -348,34 +383,59 @@ class Agent:
 
     def _cancel_active(self):
         s = self.state
-        if s.receipt is None:
-            return
+        if (not isinstance(s.receipt, ActionReceipt) or s.receipt.request_id != s.active_request.request_id
+                or not s.receipt.action_id):
+            s.receipt = None
+            try:
+                receipt = self.actions.lookup(s.active_request.request_id)
+                if (isinstance(receipt, ActionReceipt) and receipt.request_id == s.active_request.request_id
+                        and receipt.action_id):
+                    s.receipt = receipt
+            except Exception as exc:
+                self._event("lookup_error", error=type(exc).__name__)
         try:
-            reply = self.actions.cancel(s.receipt.action_id)
+            reply = self.actions.cancel(s.receipt.action_id) if s.receipt else self.actions.stop()
             self._event("cancel_requested", acknowledged=reply.acknowledged, stopped=reply.stopped)
+            if reply.acknowledged is not True:
+                reply = self.actions.stop()
+                self._event("stop_requested", acknowledged=reply.acknowledged, stopped=reply.stopped)
         except Exception as exc:
             self._event("cancel_error", error=type(exc).__name__)
+            try:
+                reply = self.actions.stop()
+                self._event("stop_requested", acknowledged=reply.acknowledged, stopped=reply.stopped)
+            except Exception as stop_error:
+                self._event("stop_error", error=type(stop_error).__name__)
 
-    def _resolve_cancellation(self):
+    def _resolve_cancellation(self, release=True):
         s = self.state
         self._cancel_active()
         deadline = self.monotonic()+self.capabilities.action_timeout
         while self.monotonic() < deadline:
             try:
-                outcome = self.actions.status(s.receipt.action_id)
                 executor = self.actions.state()
-                snapshot = self.observations.observe(s.site.id if s.site else None)
-                holding = self._holding(executor.holding, snapshot.holding, outcome.holding,
+                if s.receipt is None:
+                    s.executor = executor
+                    s.holding = self._holding(executor.holding, not_before=s.active_request.submitted_at)
+                    return False
+                outcome = self.actions.status(s.receipt.action_id)
+                try:
+                    snapshot = self.observations.observe(s.site.id if s.site else None)
+                    observed_holding = snapshot.holding if snapshot.valid and self._fresh(snapshot.captured_at) else None
+                except Exception:
+                    observed_holding = None
+                holding = self._holding(executor.holding, observed_holding, outcome.holding,
                                         not_before=s.active_request.submitted_at)
                 stopped = (outcome.action_id == s.receipt.action_id
                            and outcome.request_id == s.active_request.request_id
                            and outcome.status in {"cancelled", "failed", "succeeded"}
                            and outcome.motion == executor.motion == "stopped"
                            and executor.active_action is None and self._fresh(executor.ts)
-                           and self._fresh(outcome.ts) and outcome.ts >= s.active_request.submitted_at)
+                           and self._fresh(outcome.observed_at)
+                           and s.active_request.submitted_at <= outcome.ts <= outcome.observed_at+.05)
                 if stopped:
                     s.last_outcome, s.executor, s.holding = outcome, executor, holding
-                    if holding.status == "empty":
+                    if holding.status == "empty" and release:
                         s.active_request, s.receipt = None, None
                         return True
                     return False
@@ -383,6 +443,36 @@ class Agent:
                 self._event("cancel_reconciliation_error", error=type(exc).__name__)
             self.sleep(self.config.poll_s)
         return False
+
+    def _monitor_action(self, outcome):
+        s = self.state
+        report = self.observations.monitor(s.active_request, outcome)
+        if (not isinstance(report, MotionObservation) or report.request_id != s.active_request.request_id
+                or report.action_id != s.receipt.action_id or report.phase != outcome.phase
+                or not self._snapshot_valid(report.snapshot)
+                or (report.snapshot.epoch, report.snapshot.frame_id)
+                != (s.active_request.epoch, s.active_request.frame_id)):
+            raise EvidenceError("action monitoring identity, images or localization is stale/invalid")
+        previous = s.last_monitor
+        s.last_monitor = report
+        if previous is None or (previous.action_id, previous.phase, previous.safe) != (report.action_id, report.phase, report.safe):
+            self._event("action_observed", operation=s.active_request.step.operation, phase=report.phase,
+                        observation_revision=report.snapshot.revision, safe=report.safe)
+        if report.safe is not True:
+            raise EvidenceError("action monitor requires a stop: " + str(report.reason)[:256])
+        executor = self.actions.state()
+        if not self._fresh(executor.ts) or executor.active_action not in {None, s.receipt.action_id}:
+            raise EvidenceError("executor state is stale or another action is active during monitoring")
+        holding = self._holding(executor.holding, report.snapshot.holding)
+        op = s.active_request.step.operation
+        if holding.status == "unknown":
+            raise EvidenceError("possession became unknown during motion")
+        if op in {"approach_box", "look_around"} and holding.status != "empty":
+            raise EvidenceError("unexpected possession during empty-gripper motion")
+        if op == "move_to_build" and (holding.status != "holding" or holding.box_id != s.target_box):
+            raise EvidenceError("carried load was lost or changed during motion")
+        if holding.status == "holding" and holding.box_id != s.target_box:
+            raise EvidenceError("unexpected held identity during motion")
 
     def _poll(self):
         s = self.state
@@ -395,14 +485,14 @@ class Agent:
             try:
                 result = self.actions.status(s.receipt.action_id)
             except Exception as exc:
-                self._event("status_error", error=type(exc).__name__)
-                self.sleep(self.config.poll_s)
-                continue
+                raise EvidenceError(f"action status unavailable ({type(exc).__name__})") from exc
             if (result.request_id != s.active_request.request_id or result.action_id != s.receipt.action_id
-                    or not self._fresh(result.ts) or result.ts < s.active_request.submitted_at):
+                    or not self._fresh(result.observed_at)
+                    or not s.active_request.submitted_at <= result.ts <= result.observed_at+.05):
                 raise EvidenceError("action result identity or timestamp is invalid")
             if result.status != "running":
                 return result
+            self._monitor_action(result)
             self.sleep(self.config.poll_s)
         if self._resolve_cancellation():
             raise JobCancelled("action deadline exceeded; cancelled with verified stop and empty grippers")
@@ -419,8 +509,16 @@ class Agent:
             raise EvidenceError("action budget exhausted")
         if step.operation == "approach_box":
             s.target_box, s.target_cell = step.box_id, step.cell
+        box = s.inventory.get(step.box_id) if step.box_id is not None else None
+        evidence_times = [s.snapshot.captured_at, s.executor.ts]
+        if s.site:
+            evidence_times.append(s.site.ts)
+        if box and step.operation in {"approach_box", "pickup"}:
+            evidence_times.append(box.last_seen)
         request = ActionRequest(uuid.uuid4().hex, s.job.job_id, step, s.snapshot.revision,
-                                s.snapshot.epoch, s.snapshot.frame_id, self.clock())
+                                s.snapshot.epoch, s.snapshot.frame_id, self.clock(),
+                                requirements=s.job.requirements, site=s.site, box=box,
+                                expires_at=min(evidence_times)+self.config.fresh_s)
         s.active_request = request
         s.actions += 1
         self._event("action_submitted", operation=step.operation, request_id=request.request_id)
@@ -450,7 +548,7 @@ class Agent:
             occupied = self._occupancy().get(s.target_cell)
             if (outcome.phase not in {"released", "retreated", "completed"}
                     or occupied is None or occupied.status != "occupied" or occupied.box_id != s.target_box
-                    or occupied.ts < request.submitted_at):
+                    or occupied.ts <= outcome.ts):
                 raise EvidenceError("released box placement is not verified")
             s.confirmed[s.target_cell] = s.target_box
             self._event("placement_confirmed", box_id=s.target_box, cell=s.target_cell)
@@ -489,6 +587,8 @@ class Agent:
 
     def _finish(self, requested, reason):
         s = self.state
+        if s.active_request is not None:
+            self._resolve_cancellation(release=False)
         try:
             executor = self.actions.state()
             safe = (self._fresh(executor.ts) and executor.motion == "stopped"
@@ -557,6 +657,8 @@ class Agent:
                 return self._finish("FAILED", "decision budget exhausted")
             except JobCancelled as exc:
                 return self._finish("CANCELLED", str(exc))
+            except KeyboardInterrupt:
+                return self._finish("CANCELLED", "operator interrupted the agent")
             except (CapabilityError, EvidenceError) as exc:
                 self._event("blocked", reason=str(exc))
                 return self._finish("FAILED", str(exc))

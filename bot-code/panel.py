@@ -131,18 +131,28 @@ class PanelWorld(MockAgentWorld):
     def __init__(self, count, cancel, emit, tool_delay):
         super().__init__(count)
         self.cancel_event, self.emit, self.tool_delay = cancel, emit, tool_delay
+        self.reported = set()
 
     def submit(self, request):
         if self.cancel_event.is_set():
             raise JobCancelled("simulation cancelled")
+        receipt = super().submit(request)
         self.emit("tool_start", operation=request.step.operation, request_id=request.request_id,
                   arguments=asdict(request.step), simulated=True)
-        if self.cancel_event.wait(self.tool_delay):
-            raise JobCancelled("simulation cancelled")
-        receipt = super().submit(request)
-        self.emit("tool_result", operation=request.step.operation, request_id=request.request_id,
-                  result="success", simulated=True)
         return receipt
+
+    def status(self, action_id):
+        outcome = super().status(action_id)
+        if outcome.status != "running" and action_id not in self.reported:
+            self.reported.add(action_id)
+            request = self._pending[action_id]["request"]
+            self.emit("tool_result", operation=request.step.operation, request_id=request.request_id,
+                      result="success" if outcome.status == "succeeded" else outcome.status, simulated=True)
+        return outcome
+
+    def sleep(self, seconds):
+        self.cancel_event.wait(seconds*self.tool_delay/self.action_duration)
+        super().sleep(seconds)
 
 
 class PanelReasoner:
@@ -314,7 +324,7 @@ class PanelSession:
                 blocks = copy.deepcopy(self.job["design"]["blocks"])
             world = PanelWorld(len(blocks), cancel, emit, self.tool_delay)
             reasoner = PanelReasoner(self.reasoner_factory(), cancel, emit)
-            agent = Agent(world, world, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
+            agent = Agent(world.actions, world.observations, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
                           clock=world.clock, sleep=world.sleep,
                           event_sink=lambda event: emit(event["event"], **{k: v for k, v in event.items() if k != "event"}))
             with self.lock:

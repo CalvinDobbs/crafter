@@ -1,3 +1,4 @@
+import json
 import sys
 import threading
 import unittest
@@ -19,7 +20,7 @@ def structure():
 class AgentTests(unittest.TestCase):
     def run_world(self, world=None, config=None, reasoner=None, backend="auto"):
         world = world or MockAgentWorld(3)
-        agent = Agent(world, world, config=config, reasoner=reasoner, backend=backend,
+        agent = Agent(world.actions, world.observations, config=config, reasoner=reasoner, backend=backend,
                       clock=world.clock, sleep=world.sleep)
         return agent, world, agent.run(structure())
 
@@ -166,7 +167,7 @@ class AgentTests(unittest.TestCase):
         world = MockAgentWorld(3)
         def broken(event):
             raise RuntimeError("logging failed")
-        agent = Agent(world, world, clock=world.clock, sleep=world.sleep, event_sink=broken)
+        agent = Agent(world.actions, world.observations, clock=world.clock, sleep=world.sleep, event_sink=broken)
         result = agent.run(structure())
         self.assertTrue(result.success, result)
         self.assertEqual(sum(r.step.operation == "pickup" for r in world.requests), 3)
@@ -177,7 +178,7 @@ class AgentTests(unittest.TestCase):
             def decide(self, context, choices):
                 agent.cancel()
                 return choices[0]
-        agent = Agent(world, world, reasoner=CancellingModel(), clock=world.clock, sleep=world.sleep)
+        agent = Agent(world.actions, world.observations, reasoner=CancellingModel(), clock=world.clock, sleep=world.sleep)
         result = agent.run(structure())
         self.assertEqual(result.status, "CANCELLED")
         self.assertFalse(world.requests)
@@ -242,7 +243,7 @@ class AgentTests(unittest.TestCase):
                 return choices[0]
         world = MockAgentWorld(4)
         source = Structure([Block(0, 0, 0), Block(1, 0, 0), Block(0, 0, 1), Block(0, 1, 0)])
-        result = Agent(world, world, reasoner=Scripted(), backend="llm",
+        result = Agent(world.actions, world.observations, reasoner=Scripted(), backend="llm",
                        clock=world.clock, sleep=world.sleep).run(source)
         self.assertTrue(result.success, result)
         self.assertEqual(result.placed, 4)
@@ -275,7 +276,7 @@ class AgentTests(unittest.TestCase):
         for block in source.blocks:
             block.kind = "imaginary-material"
         world = MockAgentWorld(3)
-        result = Agent(world, world, clock=world.clock, sleep=world.sleep).run(source)
+        result = Agent(world.actions, world.observations, clock=world.clock, sleep=world.sleep).run(source)
         self.assertTrue(result.success, result)
 
     def test_observe_only_reasoner_hits_budget(self):
@@ -286,6 +287,208 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertLessEqual(result.steps, 4)
         self.assertFalse(world.requests)
+
+    def test_invalid_running_status_still_requests_a_stop(self):
+        class InvalidStatus(MockAgentWorld):
+            def status(self, action_id):
+                return replace(super().status(action_id), request_id="wrong-request")
+        world = InvalidStatus(3, faults={"pickup": ["running_forever"]})
+        _, _, result = self.run_world(world)
+        self.assertEqual(result.status, "NEEDS_OPERATOR")
+        self.assertTrue(world.cancellations)
+        self.assertIsNone(world.active)
+
+    def test_cached_prerelease_occupancy_does_not_confirm_placement(self):
+        class CachedOccupancy(MockAgentWorld):
+            cached = None
+            def submit(self, request):
+                if request.step.operation == "place":
+                    self.cached = (request.step.cell, request.step.box_id, request.submitted_at + .001)
+                return super().submit(request)
+            def observe(self, site_id=None):
+                snapshot = super().observe(site_id)
+                if self.cached is None or site_id is None:
+                    return snapshot
+                cell, mid, ts = self.cached
+                return replace(snapshot, occupancy=tuple(
+                    replace(item, status="occupied", box_id=mid, ts=ts)
+                    if item.cell == cell else item for item in snapshot.occupancy))
+        world = CachedOccupancy(3, faults={"place": ["bad_placement"]})
+        _, _, result = self.run_world(world)
+        self.assertEqual(result.status, "NEEDS_OPERATOR")
+        self.assertEqual(result.placed, 0)
+        self.assertFalse(world.placed)
+
+    def test_every_running_action_is_monitored_without_model_calls(self):
+        world = MockAgentWorld(3)
+        contexts = []
+        class InspectingReasoner:
+            def decide(self, context, choices):
+                self_case.assertIsNone(world.active)
+                contexts.append(context)
+                return choices[0]
+        self_case = self
+        _, _, result = self.run_world(world, reasoner=InspectingReasoner())
+        self.assertTrue(result.success, result)
+        self.assertEqual({entry[0] for entry in world.monitor_calls}, {r.request_id for r in world.requests})
+        self.assertIn("lifting", {entry[2] for entry in world.monitor_calls})
+        self.assertIn("retreating", {entry[2] for entry in world.monitor_calls})
+        self.assertTrue(all(c["images"][0]["simulated"] for c in contexts))
+        self.assertTrue(all(c["images"][0]["data_url"].startswith("data:image/png;base64,") for c in contexts))
+        self.assertTrue(any(c["candidate_sites"] for c in contexts))
+        self.assertNotEqual(contexts[0]["base_position"], contexts[-1]["base_position"])
+        self.assertNotEqual(contexts[0]["images"][0]["data_url"], contexts[-1]["images"][0]["data_url"])
+        self.assertNotIn("data:image", json.dumps(result.events))
+
+    def test_monitor_faults_stop_in_flight_before_placement(self):
+        for fault in ("obstacle", "pose_loss", "stale_observation", "lost_load"):
+            with self.subTest(fault=fault):
+                world = MockAgentWorld(3, faults={"move_to_build": [fault]})
+                agent, _, result = self.run_world(world)
+                self.assertEqual(result.status, "NEEDS_OPERATOR", result)
+                self.assertIsNotNone(agent.manager.active)
+                self.assertTrue(world.cancellations)
+                self.assertIsNone(world.active)
+                self.assertNotIn("place", [r.step.operation for r in world.requests])
+                self.assertEqual(world.holding.status, "empty" if fault == "lost_load" else "holding")
+
+    def test_unknown_or_mismatched_monitor_report_requests_stop(self):
+        for changes in ({"safe": None}, {"phase": "unrelated-phase"}, {"action_id": "other-action"}):
+            class BadMonitor(MockAgentWorld):
+                def monitor(self, request, outcome):
+                    return replace(super().monitor(request, outcome), **changes)
+            with self.subTest(changes=changes):
+                _, world, result = self.run_world(BadMonitor(3))
+                self.assertEqual(result.status, "NEEDS_OPERATOR")
+                self.assertTrue(world.cancellations)
+                self.assertIsNone(world.active)
+                self.assertFalse(world.placed)
+
+    def test_missing_stale_or_wrong_frame_images_never_dispatch(self):
+        for mode in ("missing", "stale", "wrong-frame"):
+            class BadImages(MockAgentWorld):
+                def observe(self, site_id=None):
+                    snapshot = super().observe(site_id)
+                    images = () if mode == "missing" else tuple(replace(
+                        image, **({"captured_at": 0.0} if mode == "stale" else {"epoch": 999}))
+                        for image in snapshot.images)
+                    return replace(snapshot, images=images)
+            with self.subTest(mode=mode):
+                _, world, result = self.run_world(BadImages(3))
+                self.assertFalse(result.success)
+                self.assertFalse(world.requests)
+
+    def test_long_phases_allow_fresh_heartbeats_without_changing_event_time(self):
+        world = MockAgentWorld(3, action_duration=.08)
+        _, _, result = self.run_world(world, config=AgentConfig(fresh_s=.015, poll_s=.002))
+        self.assertTrue(result.success, result)
+        self.assertFalse(world.cancellations)
+
+    def test_post_action_refresh_waits_for_a_new_camera_frame(self):
+        class DelayedCamera(MockAgentWorld):
+            cached = None
+            delay = 0
+            delayed = 0
+            def __init__(self):
+                super().__init__(3)
+                self.completed = set()
+            def status(self, action_id):
+                outcome = super().status(action_id)
+                if outcome.status != "running" and action_id not in self.completed:
+                    self.completed.add(action_id)
+                    self.delay = 4
+                return outcome
+            def observe(self, site_id=None):
+                snapshot = super().observe(site_id)
+                if self.delay and self.cached is not None:
+                    self.delay -= 1
+                    self.delayed += 1
+                    return self.cached
+                self.cached = snapshot
+                return snapshot
+        world = DelayedCamera()
+        _, _, result = self.run_world(world)
+        self.assertTrue(result.success, result)
+        self.assertGreater(world.delayed, 0)
+
+    def test_post_action_refresh_waits_for_new_cell_evidence(self):
+        class DelayedCells(MockAgentWorld):
+            def __init__(self):
+                super().__init__(3)
+                self.completed = set()
+                self.delayed_cell = None
+                self.delay = 0
+                self.delayed = 0
+            def status(self, action_id):
+                outcome = super().status(action_id)
+                request = self._pending[action_id]["request"]
+                if outcome.status == "succeeded" and request.step.operation == "place" and action_id not in self.completed:
+                    self.completed.add(action_id)
+                    self.delayed_cell = (request.step.cell, outcome.ts-.001)
+                    self.delay = 3
+                return outcome
+            def observe(self, site_id=None):
+                snapshot = super().observe(site_id)
+                if self.delay:
+                    self.delay -= 1
+                    self.delayed += 1
+                    cell, ts = self.delayed_cell
+                    return replace(snapshot, occupancy=tuple(replace(item, ts=ts) if item.cell == cell else item
+                                                             for item in snapshot.occupancy))
+                return snapshot
+        world = DelayedCells()
+        _, _, result = self.run_world(world)
+        self.assertTrue(result.success, result)
+        self.assertGreater(world.delayed, 0)
+
+    def test_action_requests_include_job_and_verified_target_geometry(self):
+        _, world, result = self.run_world()
+        self.assertTrue(result.success, result)
+        for request in world.requests:
+            self.assertEqual(request.requirements.cells, ((0, 0, 0), (1, 0, 0), (0, 1, 0)))
+            self.assertGreater(request.expires_at, request.submitted_at)
+            if request.step.box_id is not None:
+                self.assertEqual(request.box.id, request.step.box_id)
+            if request.step.site_id is not None:
+                self.assertEqual(request.site.id, request.step.site_id)
+                self.assertEqual((request.site.epoch, request.site.frame_id), (request.epoch, request.frame_id))
+
+    def test_lost_acknowledgement_is_looked_up_and_cancelled_without_replay(self):
+        class LostReceipt(MockAgentWorld):
+            def __init__(self):
+                super().__init__(3, faults={"pickup": ["submit_timeout"]})
+                self.lookups = []
+            def lookup(self, request_id):
+                self.lookups.append(request_id)
+                return super().lookup(request_id)
+        world = LostReceipt()
+        _, _, result = self.run_world(world)
+        self.assertEqual(result.status, "NEEDS_OPERATOR")
+        self.assertEqual(world.lookups, [world.requests[-1].request_id])
+        self.assertTrue(world.cancellations)
+        self.assertIsNone(world.active)
+        self.assertEqual(sum(r.step.operation == "pickup" for r in world.requests), 1)
+
+    def test_missing_receipt_uses_global_load_preserving_stop(self):
+        class MissingReceipt(MockAgentWorld):
+            def lookup(self, request_id):
+                return None
+        world = MissingReceipt(3, faults={"move_to_build": ["submit_timeout"]})
+        _, _, result = self.run_world(world)
+        self.assertEqual(result.status, "NEEDS_OPERATOR")
+        self.assertEqual(world.stop_calls, 1)
+        self.assertIsNone(world.active)
+        self.assertEqual(world.holding.status, "holding")
+        self.assertNotIn("place", [r.step.operation for r in world.requests])
+
+    def test_interrupt_during_monitoring_stops_the_active_motion(self):
+        class Interrupted(MockAgentWorld):
+            def monitor(self, request, outcome):
+                raise KeyboardInterrupt()
+        _, world, result = self.run_world(Interrupted(3))
+        self.assertEqual(result.status, "NEEDS_OPERATOR")
+        self.assertTrue(world.cancellations)
+        self.assertIsNone(world.active)
 
 
 if __name__ == "__main__":

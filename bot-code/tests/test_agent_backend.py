@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent_backend import OpenAIReasoner, STEP_SCHEMA, load_api_key, parse_step, save_api_key_from_env
-from agent_types import Step
+from agent_types import MAX_IMAGE_BYTES, Step
+from mock_agent_world import MockAgentWorld
 
 
 class BackendTests(unittest.TestCase):
@@ -77,6 +78,60 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenAIReasoner(client=client).decide({"huge": "x"*100000}, (Step("done"),))
         client.chat.completions.create.assert_not_called()
+
+    def test_mock_scene_is_sent_as_image_content_not_base64_prompt_text(self):
+        image = asdict(MockAgentWorld(1).observe().images[0])
+        client = self.client(json.dumps(asdict(Step("observe"))))
+        backend = OpenAIReasoner(client=client)
+        backend.decide({"images": [image]}, (Step("observe"),))
+        content = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertEqual([part["type"] for part in content], ["text", "image_url"])
+        self.assertEqual(content[1]["image_url"]["url"], image["data_url"])
+        metadata = json.loads(content[0]["text"])["images"][0]
+        self.assertTrue(metadata["simulated"])
+        self.assertEqual(metadata["view"], "overview")
+        self.assertNotIn("data_url", metadata)
+        self.assertNotIn(image["data_url"], content[0]["text"])
+
+    def test_remote_invalid_or_excessive_images_never_reach_client(self):
+        image = asdict(MockAgentWorld(1).observe().images[0])
+        invalid = [[dict(image, data_url="https://example.invalid/frame.png")],
+                   [dict(image, data_url="file:///tmp/frame.png")],
+                   [dict(image, data_url="data:image/png;base64,not-base64")],
+                   [dict(image, data_url="data:image/png;base64," + "A"*(MAX_IMAGE_BYTES*2))],
+                   [image]*4]
+        for images in invalid:
+            with self.subTest(images=len(images)):
+                client = self.client(json.dumps(asdict(Step("observe"))))
+                with self.assertRaises(ValueError):
+                    OpenAIReasoner(client=client).decide({"images": images}, (Step("observe"),))
+                client.chat.completions.create.assert_not_called()
+
+    def test_images_do_not_authorize_an_ineligible_decision(self):
+        image = asdict(MockAgentWorld(1).observe().images[0])
+        client = self.client(json.dumps(asdict(Step("pickup", box_id=999))))
+        with self.assertRaisesRegex(ValueError, "eligible"):
+            OpenAIReasoner(client=client).decide({"images": [image]}, (Step("observe"),))
+
+    def test_fake_multimodal_client_completes_a_mock_build(self):
+        from agent import Agent
+        from contracts import Block, Structure
+        client = self.client("{}")
+        def respond(**kwargs):
+            content = kwargs["messages"][1]["content"]
+            self.assertTrue(any(part["type"] == "image_url" for part in content))
+            context = json.loads(content[0]["text"])
+            decision = context["allowed_choices"][0]
+            return SimpleNamespace(choices=[SimpleNamespace(
+                finish_reason="stop", message=SimpleNamespace(content=json.dumps(decision), refusal=None))])
+        client.chat.completions.create.side_effect = respond
+        world = MockAgentWorld(3)
+        result = Agent(world.actions, world.observations, reasoner=OpenAIReasoner(client=client),
+                       backend="llm", clock=world.clock, sleep=world.sleep).run(
+                           Structure([Block(0, 0, 0), Block(1, 0, 0), Block(0, 1, 0)]))
+        self.assertTrue(result.success, result)
+        self.assertEqual(result.placed, 3)
+        self.assertTrue(world.monitor_calls)
 
 
 class SavedKeyTests(unittest.TestCase):

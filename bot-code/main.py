@@ -195,7 +195,7 @@ def run_agent(args, structure):
         if args.mock:
             from mock_agent_world import MockAgentWorld
             world = MockAgentWorld(len(structure.blocks), voxel_size=config.voxel_size)
-            providers = AgentProviders(world, world)
+            providers = AgentProviders(world.actions, world.observations, world.close)
             kwargs = {"clock": world.clock, "sleep": world.sleep}
         else:
             providers = load_providers(args.provider)

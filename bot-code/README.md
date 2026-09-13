@@ -2,6 +2,8 @@
 
 Project-level sequencing, demo definition, and the voice-during-motion plan: **[../PLAN.md](../PLAN.md)**. This file is the robot-app architecture and runbook.
 
+For parallel component development, start with the **[agent component interface v2](#agent-component-interface-v2)** below. It is the current action/perception handoff; legacy body-server endpoints are not themselves a complete agent provider.
+
 ## The idea
 
 A player builds a structure in Minecraft; the Fabric mod
@@ -42,41 +44,42 @@ head stereo camera, 2 wrist cameras, mic/speaker, LED. All I/O is **bbos IPC**
 Each `scan()` produces a snapshot in the robot's **current** base frame:
 
 ```python
-Scan { boxes: [Detection],   # loose, pickable — outside the grid
-       stacked: [Detection], # inside grid footprint = already placed
-       anchor: [x,y,z]|None, # base-frame pos of the grid anchor marker
-       ts: float }
+Scan { boxes: [Detection],     # current loose candidates
+       protected: [Detection], # inside footprint, NOT proof of placement
+       build: BuildFrame|None, # measured origin and oriented column/row axes
+       pose: Pose, ts: float }
 ```
 
-- **Anchor marker** (ArUco id 99) is taped at cell (0,0)'s table spot and
-  re-detected every scan → the virtual grid is always resolved in the
-  *current* heading. This replaces SLAM: rotating stales old detections, but
-  every action re-scans first. Fallback when anchor unseen: fixed
-  `GRID_ORIGIN` (fine while the base stays parked).
-- **Grid gate:** any detection projecting inside the footprint is `stacked`,
-  never a pick candidate. "Don't grab the 3rd block off the stack" is a
-  spatial rule in code — the LLM never sees placed boxes as options.
+- **Anchor marker** is ArUco id **49**, in `DICT_4X4_50`. The measured
+  `BuildFrame` carries orientation; an xyz point is insufficient. Missing/stale
+  registration is unknown, never a fixed `GRID_ORIGIN` fallback. Planar odometry
+  is not SLAM, free-space certification or collision-free navigation.
+- **Grid gate:** detections inside the footprint are protected, not pick
+  candidates. `stacked` is a deprecated alias for protected, not an assertion
+  that a box has been successfully placed.
 - **Dual tracking:** `placed` (agent's authoritative set — what SHOULD be
   there) vs `column_heights()` (measured z per cell from the pointcloud —
   what IS there). Disagreement = fumble → feed back, re-plan.
 
 ## Architecture
 
+```text
+Minecraft --TCP:5005--> panel.StructureReceiver --+
+Fixtures / grid UI ------------------------------+--> Structure --> Agent
+                                                                    |
+                                           Reasoner <--- state + images + choices
+                                                                    |
+                                          +-------------------------+------------------+
+                                          |                                            |
+                                    ActionProvider                            ObservationProvider
+                              submit/status/cancel/stop                  observe/sites/images/monitor
+                                          |                                            |
+                          explicit live component adapters, OR temporary shared mock world
+                                   world.actions                              world.observations
 ```
- minecraft-mod ──TCP:5005──> structure_rx.py ──> structure.json ─┐
-   (grid UI / .json fixtures are fallbacks)                       v
- cameras+depth ──> perception.scan() ──> Scan ──> agent/planner ──> steps
-       (Readers only)                                │            │
-                                                     v            v
-                                   orchestrator (main.py)  <── feedback
-                                                     │ HTTP
-                                                     v
-                       ┌─────── mc_skills (body server, :8006) ────────┐
-                       │ owns ALL hardware Writers                     │
-                       │ /home /park /pick /place /goto /drive         │
-                       │ /gripper /rotate /say /celebrate              │
-                       └───────────────────────────────────────────────┘
-```
+
+The live action provider talks to the designated hardware owner; it does not
+create another writer. The mock providers have no hardware or network access.
 
 ## Files
 
@@ -86,11 +89,14 @@ bot-code/
   contracts.py               shared types (pure python, no bbos) — FROZEN
   skills_client.py           SkillsClient (HTTP) + MockSkills
   structure_src.py           .nbt import, structure.json, grid web UI :8005
-  structure_rx.py            STAGED: TCP :5005 receiver per WIRE_FORMAT.md
-  perception.py              Scan world model, gate, verify_* — DONE
-  planner.py                 one-shot plan_build() — deterministic + LLM
-  agent.py                   STAGED: per-step reasoning loop (see below)
-  main.py                    orchestrator (`run minecraft` equivalent)
+  panel.py                   control panel and EOF-framed TCP :5005 receiver
+  perception.py              independently owned sensing/world model
+  planner.py                 legacy one-shot plan_build()
+  agent.py                   verified per-step reasoning and monitoring
+  agent_types.py             pure-stdlib component interface v2
+  agent_adapters.py          live factory seam and ordinary-function bridge
+  mock_agent_world.py        temporary action/perception contract simulator
+  main.py                    default agent CLI; explicit legacy oneshot mode
   fixtures/                  structure_house.json, world_state.json,
                              scan_sample.json (boxes+anchor+stacked+heights)
 ```
@@ -115,43 +121,249 @@ MC axes +X east/+Z south/+Y up; coords relative to origin. MC `y` = our layer.
 Receiver: accept → **read to EOF** (half-close framing) → parse →
 `save_structure`. Backlog ≥8, sends can overlap. See `../WIRE_FORMAT.md`.
 
-## perception.py — DONE (Readers only, live-safe)
+## perception.py — Readers-only sensing, not a complete agent provider
 
-- `scan(mock=False) -> Scan` — ArUco `DICT_4X4_50` (marker id = box id, 99 =
-  anchor) → pixel mask → median `camera.points` → base-frame pos; grid gate
-  splits `boxes`/`stacked`.
-- `is_in_grid(pos, anchor)`, `cell_center(x,y,z,anchor)`, `resolve_anchor`,
-  `column_heights(cells, anchor)` — measured stack tops (90th-pct z disk).
-- `verify_pick(box)` — marker gone/moved from old spot.
-  `verify_place(cell, anchor, expected_top)` — measured z ≈ expected.
-- `scan_all(skills, mock, sweeps)` — compat wrapper used by main.py.
+- `scan(mock=False) -> Scan` uses ArUco `DICT_4X4_50` (49 = anchor), sparse
+  depth/image correspondence and pose-aligned world tracking. Loose, protected,
+  unknown and remembered observations are distinct.
+- `is_in_grid`, `cell_center`, `resolve_anchor` require an oriented `BuildFrame`;
+  `column_heights` measures stack tops from current depth.
+- `verify_pick` returns false or unknown; disappearance alone never proves a grasp.
+  `verify_place` checks geometric height consistency, not action success or identity.
+- `scan_all` is legacy compatibility and rejects physical sweeps. The action
+  provider owns movement; perception never commands a sweep.
 - **Debug viz:** `uv run perception.py --viz [--mock]` → :8007 top-down map
   (robot, grid, loose/stacked markers, anchor) + live head-cam feed.
-- Prep: print markers 0..N-1 + id 99 anchor. Fallbacks: color blobs →
-  hardcoded positions.
+- Prep: print box markers 0..N-1 and anchor 49. Hardcoded positions are mock
+  fixtures only, never a substitute for missing live evidence.
 - ⚠️ FIRST LIVE CHECK: confirm `camera.points` is pixel-aligned to the left
   half of head rgb (compare shapes) before trusting positions.
 
-## agent.py — STAGED (the reasoning loop)
+## Agent component interface v2
 
-The build memory lives in CODE, not the model's context:
+This section and the pure-stdlib types in **`agent_types.py`** are the handoff
+contract for independently developed actions, perception, and reasoning. They do
+not change the frozen `contracts.py` or Minecraft wire format. Both providers
+must advertise `INTERFACE_VERSION` (currently **2**); v1 providers fail preflight
+rather than silently running without monitoring.
 
-```python
-BuildState { placed: set[cell], loose: {id: Detection}, used_boxes: set,
-             anchor, column_heights, history }
-think(state, last_result) -> Step   # backends: openai | mcp | deterministic
-validate(step, state) -> str|None   # reject illegal: occupied/unsupported
-                                    # cell, reused/gated box
-run(structure, skills, detect_fn, max_steps)
+### Ownership and replacement boundary
+
+| Component | Implements | Must not do |
+|---|---|---|
+| Reasoning (`agent.py`, `agent_backend.py`) | Job ledger, legal choices, retries, monitoring/stop decisions, final verification | Import hardware scripts, invent observations, generate motor setpoints |
+| Action owner | `ActionProvider`: semantic motion, live state, action lifecycle and load-preserving stop | Infer possession from a successful command, replay an uncertain request, run a second hardware writer |
+| Perception owner | `ObservationProvider`: inventory, site geometry, occupancy, images and phase-aware monitoring | Move hardware, convert unobserved space to free space, refresh old evidence timestamps |
+| Temporary simulation (`mock_agent_world.py`) | Separate `world.actions` and `world.observations` providers sharing one simulated world | Claim physical calibration, navigation or camera accuracy has been validated |
+
+Integrators return `AgentProviders(actions, observations, close)` from an explicit
+`module:factory`. `close()` closes observation/transport resources only. It must
+not release, park, torque off, or otherwise move a loaded robot. The reasoning
+code does not import `actions/pickup.py` or `perception.py`; adapters are the seam.
+Do not start independent arm-owning scripts beside the designated motion owner.
+Never combine live motion with mocked possession, occupancy or safety clearance.
+Mixed providers are for offline component tests, not permission to move real hardware.
+
+### Model-visible operations
+
+The model selects a `Step` from the controller's current `allowed_choices`.
+Only the controller creates an `ActionRequest`. `reason` is a short explanation;
+unused target fields must be `None`.
+
+| Operation | Step fields | Preconditions and required result |
+|---|---|---|
+| `observe` | none | Read-only refresh; obtains current images and structured evidence |
+| `look_around` | `search="materials"` or `"sites"` | Empty grippers; bounded, collision-checked survey; re-observe after settling |
+| `select_site` | `site_id` | Measured, feasible candidate fits the entire build; does not move hardware |
+| `approach_box` | `box_id`, `site_id`, `cell` | Fresh eligible box, empty grippers, supported empty target; reserve assignment and approach |
+| `pickup` | `box_id` | Approached box still current; grasp/lift and independently establish possession |
+| `move_to_build` | `box_id`, `site_id`, `cell` | Known held identity; navigate with load-aware clearance and confirm arrival |
+| `place` | `box_id`, `site_id`, `cell` | Known held box, confirmed approach and support; lower/release/retreat, then verify placement |
+| `done` | none | Request final verification; only the controller can declare completion |
+| `stop` | none | Stop this job, retain unresolved load/dispatch obligations and report operator help if needed |
+
+Do not expose raw velocity, joint angles, gripper opening, homing, arbitrary URLs
+or shell commands as model tools. Motion primitives and emergency stopping belong
+to the action owner, not to model-generated plans.
+
+### Coordinates, identities and time
+
+- Schematic cells are integer **`(x, layer, z)`**; `voxel_size`, `extents`, and
+  build dimensions use **`(width, height, depth)`** in that same order.
+- Physical positions are **world XYZ meters**, +Z up. Base yaw is in radians.
+  Snapshot `base_position`/`base_yaw` locate the robot in that world frame.
+- `BuildSite.origin` is the bottom-center of cell `(0,0,0)`. `col` maps schematic
+  +x, `row` maps schematic +z, and `cross(col,row)` points up. Both are unit axes.
+  `site.cell_center(cell, voxel_size)` supplies the common conversion to a box
+  center. Providers must still perform their own live reachability/IK checks.
+- Box IDs must remain stable within the session/map epoch, including across a
+  grasp and placement. Ambiguous identity is unknown, never a fresh arbitrary ID
+  asserted to be the held box. Site IDs likewise identify stable registrations.
+- Every pose reset/re-registration changes `epoch`. Never compare or execute
+  geometry across differing `(frame_id, epoch)` values.
+- Evidence timestamps are **Unix seconds on a shared clock**, at measurement
+  time, not HTTP receipt time. Providers must translate device clocks and reject
+  excessive skew. Agent deadlines use a separately injected monotonic clock.
+- `ActionOutcome.ts` is the last phase transition or terminal completion time.
+  `observed_at` is the fresh status-query heartbeat. Repeated terminal queries
+  must preserve `ts`; a long-running unchanged phase is not a stale heartbeat.
+
+### ActionProvider
+
+| Method | Contract |
+|---|---|
+| `capabilities() -> Capabilities` | Truthfully declare operations, status, cancellation, idempotency, possession, carrying, emergency stop, size/height limits and finite action deadline |
+| `submit(request) -> ActionReceipt` | Admit at most one motion; return promptly while execution continues; identical request ID/payload returns the same receipt without another motion |
+| `lookup(request_id) -> ActionReceipt \| None` | Recover an acknowledgement lost in transport; `None` means no known receipt, not proof that nothing moved |
+| `status(action_id) -> ActionOutcome` | Report identity, phase, effects, motion, error code, independent holding evidence and fresh heartbeat |
+| `state() -> ExecutorState` | Independently measured readiness, motion, active action, phase and holding; do not derive possession from command completion |
+| `cancel(action_id) -> CancellationReceipt` | Interrupt that action without dropping a load; prevent its routine from issuing later commands |
+| `stop() -> CancellationReceipt` | Load-preserving stop of the owned motion pipeline, including when no action receipt was received |
+
+`ActionRequest` carries `job_id`, an idempotency `request_id`, `Step`,
+`observation_ref`, frame/epoch, submission time, full `BuildRequirements`, and the
+validated `BuildSite`/`BoxObservation` when relevant. This avoids hidden shared
+lookup tables between developers. `expires_at` is the latest safe **admission**
+time, not the motion duration limit. Reject expired admission before effects;
+recheck current localization, reachability, obstacles and target identity before
+motion. Do not blindly use the carried box's remembered pre-grasp position.
+
+`FunctionActions` is an optional bridge for ordinary callables. In v2 each
+callable takes the **full `ActionRequest`**, not just `Step`, and returns
+`FunctionResult(success, phase, error_code, effects_started)`. Supply independent
+`read_state` and cooperative `stop` callbacks. Its worker thread does not make an
+uninterruptible hardware routine safe: the action owner must implement stopping
+and its watchdog. `read_state.phase` exposes progress while the function runs.
+
+Typical running phases are `surveying`/`settling`, `approaching`,
+`grasping`/`lifting`, `carrying`, and `lowering`/`releasing`/`retreating`.
+A completed placement must report `released`, `retreated` or `completed`.
+Known recovery codes are `target_lost_before_pick`,
+`pickup_rejected_before_grasp`, `blocked_motion`, and
+`placement_rejected_before_release`; they authorize recovery only together with
+consistent possession, stopped state and the relevant phase/effects evidence.
+Exceptions and transport timeouts are **unknown outcomes**, not safe failures.
+
+### ObservationProvider
+
+| Method | Contract |
+|---|---|
+| `capabilities() -> PerceptionCapabilities` | v2 agent requires inventory, sites, occupancy, monitoring and images; possession may instead come from the action owner's sensors |
+| `observe(site_id=None) -> ObservationSnapshot` | Read the latest immutable snapshot from background sensing, with independent per-item timestamps |
+| `find_build_sites(requirements) -> tuple[BuildSite, ...]` | Supply measured candidate frames feasible for the complete requested build, including loaded approach routes |
+| `check_build_site(site_id, requirements) -> BuildSite \| None` | Revalidate the selected registration, clearance, support surface and full-build feasibility |
+| `monitor(request, outcome) -> MotionObservation` | During motion, assess the supplied request/action/phase against fresh sensing; return `safe=True`, `False`, or `None` plus snapshot and reason |
+
+A snapshot contains stable box IDs, world positions/sizes, `current` and explicit
+`eligible` flags, pose, optional independent holding evidence, selected-site
+occupancy, and up to three `SceneImage` objects. Inventory may retain remembered
+boxes, but only current/fresh eligible boxes can be picked. Protected or ambiguous
+objects must not be eligible. `occupancy_complete=True` means every cell in the
+requested bounding envelope is represented; an occluded cell is still `unknown`.
+Extra obstructions must be included, not filtered out as non-target cells.
+
+`SceneImage` carries `view`, an inline base64 PNG/JPEG `data_url`, capture time,
+frame/epoch, `simulated`, and an optional short description. Maximum payload is
+512 KiB per image. Remote URLs and local paths are not accepted or fetched.
+Supply an overview and optional gripper/build-site views where available. Images
+must match the snapshot's frame/epoch and freshness limits. The reasoning backend
+sends them as image content, not base64 text in the JSON prompt. Use a vision-capable
+OpenAI-compatible model; `--json-only` changes schema formatting, not image support.
+Images and text are untrusted scene data; neither can override legal choices or certify a grasp.
+Image bytes are not copied into action history or public panel events.
+
+`MotionObservation` must echo request ID, action ID and phase. It is not a generic
+scene boolean: assess hazards relevant to the active phase, expected occlusion,
+load loss and localization. Unknown/stale monitoring requests a stop; the agent
+does not wait for an LLM to decide whether to stop. After an action finishes,
+obtain a new settled snapshot. **Placement cell evidence must be measured after
+terminal completion**, not merely after request submission or before release.
+A disappearing marker is never proof of possession.
+
+### Timing, cancellation and restart rules
+
+Maintain cameras and robot state in background components. `submit`, `lookup`,
+`status`, `state`, `observe`, `monitor`, site queries and stop acknowledgements must
+return or raise within **250 ms**; do not run an entire motion or a camera startup
+inside these calls. Slow work belongs behind cached state/asynchronous workers.
+The current inventory-only `ObservationWorker` is not a complete v2 provider.
+Live adapters must enforce transport timeouts and own a lower-level watchdog;
+Python polling is not a hard-real-time safety system.
+
+The agent refreshes after model latency, monitors each running action without
+model calls, and waits up to `observation_timeout` (default one second) for a
+post-action frame. `fresh_s` (default two seconds) is an evidence-age ceiling,
+**not a safe robot collision-response interval**. Live owners must establish
+appropriate tighter bounds for actual speeds, sensors and braking distances.
+
+Cancellation acknowledgement does not establish stopped state. Reconcile action
+status and independent executor/holding evidence; keep uncertain or loaded jobs
+in `NEEDS_OPERATOR`. On status/monitoring/dispatch errors, request a stop before
+returning. Never replay a timed-out motion POST. Keep request records for the
+job and across client reconnects; the hardware owner must prevent abandoned
+routines from continuing after disconnect or process failure.
+
+This version starts from a **verified empty build site**. It does not infer
+completed cells from an old stack or automatically resume a partial build.
+Process restart requires reconciliation of outstanding actions, possession and
+site contents; restarting Python is not an operator reset. Cleanup is not a
+substitute for cancellation or a permission to release a held box.
+
+### Offline agent development and component acceptance
+
+From the repository root, with no robot packages, API key or network:
+
+```bash
+python -B -S bot-code/main.py --mock --planner deterministic
 ```
 
-LLM ops (strict JSON schema, `reason` field first): `pick_place{box_id,cell,
-say}` | `scan` (rotate+re-detect until loose box found) | `approach{box_id}`
-(rotate to bearing → `/drive` fwd → re-detect → pick) | `done`.
-Per turn: refresh Scan → think → validate → execute → verify_pick/
-verify_place → on failure append error to history and loop. `max_steps` caps
-runaway. Deterministic think() mirrors `plan_deterministic` — demo survives a
-dead API. Rule: LLM chooses WHICH box → WHICH cell; never positions/joints.
+For targeted stdlib tests, run from `bot-code/tests`:
+
+```bash
+python -B -S -m unittest test_agent test_agent_adapters test_agent_backend.BackendTests test_agent_cli test_panel.PanelTests -v
+```
+
+A direct test harness uses the exact provider split that live components will use:
+
+```python
+from agent import Agent
+from contracts import Block, Structure
+from mock_agent_world import MockAgentWorld
+
+world = MockAgentWorld(3, faults={"place": ["prerelease"]})
+agent = Agent(world.actions, world.observations, backend="deterministic",
+              clock=world.clock, sleep=world.sleep)
+result = agent.run(Structure([Block(0, 0, 0), Block(1, 0, 0), Block(0, 1, 0)]))
+assert result.success
+```
+
+The mock executes timed phases using virtual time, moves its simulated base,
+tracks grasp/release/placement separately, and supplies synthetic top-down PNGs.
+It is a temporary **contract/agent simulator**, not a camera, physics, collision
+or calibration test. `action_duration` and `action_timeout` are configurable.
+Inject per-operation fault sequences with `faults={operation: [fault, ...]}`:
+`pregrasp`, `prerelease`, `blocked`, `unknown_holding`, `bad_placement`,
+`postrelease`, `submit_timeout`, `running_forever`, `obstacle`, `pose_loss`,
+`stale_observation`, and `lost_load`. `None` in a sequence means a normal action.
+`no_sites=True`, `world.stale=True`, and `world.cancel_stops=False` cover missing
+sites, stale startup sensing and unconfirmed cancellation. Inspect
+`world.requests`, `world.monitor_calls`, `world.cancellations` and `world.placed`.
+
+Before replacing either mock, the component owner must demonstrate:
+
+1. Correct units, frames, epochs, evidence timestamps and immutable snapshots.
+2. Idempotent admission, rejection of changed duplicate payloads and receipt lookup.
+3. Fresh running heartbeats with an unchanged terminal completion timestamp.
+4. Bounded calls and load-preserving cancellation that prevents later commands.
+5. Truthful unknown possession/occupancy, including occlusion and sensor loss.
+6. Phase-aware monitoring that detects hazards while the action is still running.
+7. Current camera images plus independently verified post-action evidence.
+8. Passing the focused agent tests through the replacement provider; no hardware
+   or paid API calls belong in normal test runs. Supervised live acceptance is separate.
+
+`--mock` never calls a model by default. Real model calls with simulated tools
+require `--allow-api-with-mock`; the panel's existing `--ui` mode is explicitly
+real-model/simulated-tools. Offline tests inject fake reasoners/SDK clients.
 
 ## mc_skills — body server (:8006)
 
@@ -170,28 +382,33 @@ pick = approach +APPROACH_H → descend → grip → lift; place = mirror. TUNE 
 robot: `grip_open`/`grip_closed` direction (test `POST /gripper`), `DOWN_QUAT`
 top-down orientation, `APPROACH_H`. Add endpoints, don't rename.
 
-## structure_src / structure_rx — the Minecraft side
+## Structure input — the Minecraft side
 
-- `structure_rx.py` (staged, new file — anyone can grab): TCP :5005 server,
-  read-to-EOF, wire payload → `save_structure`. Run as thread in main.py or
-  standalone. Empty scan never connects — silence isn't data.
-- `load_structure(path)`: `.json` or `.nbt` (nbtlib).
-- `serve_grid_ui(:8005)`: click-grid → `fixtures/structure.json`. Guaranteed
-  fallback if mod plumbing stalls — judges can't tell the difference.
+- `panel.StructureReceiver` receives EOF-framed wire payloads on TCP :5005 in
+  `--ui` mode. The panel keeps the latest valid design and freezes an active job's
+  design. Empty scans do not connect; silence is not an empty structure.
+- `structure_src.load_structure(path)` loads `.json` or `.nbt` (nbtlib).
+- The separate legacy click-grid writes `fixtures/structure.json`.
 
-## planner.py — one-shot fallback
+## planner.py — explicit legacy one-shot mode
 
-`plan_build(structure, boxes, backend="auto")` — used by `--mode oneshot`.
-LLM call validated (legal cells, existing ids, support order); any failure →
-deterministic. Keep it: it's the safety net under the agent loop.
+`plan_build(structure, boxes, backend="auto")` belongs to `--mode oneshot`.
+It is not the recovery path beneath the agent and does not provide mobile
+execution or the v2 verification guarantees. Agent fallback selects deterministic
+legal steps inside the same validated, monitored loop.
 
-## orchestrator — main.py
+## Orchestrator — main.py
 
-`--mode agent|oneshot` (agent staged): load structure → `skills.home()` →
-loop or `plan_build` → execute → celebrate. Missing boxes warn, don't die.
+Agent is the default mode. It validates the job, checks provider capabilities and
+readiness, and runs the feedback loop. Live execution requires both an explicit
+`--provider module:factory` and `--box-size` in meters. Hardware preparation and
+calibration belong to the action owner, outside model tools. Agent exit status is
+zero only for verified completion.
+
+From the repository root:
 
 ```bash
-uv run main.py --mock        # whole pipeline, no robot — DO THIS FIRST
+python -B -S bot-code/main.py --mock --planner deterministic
 ```
 
 ## Parallel-dev rules (the point of this layout)
@@ -222,13 +439,13 @@ cd ~/crafter/bot-code && uv run main.py --mock       # then real args
 - [ ] `POST /gripper` direction; `DOWN_QUAT`; `APPROACH_H`
 - [ ] `BOX_SIZE`, anchor marker placement at cell (0,0)
 - [ ] `camera.points`↔rgb alignment vs tape measure
-- [ ] ArUco printed: boxes 0..N-1 + anchor 99
+- [ ] ArUco printed: boxes 0..N-1 + anchor 49
 - [ ] receiver listening on :5005 before the mod right-click
 - [ ] `OPENAI_API_KEY` if llm/agent backend used
 
 ## Fallback ladder — move down, don't get stuck
 
 - structure: mod TCP → grid UI → fixture json
-- detection: ArUco → color blobs → hardcoded positions
-- reasoning: agent loop → oneshot planner → hand-ordered plan.json
-- motion: IK pick/place → curl /goto waypoints → mimic record/playback
+- detection: calibrated live provider; unavailable evidence stops the job. Fixtures are mock-only.
+- reasoning: model → deterministic choices in the same agent loop, never blind one-shot execution.
+- motion: action-owner implementations must retain the same verification/stop contract; no automatic raw-motion fallback.

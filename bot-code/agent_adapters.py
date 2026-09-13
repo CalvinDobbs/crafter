@@ -15,6 +15,8 @@ from agent_types import (ActionOutcome, ActionProvider, ActionReceipt, BoxObserv
 
 @dataclass
 class AgentProviders:
+    """Replaceable component pair. close releases transports/sensors, never a held load."""
+
     actions: ActionProvider
     observations: ObservationProvider
     close: Callable[[], None] = lambda: None
@@ -22,6 +24,8 @@ class AgentProviders:
 
 @dataclass(frozen=True)
 class FunctionResult:
+    """Motion result only; possession/readiness come from the separate read_state callback."""
+
     success: bool
     phase: str = "completed"
     error_code: str | None = None
@@ -29,17 +33,24 @@ class FunctionResult:
 
 
 class FunctionActions:
+    """Adapt request-taking functions; state/stop callbacks must be independently bounded.
+
+    This bridge never invents possession and cannot forcibly interrupt Python or
+    hardware. The supplied stop callback must revoke/interrupt the motion routine.
+    """
+
     def __init__(self, functions, read_state, stop, *, max_box_size, max_height,
                  action_timeout=30.0, clock=time.time):
-        self.functions, self.read_state, self.stop = dict(functions), read_state, stop
+        self.functions, self.read_state, self._stop = dict(functions), read_state, stop
         self.clock = clock
         self._capabilities = Capabilities(
             operations=frozenset(functions), status=True, cancellation=stop is not None,
             idempotency=True, possession=True, carrying="move_to_build" in functions,
-            max_box_size=tuple(max_box_size), max_height=max_height, action_timeout=action_timeout)
+            max_box_size=tuple(max_box_size), max_height=max_height, action_timeout=action_timeout,
+            emergency_stop=stop is not None)
         self._lock = threading.Lock()
         self._active = None
-        self._outcomes, self._receipts = {}, {}
+        self._outcomes, self._receipts, self._requests = {}, {}, {}
 
     def capabilities(self):
         return self._capabilities
@@ -47,39 +58,58 @@ class FunctionActions:
     def submit(self, request):
         with self._lock:
             if request.request_id in self._receipts:
+                if request != self._requests[request.request_id]:
+                    raise ValueError("request ID reused with a different payload")
                 return self._receipts[request.request_id]
+            request.validate_admission(self.clock())
             if self._active is not None:
                 raise RuntimeError("another action function is still running")
             if request.step.operation not in self.functions:
                 raise CapabilityError("action function is unavailable")
             receipt = ActionReceipt(request.request_id, request.request_id)
             self._receipts[request.request_id] = receipt
+            self._requests[request.request_id] = request
             self._active = receipt.action_id
             self._outcomes[receipt.action_id] = ActionOutcome(
-                request.request_id, receipt.action_id, "running", self.clock(), motion="running")
+                request.request_id, receipt.action_id, "running", self.clock(), motion="running",
+                observed_at=self.clock())
             threading.Thread(target=self._execute, args=(request,), name="agent-action", daemon=True).start()
             return receipt
 
+    def lookup(self, request_id):
+        with self._lock:
+            return self._receipts.get(request_id)
+
     def _execute(self, request):
         try:
-            result = self.functions[request.step.operation](request.step)
+            result = self.functions[request.step.operation](request)
             if not isinstance(result, FunctionResult) or type(result.success) is not bool:
                 raise TypeError("action functions must return FunctionResult")
             executor = self.read_state()
             outcome = ActionOutcome(
                 request.request_id, request.request_id, "succeeded" if result.success else "failed",
                 self.clock(), result.phase, result.effects_started, executor.motion,
-                result.error_code, executor.holding)
+                result.error_code, executor.holding, observed_at=self.clock())
         except Exception as exc:
             outcome = ActionOutcome(request.request_id, request.request_id, "unknown", self.clock(),
-                                    error_code=type(exc).__name__)
+                                    error_code=type(exc).__name__, observed_at=self.clock())
         with self._lock:
             self._outcomes[request.request_id] = outcome
             self._active = None
 
     def status(self, action_id):
         with self._lock:
-            return self._outcomes[action_id]
+            outcome = self._outcomes[action_id]
+        if outcome.status == "running":
+            executor = self.read_state()
+            with self._lock:
+                outcome = self._outcomes[action_id]
+                if outcome.status == "running":
+                    phase = executor.phase if executor.phase != "unknown" else outcome.phase
+                    outcome = replace(outcome, phase=phase, holding=executor.holding,
+                                      ts=self.clock() if phase != outcome.phase else outcome.ts)
+                    self._outcomes[action_id] = outcome
+        return replace(outcome, observed_at=self.clock())
 
     def state(self):
         executor = self.read_state()
@@ -90,11 +120,19 @@ class FunctionActions:
 
     def cancel(self, action_id):
         with self._lock:
-            if action_id not in self._outcomes:
-                raise ValueError("unknown action")
-        if self.stop is None:
+            outcome = self._outcomes[action_id]
+            if self._active not in {None, action_id}:
+                return CancellationReceipt(action_id, False)
+            if self._active is None and outcome.status in {"succeeded", "failed", "cancelled"} and outcome.motion == "stopped":
+                return CancellationReceipt(action_id, True, True)
+        return replace(self.stop(), action_id=action_id)
+
+    def stop(self):
+        with self._lock:
+            action_id = self._active
+        if self._stop is None:
             return CancellationReceipt(action_id, False)
-        self.stop()
+        self._stop()
         executor = self.state()
         return CancellationReceipt(action_id, True, executor.motion == "stopped" and executor.active_action is None)
 
@@ -158,7 +196,8 @@ def normalize_scan(scan, received_at, *, eligibility=None, revision=None):
                                     current=track.get("current") is True, eligible=eligible, valid=valid))
     return ObservationSnapshot(revision or str(scan.ts), scan.ts, received_at, pose.epoch,
                                frame_id="session-world", valid=valid, pose_valid=valid,
-                               boxes=tuple(boxes), warnings=tuple(getattr(scan, "warnings", ())))
+                               boxes=tuple(boxes), warnings=tuple(getattr(scan, "warnings", ())),
+                               base_position=(float(pose.x), float(pose.y), 0.0), base_yaw=float(pose.yaw))
 
 
 class ObservationWorker:
@@ -227,6 +266,9 @@ class ObservationWorker:
             if not ready:
                 raise TimeoutError("no observation before deadline")
             return self._latest
+
+    def monitor(self, request, outcome):
+        raise CapabilityError("inventory-only worker lacks phase-aware action monitoring")
 
     def find_build_sites(self, requirements):
         raise CapabilityError("perception adapter lacks candidate sites; fixed anchor is not a site finder")
