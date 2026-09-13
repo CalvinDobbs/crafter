@@ -117,18 +117,24 @@ class Geometry:
         if snapshot is None or not snapshot.valid:
             return None
         scan = getattr(self.observations, "_scan", lambda: None)()
-        best, best_score = None, None
+        # Remembered sightings count here, and that is the whole point: everything seen during a
+        # sweep is remembered by the time the sweep ends, so requiring a current detection means
+        # never facing anything the survey found. perception re-projects a remembered object
+        # through the CURRENT pose, so position_base_m is a valid heading even after rotating.
+        # A current sighting is still preferred where one exists.
+        best, best_key = None, None
         for item in (getattr(scan, "objects", ()) or ()) if scan is not None else ():
             position, score = item.get("position_base_m"), item.get("score")
-            if position is None or not item.get("current") or score is None:
+            if position is None or score is None:
                 continue
-            if best_score is None or score > best_score:
-                best, best_score = position, score
+            key = (bool(item.get("current")), float(score))
+            if best_key is None or key > best_key:
+                best, best_key = position, key
         if best is None:
             return None
-        bearing = math.atan2(best[1], best[0])
-        return {"bearing": bearing, "score": best_score,
-                "range": math.hypot(best[0], best[1])}
+        best_score, seen_now = best_key[1], best_key[0]
+        return {"bearing": math.atan2(best[1], best[0]), "score": best_score,
+                "range": math.hypot(best[0], best[1]), "current": seen_now}
 
     def look_around(self, request):
         """A survey needs no target, but it can finish pointed at what it found."""

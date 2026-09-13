@@ -176,7 +176,8 @@ def look_around(executor, request):
             best, _ = None, executor.log(f"[provider] could not pick a heading to face: {exc!r}")
         if best and abs(best["bearing"]) > armctl.YAW_TOL:
             executor.log(f"[provider] facing best candidate: bearing {np.degrees(best['bearing']):+.0f} deg,"
-                         f" score {best['score']:.2f}, range {best['range']:.2f} m")
+                         f" score {best['score']:.2f}, range {best['range']:.2f} m,"
+                         f" {'seen now' if best.get('current') else 'remembered from the sweep'}")
             rig.turn_by(best["bearing"], SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
         elif best:
             executor.log(f"[provider] best candidate already ahead (score {best['score']:.2f})")
