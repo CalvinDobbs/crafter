@@ -59,6 +59,8 @@ def main(argv=None):
     ap.add_argument("--save-api-key", action="store_true",
                     help="save exported OPENAI_API_KEY privately in ~/.config/crafter; never overwrite an existing key")
     ap.add_argument("--ui", action="store_true", help="Minecraft control panel: receives Minecraft designs and runs builds")
+    ap.add_argument("--build-pace", type=float, default=1.0,
+                    help="multiplier on how long each simulated physical action takes; 0 runs flat out")
     ap.add_argument("--ui-host", default="127.0.0.1")
     ap.add_argument("--ui-port", type=int, default=8005)
     ap.add_argument("--debug-perception", metavar="URL",
@@ -125,6 +127,7 @@ def main(argv=None):
         return serve_panel(host=a.ui_host, port=a.ui_port, receiver_host=a.receiver_host,
                            receiver_port=a.receiver_port, model=a.model, base_url=a.base_url,
                            model_timeout=a.llm_timeout, json_only=a.json_only,
+                           pace=a.build_pace,
                            debug_provider=a.debug_provider, debug_perception=a.debug_perception,
                            box_size=a.box_size)
     if a.mode == "agent" and a.sweeps != 1:

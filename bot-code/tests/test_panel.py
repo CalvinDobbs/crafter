@@ -43,7 +43,7 @@ class FirstChoice:
 
 class PanelTests(unittest.TestCase):
     def session(self, reasoner=FirstChoice):
-        session = PanelSession(reasoner_factory=reasoner, tool_delay=0)
+        session = PanelSession(reasoner_factory=reasoner, pace=0)
         self.addCleanup(session.close)
         return session
 
@@ -138,7 +138,7 @@ class PanelTests(unittest.TestCase):
 
     def test_a_build_waits_for_a_design_but_not_for_a_key(self):
         """Builds take the agent's own first legal step, so no model and no key are involved."""
-        session = PanelSession(tool_delay=0)
+        session = PanelSession(pace=0)
         self.addCleanup(session.close)
         self.assertIsNone(session.snapshot()["design"])
         self.assertEqual(session.snapshot()["view"], "main")
@@ -677,7 +677,7 @@ class PanelHTTPTests(unittest.TestCase):
     def test_clear_requires_csrf_and_current_design(self):
         from fastapi.testclient import TestClient
         from panel import create_app
-        session = PanelSession(FirstChoice, tool_delay=0)
+        session = PanelSession(FirstChoice, pace=0)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
             headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
             self.assertEqual(client.post("/api/example", headers=headers).status_code, 200)
@@ -730,7 +730,7 @@ class PanelHTTPTests(unittest.TestCase):
         from fastapi.testclient import TestClient
         from panel import create_app
         console = debug_console()
-        session = PanelSession(FirstChoice, tool_delay=0, debug=console)
+        session = PanelSession(FirstChoice, pace=0, debug=console)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
             state = client.get("/api/state").json()
             headers = {"X-Crafter-Token": state["csrf"]}
@@ -790,7 +790,7 @@ class PanelHTTPTests(unittest.TestCase):
     def test_a_panel_without_a_console_exposes_no_debug_surface(self):
         from fastapi.testclient import TestClient
         from panel import create_app
-        session = PanelSession(FirstChoice, tool_delay=0)
+        session = PanelSession(FirstChoice, pace=0)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
             headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
             self.assertIsNone(client.get("/api/state").json()["debug_kind"])
@@ -813,7 +813,7 @@ class PanelHTTPTests(unittest.TestCase):
                 return choices[0]
 
         console = debug_console()
-        session = PanelSession(Blocking, tool_delay=0, debug=console)
+        session = PanelSession(Blocking, pace=0, debug=console)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
             headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
             client.post("/api/example", headers=headers)
@@ -835,7 +835,7 @@ class PanelHTTPTests(unittest.TestCase):
     def test_http_assets_state_protection_and_complete_flow(self):
         from fastapi.testclient import TestClient
         from panel import create_app
-        session = PanelSession(FirstChoice, tool_delay=0)
+        session = PanelSession(FirstChoice, pace=0)
         with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
             for path, media_type in (("/", "text/html"), ("/panel.js", "text/javascript"),
                                      ("/panel.css", "text/css"), ("/assets/Crafter-transparent.svg", "image/svg+xml")):

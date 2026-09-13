@@ -23,6 +23,10 @@ and receiver, and voice. The `main.py --ui` panel receives Minecraft designs on 
 them before Start. Builds run on the offline simulator and take the agent's own first legal step, so they
 need no model, no API key and no robot.
 
+Each simulated physical action takes wall-clock seconds, in the proportions the robot's own
+routines have -- a survey is long, a drive is short -- so a four-box build runs about two
+minutes. `--build-pace` scales that, and `--build-pace 0` runs flat out.
+
 Hardware motion is not wired up yet: there is no action provider implementing interface v2, so a live
 build fails preflight by design. See [bot-code/README.md](bot-code/README.md) for the interface and
 [bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md) for how the base and arms

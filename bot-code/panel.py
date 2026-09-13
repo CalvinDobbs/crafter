@@ -129,10 +129,23 @@ class StructureReceiver:
         self.session.receiver_status(False, self.port)
 
 
+ACTION_SECONDS = {"look_around": 9.0, "approach_box": 6.0, "pickup": 8.0,
+                  "move_to_build": 6.0, "place": 8.0}
+OTHER_ACTION_SECONDS = 6.0
+
+
 class PanelWorld(MockAgentWorld):
-    def __init__(self, count, cancel, emit, tool_delay):
+    """The simulated world, paced so a build reads as physical work rather than a progress bar.
+
+    The mock runs on virtual time, which the agent advances by sleeping. Stretching those sleeps
+    against the wall clock is what makes an action take real seconds, and doing it per operation
+    keeps the proportions the robot's own routines have -- a survey is long, a drive is short.
+    Cancellation waits on the same event, so a slow action still stops the moment it is asked to.
+    """
+
+    def __init__(self, count, cancel, emit, pace):
         super().__init__(count)
-        self.cancel_event, self.emit, self.tool_delay = cancel, emit, tool_delay
+        self.cancel_event, self.emit, self.pace = cancel, emit, pace
         self.reported = set()
 
     def submit(self, request):
@@ -153,8 +166,15 @@ class PanelWorld(MockAgentWorld):
         return outcome
 
     def sleep(self, seconds):
-        self.cancel_event.wait(seconds*self.tool_delay/self.action_duration)
+        self.cancel_event.wait(seconds*self.pace*self._seconds()/self.action_duration)
         super().sleep(seconds)
+
+    def _seconds(self):
+        """Wall-clock budget for whatever is running now; nothing between actions has to drag."""
+        if self.active is None:
+            return 0.0
+        operation = self._pending[self.active]["request"].step.operation
+        return ACTION_SECONDS.get(operation, OTHER_ACTION_SECONDS)
 
 
 class DeterministicChoice:
@@ -194,11 +214,11 @@ class PanelReasoner:
 
 
 class PanelSession:
-    def __init__(self, reasoner_factory=None, model="gpt-4o-mini", tool_delay=.65,
+    def __init__(self, reasoner_factory=None, model="gpt-4o-mini", pace=1.0,
                  base_url=None, model_timeout=15.0, json_only=False, debug=None):
-        if not math.isfinite(tool_delay) or not 0 <= tool_delay <= 5:
-            raise ValueError("simulation delay must be between 0 and 5 seconds")
-        self.reasoner_factory, self.model, self.tool_delay = reasoner_factory, model, tool_delay
+        if not math.isfinite(pace) or not 0 <= pace <= 10:
+            raise ValueError("build pace must be a multiplier between 0 and 10")
+        self.reasoner_factory, self.model, self.pace = reasoner_factory, model, pace
         self.base_url, self.model_timeout, self.json_only = base_url, model_timeout, json_only
         self.debug = debug
         self.lock = threading.RLock()
@@ -336,7 +356,7 @@ class PanelSession:
         try:
             with self.lock:
                 blocks = copy.deepcopy(self.job["design"]["blocks"])
-            world = PanelWorld(len(blocks), cancel, emit, self.tool_delay)
+            world = PanelWorld(len(blocks), cancel, emit, self.pace)
             reasoner = PanelReasoner((self.reasoner_factory or DeterministicChoice)(), cancel, emit)
             agent = Agent(world.actions, world.observations, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
                           clock=world.clock, sleep=world.sleep,
@@ -455,7 +475,7 @@ def build_debug_console(provider=None, perception=None, box_size=None):
 
 
 def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model="gpt-4o-mini",
-               base_url=None, model_timeout=15.0, json_only=False, tool_delay=.65,
+               base_url=None, model_timeout=15.0, json_only=False, pace=1.0,
                debug_provider=None, debug_perception=None, box_size=None):
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import FileResponse, JSONResponse, Response
@@ -463,7 +483,7 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
     if session is None:
         # Builds run on the agent's own legal-step ordering, so the panel starts with no reasoner
         # and no key. set_api_key installs one for anyone who wants model decisions back.
-        session = PanelSession(None, model, tool_delay, base_url, model_timeout, json_only,
+        session = PanelSession(None, model, pace, base_url, model_timeout, json_only,
                                debug=build_debug_console(debug_provider, debug_perception, box_size))
     receiver = StructureReceiver(session, receiver_host, receiver_port)
     origin = urlsplit(debug_perception) if debug_perception else None
