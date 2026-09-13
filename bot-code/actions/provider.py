@@ -165,6 +165,24 @@ def look_around(executor, request):
     finally:
         rig.stop_base()
     executor.log(f"[provider] survey swept {covered * 180 / np.pi:+.0f} deg of an intended 360")
+    # Finish pointed at the best thing found. A wide-angle frame makes a box at its edge small
+    # and distorted, which is precisely why it scores badly, and it cannot score better while
+    # nothing ever turns to look at it. Facing it costs one short turn and is reversible.
+    face_best = request.get("face_best")
+    if face_best is not None:
+        try:
+            best = face_best()
+        except Exception as exc:
+            best, _ = None, executor.log(f"[provider] could not pick a heading to face: {exc!r}")
+        if best and abs(best["bearing"]) > armctl.YAW_TOL:
+            executor.log(f"[provider] facing best candidate: bearing {np.degrees(best['bearing']):+.0f} deg,"
+                         f" score {best['score']:.2f}, range {best['range']:.2f} m")
+            rig.turn_by(best["bearing"], SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
+        elif best:
+            executor.log(f"[provider] best candidate already ahead (score {best['score']:.2f})")
+        else:
+            executor.log("[provider] nothing found to face")
+
     executor.phase("settling")
     armctl.dwell(SURVEY_SETTLE_S, cancel)
     return "completed"
@@ -391,7 +409,8 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
     executor = Executor(rig, holding_source=holding_source, log=log)
 
     # look_around needs no target geometry: it surveys where it stands.
-    functions = {"look_around": _wrap(executor, look_around, lambda r: {}),
+    functions = {"look_around": _wrap(executor, look_around,
+                                      geometry.look_around if geometry is not None else (lambda r: {})),
                  "pickup": _wrap(executor, pickup, lambda r: {})}
     if geometry is not None:
         functions["place"] = _wrap(executor, place, geometry.place)

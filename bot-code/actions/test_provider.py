@@ -291,6 +291,61 @@ class PickupTests(unittest.TestCase):
             self.assertGreaterEqual(arm.cmd[armctl.SWING], arm.lo[armctl.SWING])
 
 
+class FaceBestTests(unittest.TestCase):
+    """A survey should finish pointed at what it found, on much weaker evidence than a pick."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        for patcher in (patch.object(armctl, "time", self.clock),
+                        patch.object(provider, "time", self.clock)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.rig = FakeRig()
+        self.executor = provider.Executor(self.rig, log=lambda *a: None)
+
+    def survey(self, face_best):
+        start = self.rig.yaw
+        provider.look_around(self.executor, {"stations": 2, "face_best": face_best})
+        return self.rig.yaw - start
+
+    def test_it_turns_to_face_the_best_candidate(self):
+        # two stations of 2*pi/2 sweep a full turn; facing a candidate adds its bearing on top
+        swept = self.survey(lambda: {"bearing": 0.6, "score": 0.18, "range": 1.5})
+        self.assertAlmostEqual(swept, 2 * math.pi + 0.6, delta=0.2)
+
+    def test_a_weak_candidate_is_still_worth_facing(self):
+        # 0.18 is far below the selection bar; looking is free, picking is not
+        self.assertLess(0.18, observations_score_select())
+        swept = self.survey(lambda: {"bearing": -0.5, "score": 0.18, "range": 1.5})
+        self.assertAlmostEqual(swept, 2 * math.pi - 0.5, delta=0.2)
+
+    def test_a_candidate_already_ahead_needs_no_turn(self):
+        swept = self.survey(lambda: {"bearing": 0.005, "score": 0.4, "range": 1.0})
+        self.assertAlmostEqual(swept, 2 * math.pi, delta=0.2)
+
+    def test_finding_nothing_is_not_an_error(self):
+        swept = self.survey(lambda: None)
+        self.assertAlmostEqual(swept, 2 * math.pi, delta=0.2)
+
+    def test_a_failing_lookup_does_not_fail_the_survey(self):
+        def broken():
+            raise RuntimeError("perception went away")
+        self.assertEqual(
+            provider.look_around(self.executor, {"stations": 2, "face_best": broken}), "completed")
+
+
+def observations_score_select():
+    import importlib.util, pathlib as _p
+    spec = importlib.util.spec_from_file_location(
+        "obs_const", _p.Path(__file__).resolve().parent.parent / "observations.py")
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.SCORE_SELECT
+    except Exception:
+        return 0.25
+
+
 class DriveTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()

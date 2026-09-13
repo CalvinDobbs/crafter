@@ -105,6 +105,35 @@ class Geometry:
             return {"box_id": request.step.box_id, "score": score}
         raise StaleGeometry(f"box {request.step.box_id} is not visible at the grasp")
 
+    def strongest_bearing(self, _request=None):
+        """Bearing to the most confident box proposal currently in view, or None.
+
+        Deliberately ignores the eligibility gates. Turning to look at something is free and
+        reversible, so it warrants far weaker evidence than picking it up: a box out at the edge
+        of a wide-angle frame is small and distorted, scores poorly for exactly that reason, and
+        can never improve while nothing ever points the camera at it.
+        """
+        snapshot = self.observations.observe()
+        if snapshot is None or not snapshot.valid:
+            return None
+        scan = getattr(self.observations, "_scan", lambda: None)()
+        best, best_score = None, None
+        for item in (getattr(scan, "objects", ()) or ()) if scan is not None else ():
+            position, score = item.get("position_base_m"), item.get("score")
+            if position is None or not item.get("current") or score is None:
+                continue
+            if best_score is None or score > best_score:
+                best, best_score = position, score
+        if best is None:
+            return None
+        bearing = math.atan2(best[1], best[0])
+        return {"bearing": bearing, "score": best_score,
+                "range": math.hypot(best[0], best[1])}
+
+    def look_around(self, request):
+        """A survey needs no target, but it can finish pointed at what it found."""
+        return {"face_best": self.strongest_bearing}
+
     def approach_box(self, request):
         """A target callable the drive loop re-reads every cycle, never a remembered pose."""
         self._fresh_snapshot(request)       # refuse up front if the request cannot be resolved at all
