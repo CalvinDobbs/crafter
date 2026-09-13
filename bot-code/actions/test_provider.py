@@ -418,6 +418,20 @@ class YawTests(unittest.TestCase):
         turned = armctl.Rig.turn_by(rig, 0.2, 1.0, log=lambda *a: None)
         self.assertAlmostEqual(turned, 0.2, delta=armctl.YAW_TOL + 0.05)
 
+    def test_a_heading_is_held_between_imu_samples(self):
+        # bbos ready() is edge-triggered, so a 200 Hz loop sees False most ticks against a 90 Hz
+        # IMU; reporting unknown there would make every closed-loop turn fall apart
+        rig = FakeRig()
+        rig._yaw = (1.25, armctl.time.monotonic())
+        rig._r_imu = SimpleNamespace(ready=lambda: False, data=None)
+        self.assertAlmostEqual(armctl.Rig.measured_yaw(rig), 1.25)
+
+    def test_a_dead_imu_stream_is_reported_unknown(self):
+        rig = FakeRig()
+        rig._yaw = (1.25, armctl.time.monotonic() - armctl.IMU_STALE_S - 1.0)
+        rig._r_imu = SimpleNamespace(ready=lambda: False, data=None)
+        self.assertIsNone(armctl.Rig.measured_yaw(rig))
+
     def test_no_imu_falls_back_to_open_loop_and_says_so(self):
         rig = FakeRig()
         rig.measured_yaw = lambda: None
