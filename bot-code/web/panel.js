@@ -14,6 +14,11 @@ class VoxelView {
     this.blocks = [];
     this.placed = new Set();
     this.active = null;
+    this.action = null;
+    this.carried = 0;        // eased toward the action's reported fraction, which arrives in steps
+    this.flashes = new Map();
+    this.animating = false;
+    this.spin = 0;
     this.selected = null;
     this.identity = null;
     this.mode = 'design';
@@ -67,7 +72,7 @@ class VoxelView {
     this.zoom = 1;
     this.invalidate();
   }
-  set(design, mode, placed, active) {
+  set(design, mode, placed, active, action) {
     const identity = design ? design.id : 'empty';
     if (identity !== this.identity) {
       this.identity = identity;
@@ -78,9 +83,28 @@ class VoxelView {
     this.extents = design ? design.size : [3, 2, 3];
     this.center = [this.extents[0] / 2, this.extents[1] / 2 - .15, this.extents[2] / 2];
     this.mode = mode;
-    this.placed = new Set((placed || []).map(p => cellKey(p.cell)));
+    const settled = new Set((placed || []).map(p => cellKey(p.cell)));
+    for (const key of settled) if (!this.placed.has(key)) this.flashes.set(key, performance.now());
+    this.placed = settled;
     this.active = active ? cellKey(active) : null;
+    if (!action || !this.action || action.operation !== this.action.operation) this.carried = action ? action.fraction : 0;
+    this.action = action || null;
     this.invalidate();
+  }
+
+  animate(on) {
+    if (on === this.animating) return;
+    this.animating = on;
+    if (!on) return;
+    const step = () => {
+      if (!this.animating) return;
+      // A slow orbit while the agent works, surrendered the moment the viewer takes hold.
+      if (!this.drag) this.yaw += .0015;
+      if (this.action) this.carried += (this.action.fraction - this.carried) * .06;
+      this.draw();
+      this.spin = requestAnimationFrame(step);
+    };
+    this.spin = requestAnimationFrame(step);
   }
   invalidate() {
     if (this.pending) return;
@@ -135,8 +159,16 @@ class VoxelView {
       {v: [0, 3, 7, 4], color: '#ba8246'}, {v: [1, 5, 6, 2], color: '#ce9857'}
     ];
     const faces = [];
-    for (const block of this.blocks) {
-      const x = block.x + .025, y = block.y + .015, z = block.z + .025, s = .95, h = .97;
+    // The cell being worked on gets a second, airborne copy: lowered into place as the motion
+    // runs, held up while it is still being carried. It is what makes a build look like building.
+    const flight = this.mode === 'build' && this.action && this.active
+      ? {carrying: this.action.operation === 'move_to_build' || (this.action.operation === 'pickup' && this.action.phase === 'lifting'),
+         lowering: this.action.operation === 'place'} : null;
+    const lift = flight ? (flight.carrying ? 2.4 : flight.lowering ? 2.4 * (1 - Math.min(1, this.carried * 1.35)) : 0) : 0;
+    const airborne = flight && lift > .02 ? this.active.split(',').map(Number) : null;
+    const drawn = airborne ? this.blocks.concat([{x: airborne[0], y: airborne[1], z: airborne[2], flying: lift}]) : this.blocks;
+    for (const block of drawn) {
+      const x = block.x + .025, y = block.y + .015 + (block.flying || 0), z = block.z + .025, s = .95, h = .97;
       const vertices = [[x,y,z],[x+s,y,z],[x+s,y+h,z],[x,y+h,z],[x,y,z+s],[x+s,y,z+s],[x+s,y+h,z+s],[x,y+h,z+s]].map(p => this.project(p));
       const key = cellKey([block.x, block.y, block.z]);
       for (let i = 0; i < definitions.length; i++) {
@@ -144,8 +176,11 @@ class VoxelView {
         const edge1 = [points[1][0] - points[0][0], points[1][1] - points[0][1]];
         const edge2 = [points[2][0] - points[0][0], points[2][1] - points[0][1]];
         if (edge1[0] * edge2[1] - edge1[1] * edge2[0] < 0) continue;
+        const flying = block.flying !== undefined;
         faces.push({points, depth: points.reduce((sum, p) => sum + p[2], 0) / 4, color: def.color, block, key, face: i,
-          ghost: this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key), active: key === this.active || key === this.selected});
+          ghost: !flying && this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key),
+          flying, flash: this.flashes.has(key) ? Math.max(0, 1 - (performance.now() - this.flashes.get(key)) / 1400) : 0,
+          active: key === this.active || key === this.selected});
       }
     }
     faces.sort((a, b) => a.depth - b.depth);
@@ -154,8 +189,9 @@ class VoxelView {
       this.path(face.points);
       ctx.fillStyle = face.ghost ? (face.active ? '#b8494630' : '#aa92821a') : face.color;
       ctx.fill();
-      ctx.strokeStyle = face.active ? '#b84946' : face.placed ? '#397253' : face.ghost ? '#9f897a' : '#533c2690';
-      ctx.lineWidth = face.active ? 2 : 1;
+      if (face.flash > 0) { ctx.fillStyle = `rgba(57,114,83,${(face.flash * .45).toFixed(3)})`; ctx.fill(); }
+      ctx.strokeStyle = face.flying ? '#b84946' : face.active ? '#b84946' : face.placed ? '#397253' : face.ghost ? '#9f897a' : '#533c2690';
+      ctx.lineWidth = face.flying || face.active ? 2 : 1;
       ctx.stroke();
       if (!face.ghost && (face.face === 3 || face.face === 0 || face.face === 1)) {
         const p = face.points;
@@ -217,11 +253,11 @@ async function command(path, data) {
   } catch (error) { notice(error.message); }
   finally { submitting = false; if (state) render(state); }
 }
-function scene(name, design, mode, placed, active) {
-  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null]);
+function scene(name, design, mode, placed, active, action) {
+  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null, action || null]);
   if (lastScene[name] !== signature) {
     lastScene[name] = signature;
-    views[name].set(design, mode, placed, active);
+    views[name].set(design, mode, placed, active, action);
     if (name === 'main') byId('selection').hidden = true;
   }
 }
@@ -347,7 +383,8 @@ function render(s) {
     text('elapsed', elapsed(job.started_at, job.finished_at));
     text('llm-count', job.llm_calls); text('tool-count', job.tool_calls);
     byId('feed-live').hidden = !running;
-    scene('build', job.design, 'build', job.placed, job.current_cell);
+    scene('build', job.design, 'build', job.placed, job.current_cell, job.action);
+    views.build.animate(running && screen === 'build');
     scene('complete', job.design, 'complete', job.placed, null);
     renderFeed(job);
     text('complete-description', `Your ${total}-box shape is complete. Every placement has been verified.`);

@@ -143,9 +143,10 @@ class PanelWorld(MockAgentWorld):
     Cancellation waits on the same event, so a slow action still stops the moment it is asked to.
     """
 
-    def __init__(self, count, cancel, emit, pace):
+    def __init__(self, count, cancel, emit, pace, progress):
         super().__init__(count)
         self.cancel_event, self.emit, self.pace = cancel, emit, pace
+        self.progress = progress
         self.reported = set()
 
     def submit(self, request):
@@ -158,9 +159,16 @@ class PanelWorld(MockAgentWorld):
 
     def status(self, action_id):
         outcome = super().status(action_id)
+        request = self._pending[action_id]["request"]
+        # How far through its motion the action is. The feed records transitions; this is for the
+        # preview, which wants a continuous number rather than another log line.
+        elapsed = (self.now-self._pending[action_id]["started"])/self.action_duration
+        self.progress(operation=request.step.operation, phase=outcome.phase,
+                      cell=list(request.step.cell) if request.step.cell else None,
+                      fraction=min(1.0, max(0.0, elapsed)),
+                      running=outcome.status == "running")
         if outcome.status != "running" and action_id not in self.reported:
             self.reported.add(action_id)
-            request = self._pending[action_id]["request"]
             self.emit("tool_result", operation=request.step.operation, request_id=request.request_id,
                       result="success" if outcome.status == "succeeded" else outcome.status)
         return outcome
@@ -319,6 +327,7 @@ class PanelSession:
                         "started_at": time.time(), "finished_at": None, "phase": "INVENTORY",
                         "reasoning": "Waiting for the first model decision.", "events": [], "placed": [],
                         "llm_calls": 0, "tool_calls": 0, "current_tool": None, "current_cell": None,
+                        "action": None,
                         "error": None, "result": None}
             self.view, self.worker_busy = "build", True
             self.revision += 1
@@ -344,19 +353,28 @@ class PanelSession:
             elif event_type == "tool_start":
                 job["tool_calls"] += 1
                 job["current_tool"] = data["operation"]
-                job["current_cell"] = data["arguments"].get("cell")
+                job["current_cell"] = data["arguments"].get("cell") or job["current_cell"]
             elif event_type == "tool_result":
                 job["current_tool"] = None
             elif event_type == "placement_confirmed":
                 job["placed"].append({"cell": list(data["cell"]), "box_id": data["box_id"]})
                 job["current_cell"] = None
 
+    def _progress(self, job_id, **data):
+        """Motion progress for the preview. Never appends to the feed: it ticks every poll."""
+        with self.lock:
+            if not self.job or self.job["id"] != job_id or self.job["status"] != "running":
+                return
+            self.job["action"] = data if data.pop("running", False) else None
+            self.revision += 1
+
     def _run(self, job_id, cancel):
         emit = lambda event_type, **data: self._emit(job_id, event_type, **data)
+        progress = lambda **data: self._progress(job_id, **data)
         try:
             with self.lock:
                 blocks = copy.deepcopy(self.job["design"]["blocks"])
-            world = PanelWorld(len(blocks), cancel, emit, self.pace)
+            world = PanelWorld(len(blocks), cancel, emit, self.pace, progress)
             reasoner = PanelReasoner((self.reasoner_factory or DeterministicChoice)(), cancel, emit)
             agent = Agent(world.actions, world.observations, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
                           clock=world.clock, sleep=world.sleep,
