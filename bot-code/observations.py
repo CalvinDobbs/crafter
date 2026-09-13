@@ -1,18 +1,37 @@
 """In-process perception for the interface-v2 agent: sites, occupancy and motion monitoring.
 
-The reasoning, perception and action code all run on the robot, in one process, around ONE
-PerceptionSession. That matters for more than latency. Two sessions would each hold their own
-Odometry, each starting at Pose(0,0,0) with its own epoch counter, so their world origins would
-disagree and geometry from one would be meaningless in the other. It also keeps Scan.points in
-reach: occupancy is measured from the depth cloud, and the cloud never crosses a wire.
+**There are no fiducial markers in this world.** That single fact shapes everything here, so it is
+worth stating plainly against what perception.py offers:
+
+  - perception.py's default detector is `aruco`, and its `Scan.tracks` are built only inside the
+    marker loop. With no markers that list is empty, every classification falls back to "unknown",
+    and nothing is ever a pick candidate. Running it that way sees no boxes at all.
+  - So this provider always starts the session with `detector=True`, and every box below is a
+    YOLO-World proposal. perception.py hardcodes `pick_candidate=False` on those by design, and
+    that is not overridden: eligibility is decided here instead, which is where the perception
+    handoff asks for it ("a higher confidence threshold in an adapter/selection policy").
+  - A proposal reports the *visible surface centroid* of a box, never a centre, with `grasp_pose`
+    always None and no size at all. Nothing here invents either. The action side approaches the
+    face and lets contact find the box, and BoxObservation.size stays None because a fabricated
+    size would turn an assumption into evidence.
+  - perception.py classifies loose vs protected against its ArUco anchor, which does not exist, so
+    it reports everything as "unassigned". That judgement is re-made here against the measured
+    floor site the controller actually selected.
+
+The rest of the design follows from running in one process. Reasoning, perception and actions all
+share a single PerceptionSession: two would each hold their own Odometry, starting at Pose(0,0,0)
+with separate epoch counters, so their world origins would disagree and geometry from one would be
+meaningless in the other. It also keeps Scan.points in reach, so occupancy is measured from the
+depth cloud without the cloud ever crossing a wire.
 
 ObservationWorker already supports this shape. Its poll loop normalizes anything that is not
 already an ObservationSnapshot, and PerceptionSession.poll is exactly the session it expects; the
 HTTP adapter is the remote development path, not the deployed one.
 
 What this refuses to do is as important as what it provides. An unmeasured cell is unknown, never
-empty. A footprint that was never observed is not clear. A monitor that cannot see is not safe.
-Each of those would be an invented certificate, and the agent is built to act on them.
+empty. A footprint that was never observed is not clear. A monitor that cannot see is not safe. A
+proposal without a support plane is not a box. Each of those would be an invented certificate, and
+the agent is built to act on them.
 """
 from __future__ import annotations
 
@@ -25,6 +44,8 @@ import time
 
 import numpy as np
 from dataclasses import replace
+
+from types import SimpleNamespace
 
 from agent_adapters import ObservationWorker, normalize_scan
 from agent_types import (MAX_IMAGE_BYTES, BuildSite, CellObservation, MotionObservation,
@@ -76,7 +97,7 @@ def classify_cells(scan, site, cells, voxel_size, settings):
         return tuple(CellObservation(tuple(c), "unknown", scan.ts) for c in cells), False
     tolerance = voxel_size[1] * HEIGHT_TOL_FRAC
     radius = voxel_size[0] * 0.35
-    marked = _markers_by_cell(scan, site, voxel_size)
+    marked = _boxes_by_cell(scan, site, voxel_size)
     observations_out, complete = [], True
     for cell in cells:
         key = tuple(cell)
@@ -96,16 +117,23 @@ def classify_cells(scan, site, cells, voxel_size, settings):
     return tuple(observations_out), complete
 
 
-def _markers_by_cell(scan, site, voxel_size):
-    """Marker id per cell of the selected site, for boxes whose markers are actually visible.
+def _boxes_by_cell(scan, site, voxel_size):
+    """Detector-proposed box id per cell of the selected site, where one sits in a cell.
 
-    An occluded marker leaves its cell attributed to nobody. That is honest, and it is why a
-    stack can report occupied with no box_id.
+    Attribution is best effort. A stack occludes the boxes underneath it, so a cell can read
+    occupied with no id at all -- that is honest, and the agent tolerates it everywhere except a
+    cell it has already confirmed.
     """
     found = {}
-    for detection in list(getattr(scan, "protected", ())) + list(getattr(scan, "boxes", ())):
-        for cell in found_cells_near(site, detection, voxel_size, scan.pose):
-            found[cell] = detection.id
+    if site is None:
+        return found
+    for item in getattr(scan, "objects", ()) or ():
+        base = item.get("position_base_m")
+        if base is None or not item.get("current"):
+            continue
+        for cell in found_cells_near(site, SimpleNamespace(pos=base, id=item.get("id")),
+                                     voxel_size, scan.pose):
+            found[cell] = item.get("id")
     return found
 
 
@@ -128,19 +156,81 @@ def found_cells_near(site, detection, voxel_size, pose, tolerance=0.5):
 
 
 def eligible_box(track, voxel_size):
-    """Only a currently-seen loose box of about the right size may be picked.
+    """Whether a detector proposal may be selected as material to pick.
 
-    Protected boxes are part of the build, unknown ones have no anchor to judge them against, and
-    a remembered box is a memory rather than a measurement.
+    Nothing here measures a box. The detector proposes a rectangle it believes is a cardboard box,
+    and the depth association gives that rectangle a position and a support plane. So this is a
+    confidence policy over evidence, and its job is to reject the cases that look like boxes and
+    are not: a flat region of floor or wall, a proposal with no usable depth, one clipped by the
+    image edge whose centroid is meaningless, and a group of objects whose silhouette happens to
+    read as one cuboid -- an observed failure mode, not a hypothetical one.
+
+    Size is deliberately not checked: the detector cannot measure it, and a fabricated size would
+    turn an assumption into evidence.
     """
+    if track.get("source") != "box_detector":
+        return False
+    if track.get("label") not in (None, DETECTOR_LABEL):
+        return False
     if not track.get("current") or track.get("classification") != "loose":
         return False
-    size = track.get("size")
-    if isinstance(size, (int, float)) and math.isfinite(size):
-        size = (size, size, size)
-    if not size or len(size) != 3:
+    if track.get("identity_status") in {"ambiguous", "pose_epoch_changed"}:
+        return False        # an uncertain identity is not a box you can promise to place
+    if track.get("partial_view"):
+        return False        # clipped by the frame: the visible centroid is not the visible face
+    if track.get("depth_status") not in DEPTH_OK:
         return False
-    return all(abs(float(s) - v) <= 0.01 * v for s, v in zip(size, voxel_size))
+    score = track.get("score")
+    return isinstance(score, (int, float)) and math.isfinite(score) and score >= SCORE_MIN
+
+
+def detector_tracks(scan, site, voxel_size, pose):
+    """Detector proposals as tracks, classified against the site the controller chose.
+
+    perception classifies loose vs protected against its own ArUco anchor, which does not exist
+    here, so everything it reports is "unassigned". This re-does that judgement against the
+    measured floor site instead: a box standing inside the footprint is part of the build and must
+    not be picked up again.
+    """
+    tracks = []
+    for item in getattr(scan, "objects", ()) or ():
+        world = item.get("world_position_m")
+        base = item.get("position_base_m")
+        if world is None or base is None:
+            continue
+        protected = site is not None and _inside_footprint(site, base, voxel_size, pose)
+        tracks.append({
+            "id": item.get("id"),
+            "world": [float(v) for v in world],
+            "pos": [float(v) for v in base],
+            "last_seen": float(item.get("last_seen", scan.ts)),
+            "current": bool(item.get("current")),
+            "size": None,                     # the detector cannot measure one
+            "classification": "protected" if protected else "loose",
+            "source": "box_detector",
+            "score": item.get("score"),
+            "label": item.get("label"),
+            "depth_status": item.get("depth_status"),
+            "partial_view": bool(item.get("partial_view")),
+            "identity_status": item.get("identity_status"),
+            "support_clearance_m": item.get("support_clearance_m"),
+        })
+    return tracks
+
+
+def _inside_footprint(site, base_point, voxel_size, pose, margin=0.04):
+    """Is a base-frame point standing inside the site's build footprint?"""
+    origin = world_to_base(site.origin, pose)
+    c, r = site.col, site.row
+    # express the offset in the site's own axes, rotated into the base frame by -yaw
+    ca, sa = math.cos(-pose.yaw), math.sin(-pose.yaw)
+    cb = (ca * c[0] - sa * c[1], sa * c[0] + ca * c[1])
+    rb = (ca * r[0] - sa * r[1], sa * r[0] + ca * r[1])
+    dx, dy = base_point[0] - origin[0], base_point[1] - origin[1]
+    u = dx * cb[0] + dy * cb[1]
+    v = dx * rb[0] + dy * rb[1]
+    return (-margin <= u <= site.dimensions[0] + margin
+            and -margin <= v <= site.dimensions[2] + margin)
 
 
 def _floor_patch(surface_cells, centre, half_extent, radius=None):
@@ -179,7 +269,10 @@ def find_clear_site(scan, requirements, settings, base_position, base_yaw, clock
     spans = (2 * half[0] / settings.resolution, 2 * half[1] / settings.resolution)
     needed = max(4, int(spans[0] * spans[1] * SITE_COVERAGE))
 
-    boxes = [d.pos for d in list(getattr(scan, "boxes", ())) + list(getattr(scan, "unknown", ()))]
+    # anything the detector currently proposes counts as an obstruction to build over,
+    # regardless of whether it passed the stricter pick policy
+    boxes = [o["position_base_m"] for o in (getattr(scan, "objects", ()) or ())
+             if o.get("position_base_m") is not None and o.get("current")]
     best = None
     steps = int(SITE_SEARCH_RADIUS / SITE_STEP)
     for ix in range(-steps, steps + 1):
@@ -282,10 +375,16 @@ class _EnrichedSession:
         if scan is None:
             return None
         self.latest_scan = scan
-        snapshot = normalize_scan(scan, self.clock(),
-                                  eligibility=lambda t: eligible_box(t, self.voxel_size))
         requirements, site_id = self.selection.snapshot_of()
         site = self.selection.get(site_id) if site_id else None
+        # Boxes come from the detector, never from markers: there are none in this world. The
+        # scan's own tracks list stays empty, so substitute the detector's proposals before
+        # normalising, classified against the site the controller actually chose.
+        source = SimpleNamespace(
+            ts=scan.ts, pose=scan.pose, warnings=getattr(scan, "warnings", []),
+            tracks=detector_tracks(scan, site, self.voxel_size, scan.pose))
+        snapshot = normalize_scan(source, self.clock(),
+                                  eligibility=lambda tr: eligible_box(tr, self.voxel_size))
         if site is not None and requirements is not None:
             cells = _envelope(requirements)
             occupancy, complete = classify_cells(scan, site, cells, self.voxel_size, self.settings)
@@ -334,6 +433,10 @@ class RobotObservations(ObservationWorker):
         self.voxel_size = tuple(voxel_size)
         self.selection = _Selection()
         self._sessions = []
+        # detector=True is not the perception default: without markers it is the only way a box is
+        # seen at all, so this provider always asks for it.
+        session_kwargs.setdefault("detector", True)
+        session_kwargs.setdefault("detector_backend", "tensorrt")
         factory = session_factory or (
             lambda: perception.PerceptionSession(mock=mock, settings=self.settings, **session_kwargs))
 
@@ -443,7 +546,15 @@ class RobotObservations(ObservationWorker):
 # independent measured evidence, which a rise in joint tracking error is not. The volume is
 # generous around the box because the cradle tilts it back against the upper arms.
 CARRY_TOLERANCE = 0.6     # fraction of a box edge the centre may sit off the cradle midpoint
-CARRY_MIN_POINTS = 8      # depth returns needed before "nothing there" means empty rather than blind
+CARRY_MIN_POINTS = 8
+
+# Markerless box selection. There are no fiducial markers on these boxes, so every box comes from
+# the YOLO-World detector and every gate below is this adapter's policy, not perception's. The
+# perception handoff asks for exactly that: a higher confidence threshold applied in an
+# adapter/selection policy rather than inside the detector.
+DETECTOR_LABEL = "cardboard_box"
+SCORE_MIN = 0.30          # handoff's recommended floor before a pickup; do not quietly go under .20
+DEPTH_OK = frozenset({"surface_supported"})   # has real depth AND rests on a measured plane      # depth returns needed before "nothing there" means empty rather than blind
 
 
 class CarryVolume:
@@ -478,9 +589,12 @@ class CarryVolume:
             return Holding("unknown", ts=scan.ts, source="carry-volume-stale")
 
         reach = self.voxel_size[0] * CARRY_TOLERANCE
-        for detection in list(getattr(scan, "boxes", ())) + list(getattr(scan, "unknown", ())):
-            if all(abs(detection.pos[i] - centre[i]) <= reach for i in range(3)):
-                return Holding("holding", detection.id, scan.ts, "carry-volume-detector")
+        for item in getattr(scan, "objects", ()) or ():
+            base = item.get("position_base_m")
+            if base is None or not item.get("current"):
+                continue
+            if all(abs(base[i] - centre[i]) <= reach for i in range(3)):
+                return Holding("holding", item.get("id"), scan.ts, "carry-volume-detector")
 
         # No box was identified there. Calling that empty needs proof the volume was actually
         # looked through, and the proof is NOT depth returns inside it -- an empty volume has

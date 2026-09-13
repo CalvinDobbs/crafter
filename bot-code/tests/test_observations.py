@@ -33,13 +33,13 @@ def pose(valid=True, epoch=3):
     return SimpleNamespace(x=0.0, y=0.0, yaw=0.0, ts=100.0, valid=valid, epoch=epoch, warning="")
 
 
-def scan(points=None, build=None, surface=(), boxes=(), ts=None, valid=True):
+def scan(points=None, build=None, surface=(), boxes=(), objects=(), ts=None, valid=True):
     # column_heights gates on real wall-clock freshness, so fixtures must be current
     ts = time.time() if ts is None else ts
     return SimpleNamespace(
         ts=ts, pose=pose(valid), build=build, points=np.array(points if points is not None else []),
         surface_cells=list(surface), boxes=list(boxes), protected=[], unknown=[],
-        tracks=[], warnings=[])
+        tracks=[], objects=list(objects), warnings=[])
 
 
 def column(x, y, z, n=40):
@@ -131,13 +131,19 @@ class SiteTests(unittest.TestCase):
         site = self.find(scan(surface=self.floor(top=0.30)))
         self.assertIsNone(site, "a raised surface is an obstruction, not a floor")
 
-    def test_a_loose_box_in_the_footprint_disqualifies_it(self):
-        # the only observed floor is one small patch, and a loose box is sitting on it
+    def test_a_detected_box_in_the_footprint_disqualifies_it(self):
+        # the only observed floor is one small patch, and the detector sees a box on it
         floor = self.floor(centre=(0.6, 0.0), span=0.2)
-        box = SimpleNamespace(id=7, pos=[0.6, 0.0, 0.1], size=0.2, color=None)
+        obj = {"position_base_m": [0.6, 0.0, 0.1], "current": True, "score": 0.7}
         self.assertIsNotNone(self.find(scan(surface=floor)), "the bare patch is sitable")
-        self.assertIsNone(self.find(scan(surface=floor, boxes=[box])),
+        self.assertIsNone(self.find(scan(surface=floor, objects=[obj])),
                           "the build must not be sited on top of its own materials")
+
+    def test_a_low_confidence_detection_still_blocks_the_footprint(self):
+        # too uncertain to PICK is not too uncertain to be in the way
+        floor = self.floor(centre=(0.6, 0.0), span=0.2)
+        faint = {"position_base_m": [0.6, 0.0, 0.1], "current": True, "score": 0.11}
+        self.assertIsNone(self.find(scan(surface=floor, objects=[faint])))
 
     def test_an_invalid_pose_yields_no_site(self):
         self.assertIsNone(self.find(scan(surface=self.floor(), valid=False)))
@@ -154,14 +160,55 @@ class SiteTests(unittest.TestCase):
         self.assertIsNone(self.find(scan(surface=self.floor(span=0.2)), extents=(8, 1, 8)))
 
 
+def proposal(**over):
+    """A detector proposal that passes every gate, so each test can spoil exactly one."""
+    base = {"source": "box_detector", "label": "cardboard_box", "current": True,
+            "classification": "loose", "identity_status": "tracked", "partial_view": False,
+            "depth_status": "surface_supported", "score": 0.62, "size": None}
+    base.update(over)
+    return base
+
+
 class EligibilityTests(unittest.TestCase):
-    def test_only_current_loose_correctly_sized_boxes_are_eligible(self):
-        good = {"current": True, "classification": "loose", "size": 0.2}
-        self.assertTrue(observations.eligible_box(good, VOXEL))
-        for bad in ({**good, "current": False}, {**good, "classification": "protected"},
-                    {**good, "classification": "unknown"}, {**good, "size": 0.5},
-                    {**good, "size": None}):
-            self.assertFalse(observations.eligible_box(bad, VOXEL), bad)
+    """There are no markers in this world, so every box is a detector proposal and every gate
+    here is a confidence policy over evidence rather than a measurement."""
+
+    def test_a_confident_supported_proposal_is_eligible(self):
+        self.assertTrue(observations.eligible_box(proposal(), VOXEL))
+
+    def test_an_unmeasured_size_does_not_disqualify_it(self):
+        # the detector cannot measure a box; requiring a size would mean fabricating one
+        self.assertTrue(observations.eligible_box(proposal(size=None), VOXEL))
+
+    def test_low_confidence_is_rejected(self):
+        self.assertFalse(observations.eligible_box(proposal(score=0.19), VOXEL))
+        self.assertFalse(observations.eligible_box(proposal(score=None), VOXEL))
+
+    def test_the_policy_floor_is_not_quietly_below_the_handoff_minimum(self):
+        self.assertGreaterEqual(observations.SCORE_MIN, 0.20)
+
+    def test_a_proposal_without_a_support_plane_is_rejected(self):
+        # flat floor or wall reads as box-shaped; the support plane is what separates them
+        for status in ("missing", "background_or_flat_surface", "weak_no_support_plane",
+                       "inconsistent_depth"):
+            self.assertFalse(observations.eligible_box(proposal(depth_status=status), VOXEL), status)
+
+    def test_a_clipped_proposal_is_rejected(self):
+        # a box half out of frame has a centroid that is not its visible face
+        self.assertFalse(observations.eligible_box(proposal(partial_view=True), VOXEL))
+
+    def test_ambiguous_or_stale_identity_is_rejected(self):
+        for status in ("ambiguous", "pose_epoch_changed"):
+            self.assertFalse(observations.eligible_box(proposal(identity_status=status), VOXEL), status)
+
+    def test_a_remembered_proposal_is_rejected(self):
+        self.assertFalse(observations.eligible_box(proposal(current=False), VOXEL))
+
+    def test_a_box_inside_the_build_footprint_is_protected_not_material(self):
+        self.assertFalse(observations.eligible_box(proposal(classification="protected"), VOXEL))
+
+    def test_a_non_detector_track_is_rejected(self):
+        self.assertFalse(observations.eligible_box(proposal(source="aruco"), VOXEL))
 
 
 if __name__ == "__main__":
@@ -177,16 +224,17 @@ class CarryVolumeTests(unittest.TestCase):
         return observations.CarryVolume(holder, rig, VOXEL, settings=SETTINGS)
 
     def box(self, pos, mid=7):
-        return SimpleNamespace(id=mid, pos=list(pos), size=0.2, color=None)
+        """A detector proposal sitting at pos."""
+        return {"id": mid, "position_base_m": list(pos), "current": True, "score": 0.7}
 
     def test_a_box_in_the_volume_is_possession_with_its_identity(self):
-        s = scan(boxes=[self.box((0.4, 0.0, 0.3))])
+        s = scan(objects=[self.box((0.4, 0.0, 0.3))])
         held = self.source(s).holding()
         self.assertEqual((held.status, held.box_id), ("holding", 7))
         self.assertEqual(held.source, "carry-volume-detector")
 
     def test_a_box_outside_the_volume_is_not_possession(self):
-        s = scan(boxes=[self.box((1.4, 0.0, 0.3))])
+        s = scan(objects=[self.box((1.4, 0.0, 0.3))])
         self.assertNotEqual(self.source(s).holding().status, "holding")
 
     def test_no_scan_is_unknown(self):
@@ -223,5 +271,5 @@ class CarryVolumeTests(unittest.TestCase):
         self.assertEqual(self.source(scan(points=inside)).holding().status, "unknown")
 
     def test_evidence_carries_the_measurement_time_not_the_read_time(self):
-        s = scan(boxes=[self.box((0.4, 0.0, 0.3))])
+        s = scan(objects=[self.box((0.4, 0.0, 0.3))])
         self.assertEqual(self.source(s).holding().ts, s.ts)
