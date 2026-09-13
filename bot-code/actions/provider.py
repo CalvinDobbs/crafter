@@ -81,6 +81,8 @@ CARRY_OMEGA = 0.10          # rad/s while loaded; a cradled box is held by squee
 SURVEY_STATIONS = 8     # yaw stops around a full turn
 SURVEY_YAW_RATE = 0.4   # rad/s, well under drive.max_angular_vel (0.9)
 SURVEY_SETTLE_S = 1.2   # dwell per station, comfortably past perception's 0.8 s freshness budget
+FACE_ATTEMPTS = 3       # turns allowed to settle onto the best candidate before giving up
+FACE_TOL = 0.17         # rad (~10 deg); close enough to the optical axis to score properly
 # The hardware's inverted yaw is handled once, in armctl.set_twist; everything here is +CCW.
 
 
@@ -170,39 +172,56 @@ def look_around(executor, request):
     # nothing ever turns to look at it. Facing it costs one short turn and is reversible.
     face_best = request.get("face_best")
     if face_best is not None:
-        try:
-            best = face_best()
-        except Exception as exc:
-            best, _ = None, executor.log(f"[provider] could not pick a heading to face: {exc!r}")
-        if best and abs(best["bearing"]) > armctl.YAW_TOL:
-            executor.log(f"[provider] facing best candidate: bearing {np.degrees(best['bearing']):+.0f} deg,"
-                         f" score {best['score']:.2f}, range {best['range']:.2f} m,"
-                         f" {'seen now' if best.get('current') else 'remembered from the sweep'}")
-            turned = rig.turn_by(best["bearing"], SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
-            executor.log(f"[provider] facing turn asked {np.degrees(best['bearing']):+.0f} deg, "
-                         f"achieved {np.degrees(turned):+.0f} deg"
-                         if turned is not None else "[provider] facing turn ran open-loop")
-            # Did it actually end up pointed at anything? Facing has been assumed to work rather
-            # than checked, and a survey that reports success while aimed at nothing is worse
-            # than one that admits it missed.
-            armctl.dwell(SURVEY_SETTLE_S, cancel)
-            try:
-                after = face_best()
-            except Exception:
-                after = None
-            if after:
-                executor.log(f"[provider] after facing: best is {np.degrees(after['bearing']):+.0f} deg"
-                             f" off, score {after['score']:.2f}, range {after['range']:.2f} m")
-            else:
-                executor.log("[provider] after facing: nothing visible at all")
-        elif best:
-            executor.log(f"[provider] best candidate already ahead (score {best['score']:.2f})")
-        else:
-            executor.log("[provider] nothing found to face")
+        _settle_onto_best(executor, rig, face_best, cancel)
 
     executor.phase("settling")
     armctl.dwell(SURVEY_SETTLE_S, cancel)
     return "completed"
+
+
+def _settle_onto_best(executor, rig, face_best, cancel):
+    """Turn toward the best candidate, look again, and repeat until it is actually ahead.
+
+    One turn is not enough. It aims at where the strongest candidate was, and after turning,
+    whatever is strongest may still be well off to one side -- observed live at 20 degrees off,
+    which on a wide-angle frame is exactly where a box stays small, distorted and badly scored.
+    Looking again after moving is what a person does, and it is cheap: the robot is stationary
+    between turns and the only cost is a couple of seconds.
+
+    Bounded, and it stops as soon as it stops helping, so a scene with nothing worth facing
+    cannot turn this into a spin.
+    """
+    previous = None
+    for attempt in range(FACE_ATTEMPTS):
+        try:
+            best = face_best()
+        except Exception as exc:
+            executor.log(f"[provider] could not pick a heading to face: {exc!r}")
+            return
+        if not best:
+            executor.log("[provider] nothing found to face")
+            return
+        bearing = best["bearing"]
+        if abs(bearing) <= FACE_TOL:
+            executor.log(f"[provider] candidate is ahead: {np.degrees(bearing):+.0f} deg off, "
+                         f"score {best['score']:.2f}, range {best['range']:.2f} m")
+            return
+        if previous is not None and abs(bearing) > previous - FACE_TOL / 2:
+            # No better than last time: the strongest candidate is probably jumping between
+            # objects, and turning again would just chase it around the room.
+            executor.log(f"[provider] facing stopped improving at {np.degrees(bearing):+.0f} deg off")
+            return
+        previous = abs(bearing)
+        executor.log(f"[provider] facing candidate {attempt + 1}/{FACE_ATTEMPTS}: "
+                     f"{np.degrees(bearing):+.0f} deg off, score {best['score']:.2f}, "
+                     f"range {best['range']:.2f} m, "
+                     f"{'seen now' if best.get('current') else 'remembered'}")
+        turned = rig.turn_by(bearing, SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
+        if turned is not None:
+            executor.log(f"[provider]   asked {np.degrees(bearing):+.0f}, "
+                         f"achieved {np.degrees(turned):+.0f} deg")
+        armctl.dwell(SURVEY_SETTLE_S, cancel)
+    executor.log(f"[provider] still not centred after {FACE_ATTEMPTS} attempts")
 
 
 def approach_box(executor, request):

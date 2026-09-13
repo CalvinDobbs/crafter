@@ -308,6 +308,41 @@ class FaceBestTests(unittest.TestCase):
         provider.look_around(self.executor, {"stations": 2, "face_best": face_best})
         return self.rig.yaw - start
 
+    def test_it_looks_again_and_turns_until_the_candidate_is_ahead(self):
+        """One turn is not enough: what is strongest after turning may still be off to a side."""
+        bearings = iter([0.6, 0.35, 0.05, 0.05])
+        seen = []
+
+        def face_best():
+            b = next(bearings, 0.05)
+            seen.append(b)
+            return {"bearing": b, "score": 0.2, "range": 1.4, "current": True}
+
+        provider.look_around(self.executor, {"stations": 2, "face_best": face_best})
+        self.assertGreaterEqual(len(seen), 3, "it must re-check after turning, not turn once")
+
+    def test_it_stops_once_the_candidate_is_ahead(self):
+        calls = []
+
+        def face_best():
+            calls.append(1)
+            return {"bearing": 0.02, "score": 0.5, "range": 1.0, "current": True}
+
+        provider.look_around(self.executor, {"stations": 2, "face_best": face_best})
+        self.assertEqual(len(calls), 1, "already ahead means no turn and no second look")
+
+    def test_it_gives_up_rather_than_chasing_a_jumping_candidate(self):
+        # the strongest detection hops between objects; turning again just chases it
+        def face_best():
+            return {"bearing": 0.6, "score": 0.2, "range": 1.4, "current": True}
+
+        turns = []
+        real = self.rig.turn_by
+        self.rig.turn_by = lambda *a, **k: (turns.append(1), real(*a, **k))[1]
+        provider.look_around(self.executor, {"stations": 2, "face_best": face_best})
+        self.assertLessEqual(len(turns), 2 + provider.FACE_ATTEMPTS,
+                             "a candidate that never improves must not become a spin")
+
     def test_it_turns_to_face_the_best_candidate(self):
         # two stations of 2*pi/2 sweep a full turn; facing a candidate adds its bearing on top
         swept = self.survey(lambda: {"bearing": 0.6, "score": 0.18, "range": 1.5})
