@@ -6,13 +6,13 @@
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
 # ///
-"""Spread the arms, lower short of the calibrated bottom, and squeeze inward around a box.
+"""Spread the arms, turn the wrists inward, lower with clearance, and squeeze around a box.
 
-By default, bring the arms inward after descent and hold the squeeze until Ctrl+C
-(or --hold SECS). Torque stays on during the hold; exiting disables torque and
-releases the box. --lower-only stops before grasping. --pickup opts into the extra
-hook, grip, cradle and lift stages. The bottom margin is a lift offset, not a measured
-floor distance.
+By default, prepare the wrists at the top before descent, then bring the arms inward
+and hold the squeeze until Ctrl+C (or --hold SECS). Torque stays on during the hold;
+exiting disables torque and releases the box. --lower-only skips wrist preparation
+and grasping. --pickup opts into the extra grip, cradle and lift stages. The bottom
+margin is a lift offset, not a measured floor distance.
 
 Joint-space, no IK. Stages:
   1. elbow (J3) -> 90 deg, held until the optional cradle so the forearm clears the table
@@ -20,25 +20,24 @@ Joint-space, no IK. Stages:
   3. lift (J0) -> top
   4. spread: both arms swing J2 (the sideways swing) OUT to the calibrated edge of their range,
      so the forearms straddle a box much wider than the shoulders
-  5. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
-  6. cage the box:
+  5. prepare wrists: J5 yaw, blended with J6 to keep the hand level, turns each hand inward
+     toward the box while J0 stays at the top; --hook caps travel and 0 skips this stage
+  6. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
+  7. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
-          (tracking error rises), then holds a small fixed squeeze past contact; hold here by default
-       b. with --pickup, hook: the wrist (J5 yaw, blended with J6 so the hand stays level) turns each hand inward
-          across the FRONT face of the box until it meets the box (or reaches the hook angle), so
-          the box cannot slide forward out of the pinch; the upper arms already bound the back face
-       c. with --pickup, grip: grippers close (on a rim/corner if there is one; otherwise they just stiffen the
+          (tracking error rises), then holds --squeeze turns past contact; hold here by default
+       b. with --pickup, grip: grippers close (on a rim/corner if there is one; otherwise they just stiffen the
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
-       d. with --pickup, cradle: the elbows flex a little past 90 deg, lifting the front edge of the box so it
+       c. with --pickup, cradle: the elbows flex a little past 90 deg, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
-  7. with --pickup, shoot J0 back up to the top (shoulder level) and hold
+  8. with --pickup, shoot J0 back up to the top (shoulder level) and hold
 All other joints hold their live pose. Range edges come from the per-robot
 ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outward" and
 "inward" signs are per-arm (the arms are mirror images in motor-turn space) and are derived
 from FK, never hard-coded.
 
 Usage:  uv run pickup.py [--arm left|right|both] [--speed TURNS_PER_S] [--hold SECS]
-                         [--bottom-margin TURNS] [--spread TURNS]
+                         [--bottom-margin TURNS] [--spread TURNS] [--squeeze TURNS]
                          [--lower-only | --pickup] [--hook TURNS] [--cradle TURNS]
 """
 import argparse
@@ -59,7 +58,7 @@ WRIST_PITCH = 6         # tips the hand about base y; blended with J5 so the hoo
 GRIPPER = 7
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
-J0_BOTTOM_MARGIN = 0.5
+J0_BOTTOM_MARGIN = 0.75
 LIFT_SPEED = 1.2        # turns/s for the final shoot-up
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
 ELBOW_SETTLE_S = 0.5    # let the forearm stop swinging before the lift moves
@@ -75,7 +74,7 @@ SPREAD_SPEED = 0.15     # turns/s swinging the whole arm out (J2 carries the arm
 SPREAD_SETTLE_S = 0.5   # let the arms stop swinging before the lift moves
 PINCH_SPEED = 0.05      # turns/s J2 creep toward the box
 PINCH_CONTACT_ERR = 0.015   # turns of J2 tracking error that counts as touching the box (no-load ~0.002)
-PINCH_SQUEEZE = 0.02    # turns commanded past the contact point: a steady spring squeeze. TUNE on box
+PINCH_SQUEEZE = 0.03    # turns commanded past the contact point: a steady spring squeeze. TUNE on box
 PINCH_SETTLE_S = 0.5    # let the squeeze load up before hooking
 HOOK_SPEED = 0.08       # turns/s wrist creep, hand turning in across the front of the box
 HOOK_MAX_TRAVEL = 0.22  # turns (~80 deg) of wrist travel when nothing stops the hand earlier
@@ -322,16 +321,23 @@ def main():
                     help="J0 turns above the calibrated bottom; larger values stop higher (default: %(default)s)")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--lower-only", action="store_true", help="hold the spread low pose without grasping")
-    mode.add_argument("--pickup", action="store_true", help="continue after the inward grasp into hook, grip, cradle and lift")
+    mode.add_argument("--pickup", action="store_true", help="continue after the inward grasp into grip, cradle and lift")
     ap.add_argument("--spread", type=float, default=None,
                     help="cap the outward J2 swing at this many turns from the start pose (default: full calibrated range)")
-    ap.add_argument("--hook", type=float, default=HOOK_MAX_TRAVEL, help="max wrist-yaw turns for the hook; 0 disables")
+    ap.add_argument("--hook", type=float, default=HOOK_MAX_TRAVEL,
+                    help="max blended wrist-joint travel in turns inward before descent; 0 disables (default: %(default)s)")
+    ap.add_argument("--squeeze", type=float, default=PINCH_SQUEEZE,
+                    help="extra inward J2 turns past detected contact, capped by calibration (default: %(default)s)")
     ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex in turns after gripping; 0 disables")
     args = ap.parse_args()
     for name in ("speed", "bottom_margin"):
         value = getattr(args, name)
         if not np.isfinite(value) or value <= 0:
             ap.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
+    for name in ("hook", "squeeze"):
+        value = getattr(args, name)
+        if not np.isfinite(value) or value < 0:
+            ap.error(f"--{name} must be finite and nonnegative")
     if args.hold is not None and (not np.isfinite(args.hold) or args.hold < 0):
         ap.error("--hold must be finite and nonnegative")
     hold_description = "until Ctrl+C" if args.hold is None else f"for {args.hold:.1f}s"
@@ -380,6 +386,16 @@ def main():
         settle_joint(arms, SWING)
         hold(arms, SPREAD_SETTLE_S)
 
+        if not args.lower_only and args.hook > 0:
+            print("[pickup] prepare grasp: wrists -> inward before descent", flush=True)
+            creep_to_contact(arms, hook_direction, HOOK_SPEED, HOOK_CONTACT_ERR, HOOK_SQUEEZE,
+                             max_travel=args.hook, label="wrist inward")
+            settle_joint(arms, WRIST_YAW)
+            settle_joint(arms, WRIST_PITCH)
+            hold(arms, TOP_SETTLE_S)
+        if _stop:
+            return
+
         low_targets = [j0_low_target(a.top, a.bottom, args.bottom_margin) for a in arms]
         for a, target in zip(arms, low_targets):
             print(f"[pickup] {a.side}: low J0 target {target:+.3f} (bottom {a.bottom:+.3f}, margin {args.bottom_margin:.3f})", flush=True)
@@ -395,7 +411,7 @@ def main():
             return
 
         print("[pickup] grasp: swing elbows inward (J2), keeping elbow bend (J3) at 90 deg", flush=True)
-        creep_to_contact(arms, pinch_direction, PINCH_SPEED, PINCH_CONTACT_ERR, PINCH_SQUEEZE,
+        creep_to_contact(arms, pinch_direction, PINCH_SPEED, PINCH_CONTACT_ERR, args.squeeze,
                          max_travel=np.inf, label="pinch")
         hold(arms, PINCH_SETTLE_S)
 
@@ -403,11 +419,6 @@ def main():
             print(f"[pickup] holding inward squeeze {hold_description}; torque drops on exit and releases the box", flush=True)
             hold(arms, args.hold)
             return
-
-        if args.hook > 0:
-            print("[pickup] cage: hook hands across the front", flush=True)
-            creep_to_contact(arms, hook_direction, HOOK_SPEED, HOOK_CONTACT_ERR, HOOK_SQUEEZE,
-                             max_travel=args.hook, label="hook")
 
         print("[pickup] cage: grippers -> closed", flush=True)
         ramp_joint(arms, GRIPPER, [a.grip_closed for a in arms], GRIP_SPEED)
