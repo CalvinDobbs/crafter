@@ -114,20 +114,20 @@ class VoxelView {
     this.canvas.width = Math.round(bounds.width * ratio); this.canvas.height = Math.round(bounds.height * ratio);
     const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    ctx.fillStyle = '#18191b'; ctx.fillRect(0, 0, this.width, this.height);
+    ctx.fillStyle = '#f7f3ee'; ctx.fillRect(0, 0, this.width, this.height);
     const span = Math.max(...this.extents, 2);
     this.scale = Math.min(this.width, this.height) * .68 / (span + 1.6) * this.zoom;
     this.distance = span * 4 + 12;
     const radius = Math.min(Math.ceil(span / 2) + 4, 40);
     const cx = this.center[0], cz = this.center[2];
     for (let i = -radius; i <= radius; i++) {
-      this.line([cx + i, -.035, cz - radius], [cx + i, -.035, cz + radius], i === 0 ? '#343737' : '#272b2b', .8);
-      this.line([cx - radius, -.035, cz + i], [cx + radius, -.035, cz + i], i === 0 ? '#343737' : '#272b2b', .8);
+      this.line([cx + i, -.035, cz - radius], [cx + i, -.035, cz + radius], i === 0 ? '#d8c3b9' : '#e8dfd7', .8);
+      this.line([cx - radius, -.035, cz + i], [cx + radius, -.035, cz + i], i === 0 ? '#d8c3b9' : '#e8dfd7', .8);
     }
     if (this.blocks.length) {
       const footprint = [[0, -.02, 0], [this.extents[0], -.02, 0], [this.extents[0], -.02, this.extents[2]], [0, -.02, this.extents[2]]];
-      this.path(footprint.map(p => this.project(p))); ctx.fillStyle = '#e9ad6907'; ctx.fill();
-      ctx.strokeStyle = '#8d704545'; ctx.setLineDash([4, 5]); ctx.stroke(); ctx.setLineDash([]);
+      this.path(footprint.map(p => this.project(p))); ctx.fillStyle = '#b8494608'; ctx.fill();
+      ctx.strokeStyle = '#b987805e'; ctx.setLineDash([4, 5]); ctx.stroke(); ctx.setLineDash([]);
     }
     const definitions = [
       {v: [0, 1, 2, 3], color: '#ad793f'}, {v: [4, 7, 6, 5], color: '#c08a4e'},
@@ -152,9 +152,9 @@ class VoxelView {
     this.faces = faces;
     for (const face of faces) {
       this.path(face.points);
-      ctx.fillStyle = face.ghost ? (face.active ? '#e9ad693b' : '#a7b4ae10') : face.color;
+      ctx.fillStyle = face.ghost ? (face.active ? '#b8494630' : '#aa92821a') : face.color;
       ctx.fill();
-      ctx.strokeStyle = face.active ? '#ffd499' : face.placed ? '#a2caae' : face.ghost ? '#64716965' : '#533c2690';
+      ctx.strokeStyle = face.active ? '#b84946' : face.placed ? '#397253' : face.ghost ? '#9f897a' : '#533c2690';
       ctx.lineWidth = face.active ? 2 : 1;
       ctx.stroke();
       if (!face.ghost && (face.face === 3 || face.face === 0 || face.face === 1)) {
@@ -164,7 +164,7 @@ class VoxelView {
         ctx.fillStyle = face.face === 3 ? '#f3dbab65' : '#e7be7e5e'; ctx.fill();
       }
     }
-    ctx.font = '9px ui-monospace, monospace'; ctx.fillStyle = '#606961';
+    ctx.font = '9px ui-monospace, monospace'; ctx.fillStyle = '#79675c';
     ctx.fillText(this.blocks.length ? 'RELATIVE ARRANGEMENT / 1 BLOCK = 1 BOX' : 'AWAITING MINECRAFT INPUT', 17, this.height - 15);
   }
   pick(event) {
