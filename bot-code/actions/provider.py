@@ -67,7 +67,10 @@ HOME_JOINTS = (1, 2, 4, 5, 6)   # returned to configured home while raised, duri
 
 # Driving. The standoff is what leaves the box inside the forearm spread when pickup starts, so
 # it is geometry, not preference: MEASURE it against the arms rather than trusting this default.
-APPROACH_STANDOFF = 0.45    # m from base centre to box centre when the approach completes. TUNE
+# Measured to the box's VISIBLE FACE, which is what the detector reports -- not to its centre.
+# Chosen to leave the box at the robot's feet: the base half-width is about 0.16 m, so this puts
+# the near face roughly a hand's width off the front of the base, where the arms can straddle it.
+APPROACH_STANDOFF = 0.30
 BUILD_STANDOFF = 0.55       # m from base centre to the target cell. TUNE
 CARRY_SPEED = 0.05          # m/s while loaded; slower than an empty approach
 CARRY_OMEGA = 0.10          # rad/s while loaded; a cradled box is held by squeeze, not a grip

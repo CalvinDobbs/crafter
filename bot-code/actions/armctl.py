@@ -78,6 +78,7 @@ DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
 ALIGN_TOL = 0.05        # rad; inside this the base is considered pointed at the target
 RANGE_TOL = 0.02        # m; inside this the standoff is reached
+ARRIVED_MARGIN = 0.15   # m past the standoff within which losing sight counts as arriving
 STUCK_S = 15.0          # no range progress for this long = give up rather than grind
 STUCK_EPS = 0.01        # m of range change that counts as progress
 DRIVE_TIMEOUT_S = 120.0
@@ -476,13 +477,26 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
     """
     t0 = time.monotonic()
     best_range, last_progress = float("inf"), t0
+    last_distance = float("inf")
     try:
         while True:
             if cancel is not None and cancel.is_set():
                 raise Cancelled("cancelled while driving")
-            target = target_fn()
+            try:
+                target = target_fn()
+            except Exception:
+                # Losing the target is fatal at range and expected on arrival: a floor-level box
+                # drops out of a forward-looking camera once the robot is nearly on top of it.
+                # Only the second reading counts as arriving, and only because the distance
+                # measured a moment ago says the robot is already there.
+                if last_distance <= standoff + ARRIVED_MARGIN:
+                    log(f"[armctl] target left view at {last_distance:.2f}m, inside the standoff; "
+                        f"treating as arrived")
+                    return last_distance
+                raise
             bearing = math.atan2(target[1], target[0])
             distance = math.hypot(target[0], target[1])
+            last_distance = distance
 
             if distance < best_range - STUCK_EPS:
                 best_range, last_progress = distance, time.monotonic()
