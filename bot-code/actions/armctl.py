@@ -76,7 +76,6 @@ IMU_STALE_S = 0.5       # hold the last heading this long; past it the stream is
 YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believed
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
-ALIGN_TOL = 0.05        # rad; inside this the base is considered pointed at the target
 TURN_FIRST = 0.60       # rad; beyond this, turn in place -- arcing from here swings wide
 STEER_GAIN = 1.5        # rad/s of correction per rad of bearing error while driving
 STEER_SLOWING = 0.6     # how much a hard correction cuts forward speed, so the arc stays tight
