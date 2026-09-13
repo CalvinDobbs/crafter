@@ -419,7 +419,7 @@ class PanelAssetsTests(unittest.TestCase):
             };
             const now=Date.now()/1000;
             const design={id:'1',received_at:now,count:4,blocks:[{x:0,y:0,z:0},{x:1,y:0,z:0},{x:0,y:0,z:1},{x:0,y:1,z:0}],size:[2,2,2],source:'Example',buildable:true};
-            const base={revision:1,view:'main',design,job:null,notice:'',receiver:{listening:true,port:5005},worker_busy:false,llm_ready:true,model:'offline-layout-test',csrf:'layout-only',simulation:true};
+            const base={revision:1,view:'main',design,job:null,notice:'',receiver:{listening:true,port:5005},worker_busy:false,llm_ready:true,model:'offline-layout-test',csrf:'layout-only',debug_kind:'this robot, in process'};
             const job={id:'layout-job',design,status:'running',phase:'BUILD',reasoning:'Inspect the supported target before placing the next box. '.repeat(9),placed:[],started_at:now,finished_at:null,llm_calls:20,tool_calls:30,current_tool:'place',current_cell:[0,0,0],error:null,events:Array.from({length:40},(_,i)=>({id:i+1,type:'placement_confirmed',at:now+i,data:{box_id:i,cell:[0,0,0]}}))};
             const failures=[];
             const viewports=[[1600,900],[1280,720],[1280,600],[1024,640],[1024,576],[800,600],[640,480],[390,844],[320,568],[844,390]];
@@ -449,7 +449,7 @@ class PanelAssetsTests(unittest.TestCase):
                             const background=getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).map(Number);
                             if(Math.min(...background)<230)problems.push('page background is not light');
                             if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
-                            const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#load-example','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
+                            const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
                             controls.push('.brand-logo','.header-status');
                             const logo=document.querySelector('.brand-logo'),brand=logo.getBoundingClientRect(),status=document.querySelector('.header-status').getBoundingClientRect();
                             if(!logo.complete||!logo.naturalWidth)problems.push('brand logo did not load');
@@ -565,7 +565,7 @@ class PanelAssetsTests(unittest.TestCase):
                     const problems=await evaluate(`(()=>{
                         const problems=[],root=document.documentElement;
                         if(document.getElementById('debug-screen').hidden)problems.push('debug screen did not open');
-                        if(!document.getElementById('workflow').hidden)problems.push('build workflow still shown');
+                        if(document.querySelector('[data-step]'))problems.push('build workflow still present');
                         if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('shell scrolls: '+root.scrollWidth+'x'+root.scrollHeight);
                         const scrollers=[...document.querySelectorAll('#debug-screen .debug-column, #debug-screen .debug-layout')]
                             .filter(node=>/auto|scroll/.test(getComputedStyle(node).overflowY));

@@ -362,17 +362,8 @@ function renderFeed(job) {
 function render(s) {
   const screen = s.view || 'main', design = s.design, job = s.job;
   for (const section of document.querySelectorAll('[data-screen]')) section.hidden = section.dataset.screen !== screen;
-  const order = ['main', 'build', 'complete'];
-  for (const step of document.querySelectorAll('[data-step]')) {
-    step.classList.toggle('active', step.dataset.step === screen);
-    step.classList.toggle('passed', order.indexOf(step.dataset.step) < order.indexOf(screen));
-  }
-  byId('workflow').hidden = screen === 'debug';
   if (window.debugScreen) window.debugScreen.sync(s);
-  const connection = byId('connection');
-  connection.classList.toggle('offline', !connected);
-  connection.lastChild.textContent = connected ? 'Panel online' : 'Disconnected';
-  text('main-title', design ? 'A shape worth building.' : 'Your next build starts here.');
+  byId('connection').hidden = connected;
   byId('configuration-warning').hidden = s.llm_ready;
   byId('save-api-key').disabled = submitting || s.worker_busy;
   byId('waiting').hidden = !!design;
@@ -381,12 +372,6 @@ function render(s) {
   const enabled = !!(connected && design && design.buildable && s.llm_ready && !s.worker_busy && !submitting);
   byId('start-build').disabled = !enabled;
   byId('clear-blueprint').disabled = !connected || !design || submitting;
-  text('start-hint', s.worker_busy && screen === 'main' ? 'Finishing the previous run. You can start again shortly.' : !design ? 'Receive a design to get started.' : !design.buildable ? 'Adjust the schematic and scan it again.' : 'Ready when you are.');
-  byId('load-example').disabled = submitting;
-  text('receiver-detail', s.receiver.listening ? `Minecraft receiver ready on TCP :${s.receiver.port} · latest design only` : s.receiver.error || 'Minecraft receiver is starting');
-  document.querySelector('.receiver-port').textContent = `TCP :${s.receiver.port}`;
-  const receiveLabel = document.querySelector('#main-screen .live-label');
-  receiveLabel.lastChild.textContent = s.receiver.listening ? 'Listening for designs' : 'Receiver unavailable';
   byId('receive-notice').hidden = !s.notice;
   if (s.notice) text('receive-notice', s.notice);
   scene('main', design, 'design', [], null);
@@ -436,7 +421,6 @@ byId('clear-blueprint').addEventListener('click', () => { if (state && state.des
 byId('cancel-build').addEventListener('click', () => command('/api/cancel', {job_id: state.job.id}));
 byId('failed-back').addEventListener('click', () => command('/api/main'));
 byId('back-main').addEventListener('click', () => command('/api/main'));
-byId('load-example').addEventListener('click', () => command('/api/example'));
 byId('api-key-form').addEventListener('submit', async event => {
   event.preventDefault();
   const input = byId('api-key');
@@ -456,7 +440,7 @@ async function poll() {
   } catch (error) {
     connected = false;
     if (state) render(state);
-    else { byId('connection').classList.add('offline'); byId('connection').lastChild.textContent = 'Disconnected'; }
+    else byId('connection').hidden = false;
   } finally { setTimeout(poll, 350); }
 }
 poll();

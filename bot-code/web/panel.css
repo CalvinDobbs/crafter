@@ -26,14 +26,6 @@ code{font-size:12px}
 .connection i,.signal-dot,.live-label i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--green)}
 .connection.offline i{background:var(--red)}
 .shell{max-width:1440px;margin:auto;padding:30px 40px 0}
-.workflow{display:flex;gap:18px;align-items:center;color:var(--faint);font-size:12px}
-.workflow span{display:flex;align-items:center;gap:7px}
-.workflow b{font-family:var(--mono);font-size:10px;display:flex;align-items:center;justify-content:center;width:22px;height:22px;border:1px solid var(--line);border-radius:50%;font-weight:400}
-.workflow i{height:1px;width:48px;background:var(--line)}
-.workflow .active{color:var(--accent)}
-.workflow .active b{border-color:var(--accent-line);background:var(--accent-soft)}
-.workflow .passed{color:var(--green)}
-.workflow .passed b{border-color:var(--success-line)}
 .page-heading{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:31px 0 27px}
 .eyebrow{font:10px var(--mono);letter-spacing:.16em;color:var(--accent);margin-bottom:10px}
 h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing:-1.25px}
@@ -62,7 +54,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .waiting-icon svg{height:48px;width:48px;fill:none;stroke:var(--accent);stroke-width:1.1;stroke-linejoin:round}
 .waiting h2{font-size:19px;letter-spacing:-.4px;font-weight:450}
 .waiting p{font-size:12px;color:var(--muted);line-height:1.9;margin-top:10px}
-.receiver-port{font-size:10px;letter-spacing:.06em;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:3px 9px;margin-top:19px}
 .selection{position:absolute;bottom:14px;left:16px;pointer-events:none;padding:9px 12px;background:#ffffffed;border:1px solid var(--accent-line);border-radius:6px;font:11px var(--mono);color:var(--accent)}
 .design-sidebar{display:flex;flex-direction:column;gap:15px}
 .info-card{border:1px solid var(--line);background:var(--surface);padding:19px;border-radius:10px}
@@ -96,9 +87,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .button-hint{color:var(--faint);font-size:10px;text-align:center;line-height:1.5;margin-top:-7px}
 .inline-warning{padding:12px 15px;font-size:11px;line-height:1.6;background:#fff2ee;border:1px solid var(--accent-line);color:#873c36;border-radius:7px;overflow-wrap:anywhere}
 .inline-warning code{font-size:10px}
-.bottom-note{display:flex;align-items:center;justify-content:space-between;padding-top:17px;gap:12px;color:var(--faint);font-size:10px}
-.bottom-note>span{display:flex;align-items:center;gap:8px}
-.signal-dot{width:4px;height:4px}
 .text-button{border:0;background:transparent;color:var(--muted);padding:4px 0;font-size:11px}
 .text-button:hover{color:var(--accent)}
 .text-button span{color:var(--accent);margin-left:5px}
@@ -193,8 +181,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .header-status{gap:12px}
 .header-status>.badge{font-size:8px}
 .connection{font-size:10px}
-.workflow{gap:12px}
-.workflow i{width:32px}
 .page-heading{padding:27px 0 22px;align-items:flex-start}
 .page-heading h1{font-size:28px}
 .page-heading p{max-width:310px;font-size:12px}
@@ -244,11 +230,10 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 #api-key-form .button{font-size:10px;min-height:36px;padding:7px 9px}
 html{height:100%}
 body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
-.topbar{flex:none;height:clamp(52px,9dvh,78px);padding-inline:clamp(16px,3vw,40px)}
+.topbar{flex:none;height:clamp(58px,10.5dvh,96px);padding-inline:clamp(16px,3vw,40px)}
 .brand{min-width:0;height:100%;padding-block:4px}
-.brand-logo{display:block;width:auto;height:clamp(40px,7.5dvh,66px);max-width:36vw;max-height:100%;object-fit:contain}
+.brand-logo{display:block;width:auto;height:clamp(46px,9dvh,84px);max-width:40vw;max-height:100%;object-fit:contain}
 .shell{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;margin:0 auto;padding:clamp(10px,2dvh,22px) clamp(16px,3vw,40px) 0;overflow:hidden}
-.workflow{flex:none}
 [data-screen]{flex:1;min-height:0;display:flex;flex-direction:column}
 .page-heading{flex:none;gap:16px;padding:clamp(12px,2.5dvh,24px) 0}
 .page-heading>div{min-width:0}
@@ -302,15 +287,12 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 @container(max-height:240px){.waiting-icon{display:none}
 .waiting h2{font-size:16px}
 .waiting p{font-size:10px;line-height:1.5;margin-top:6px}
-.receiver-port{margin-top:8px}
 }
-@container(max-height:140px){.waiting p,.waiting .receiver-port{display:none}
+@container(max-height:140px){.waiting p{display:none}
 }
 @media(max-height:600px){.page-heading{padding:8px 0}
 .page-heading .eyebrow,.page-heading p,.page-footer{display:none}
 .page-heading h1{font-size:24px}
-.workflow b{width:18px;height:18px}
-.workflow{font-size:10px}
 .thinking-card{max-height:64px}
 .build-left{gap:8px}
 .complete-check{width:36px;height:36px;margin-bottom:10px}
@@ -320,8 +302,6 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .brand-mark{width:23px}
 .header-status{gap:8px}
 .shell{padding-inline:12px}
-.workflow{gap:8px}
-.workflow i{width:24px}
 .page-heading{gap:10px;padding:10px 0}
 .page-heading h1{font-size:24px}
 .page-heading p,.page-heading .eyebrow{display:none}

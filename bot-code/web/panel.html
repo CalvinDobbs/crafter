@@ -14,20 +14,18 @@
     <a class="brand" href="/" aria-label="Crafter home">
       <img class="brand-logo" src="/assets/Crafter-transparent.svg" alt="Crafter" width="745" height="335">
     </a>
-    <div class="header-status"><button id="open-debug" class="text-button" type="button">Debug console <span aria-hidden="true">↗</span></button><span id="connection" class="connection"><i></i>Connecting</span></div>
+    <div class="header-status"><button id="open-debug" class="text-button" type="button">Debug console <span aria-hidden="true">↗</span></button><span id="connection" class="connection offline" hidden><i></i>Disconnected</span></div>
   </header>
 
   <main class="shell">
-    <nav id="workflow" class="workflow" aria-label="Build progress"><span data-step="main"><b>01</b> Design</span><i></i><span data-step="build"><b>02</b> Build</span><i></i><span data-step="complete"><b>03</b> Complete</span></nav>
     <div id="toast" class="toast" role="alert" hidden></div>
 
     <section id="main-screen" data-screen="main">
-      <div class="page-heading"><div><div class="eyebrow">FROM BLOCKS TO BOXES</div><h1 id="main-title">Your next build starts here.</h1><p>Send a shape from Minecraft. Let the agent take it from there.</p></div><span class="live-label"><i></i>Listening for designs</span></div>
       <div class="design-layout">
         <div class="scene-card">
           <div class="scene-toolbar"><span class="small-label">SCHEMATIC PREVIEW</span><div class="view-controls"><button data-view="main" data-angle="orbit" title="Reset 3D view">3D</button><button data-view="main" data-angle="top" title="View from above">Top</button><button data-view="main" data-angle="reset" aria-label="Reset preview"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1 0 5M4 3v5h5"/></svg></button></div></div>
           <div class="canvas-wrap"><canvas id="main-canvas" tabindex="0" aria-label="Interactive 3D design. Drag to rotate, scroll to zoom, or use arrow keys."></canvas>
-            <div id="waiting" class="waiting"><div class="waiting-icon"><svg viewBox="0 0 60 60" aria-hidden="true"><path d="m30 10 19 10v22L30 52 11 42V20Zm-19 10 19 11 19-11M30 31v21M23 6h14M30 1v10"/></svg></div><h2>Waiting for a schematic</h2><p>Right-click the Structure Scanner in Minecraft.<br>Your latest design will appear here automatically.</p><span class="mono receiver-port">TCP :5005</span></div>
+            <div id="waiting" class="waiting"><div class="waiting-icon"><svg viewBox="0 0 60 60" aria-hidden="true"><path d="m30 10 19 10v22L30 52 11 42V20Zm-19 10 19 11 19-11M30 31v21M23 6h14M30 1v10"/></svg></div><h2>Waiting for a schematic</h2><p>Right-click the Structure Scanner in Minecraft.<br>Your latest design will appear here automatically.</p></div>
             <div id="selection" class="selection" hidden></div>
           </div>
           <div class="scene-footer"><span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v14M3 10h14M7 6l3-3 3 3M7 14l3 3 3-3M6 7l-3 3 3 3M14 7l3 3-3 3"/></svg> Drag to orbit <span class="separator">/</span> Scroll to zoom <span class="separator">/</span> Click a box</span><span class="mono">SHAPE, NOT SCALE</span></div>
@@ -37,12 +35,10 @@
           <div id="design-warning" class="inline-warning" hidden></div>
           <div class="design-actions">
             <button id="start-build" class="button primary start-button" disabled><span>Start build</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
-            <p id="start-hint" class="button-hint">Receive a design to get started.</p>
             <button id="clear-blueprint" class="button secondary" type="button" disabled>Clear blueprint</button>
           </div>
         </aside>
       </div>
-      <div class="bottom-note"><span><i class="signal-dot"></i><span id="receiver-detail">Connecting to Minecraft receiver</span></span><button id="load-example" class="text-button">Try a four-box example <span aria-hidden="true">↗</span></button></div>
       <div id="receive-notice" class="inline-warning" hidden></div>
     </section>
 
@@ -130,7 +126,7 @@
       </div>
     </section>
 
-    <footer class="page-footer"><span>CRAFTED IN MINECRAFT. ASSEMBLED BY AN AGENT.</span><span>Demo control panel <span class="separator">/</span> v1</span></footer>
+    <footer class="page-footer"><span>CRAFTED IN MINECRAFT. ASSEMBLED BY AN AGENT.</span></footer>
   </main>
 </body>
 </html>
