@@ -375,22 +375,38 @@ class DriveTests(unittest.TestCase):
                     state["range"] * math.sin(state["bearing"]), 0.0)
         return target_fn
 
-    def test_turns_before_it_creeps(self):
+    def test_a_badly_misaligned_target_is_turned_to_first(self):
         seen = []
         real = self.rig.set_twist
-
-        def record(v, w):
-            seen.append((v, w))
-            real(v, w)
-        self.rig.set_twist = record
-        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.6), 0.45,
+        self.rig.set_twist = lambda v, w: (seen.append((v, w)), real(v, w))[1]
+        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=1.2), 0.45,
                                  log=lambda *a: None)
-        turning = [i for i, (v, w) in enumerate(seen) if w != 0.0]
-        creeping = [i for i, (v, w) in enumerate(seen) if v != 0.0]
-        self.assertTrue(turning and creeping)
-        self.assertLess(max(turning), min(creeping), "must finish turning before creeping")
-        for v, w in seen:
-            self.assertFalse(v != 0.0 and w != 0.0, "turn and creep are separate phases")
+        # arcing from a large bearing swings wide, so the first commands must not translate
+        early = [(v, w) for v, w in seen[:5]]
+        self.assertTrue(all(v == 0.0 for v, _ in early), f"expected pure rotation first, got {early}")
+
+    def test_a_box_off_to_one_side_is_corrected_while_driving(self):
+        seen = []
+        real = self.rig.set_twist
+        self.rig.set_twist = lambda v, w: (seen.append((v, w)), real(v, w))[1]
+        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.35), 0.45,
+                                 log=lambda *a: None)
+        both = [(v, w) for v, w in seen if v > 0.0 and w != 0.0]
+        self.assertTrue(both, "driving and steering must happen together, not in alternating phases")
+
+    def test_correcting_hard_slows_the_approach(self):
+        def speed_at(bearing):
+            rig = FakeRig()
+            seen = []
+            real = rig.set_twist
+            rig.set_twist = lambda v, w: (seen.append((v, w)), real(v, w))[1]
+            self.rig = rig
+            armctl.drive_to_standoff(rig, self.moving_target(bearing=bearing), 0.45,
+                                     log=lambda *a: None)
+            driving = [v for v, _ in seen if v > 0.0]
+            return max(driving) if driving else 0.0
+        self.assertLess(speed_at(0.5), speed_at(0.02),
+                        "a hard correction should ease off the throttle to tighten the arc")
 
     def test_stops_at_the_standoff_not_at_the_target(self):
         final = armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)

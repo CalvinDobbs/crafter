@@ -77,6 +77,9 @@ YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believe
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
 ALIGN_TOL = 0.05        # rad; inside this the base is considered pointed at the target
+TURN_FIRST = 0.60       # rad; beyond this, turn in place -- arcing from here swings wide
+STEER_GAIN = 1.5        # rad/s of correction per rad of bearing error while driving
+STEER_SLOWING = 0.6     # how much a hard correction cuts forward speed, so the arc stays tight
 RANGE_TOL = 0.02        # m; inside this the standoff is reached
 ARRIVED_MARGIN = 0.15   # m past the standoff within which losing sight counts as arriving
 STUCK_S = 15.0          # no range progress for this long = give up rather than grind
@@ -505,12 +508,19 @@ def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
             if time.monotonic() - t0 > timeout:
                 raise Stuck(f"drive exceeded {timeout:.0f}s")
 
-            if abs(bearing) > ALIGN_TOL:
-                # Turn in place first. Creeping while badly misaligned arcs the robot around
-                # the target instead of closing on it.
+            if abs(bearing) > TURN_FIRST:
+                # Badly misaligned: turn in place. Arcing from here swings wide around the
+                # target rather than closing on it.
                 rig.set_twist(0.0, math.copysign(min(omega, abs(bearing)), bearing))
             elif distance > standoff + RANGE_TOL:
-                rig.set_twist(min(speed, distance - standoff), 0.0)
+                # Roughly aligned: drive and steer together. A box off to one side needs the
+                # heading corrected continuously as the robot closes on it -- stopping to turn
+                # whenever the bearing drifts makes the approach a stutter, and driving straight
+                # at a heading taken seconds ago misses. Forward speed eases off while
+                # correcting hard, which tightens the arc instead of overshooting the line.
+                steer = float(np.clip(STEER_GAIN * bearing, -omega, omega))
+                easing = 1.0 - STEER_SLOWING * min(1.0, abs(bearing) / TURN_FIRST)
+                rig.set_twist(min(speed, distance - standoff) * easing, steer)
             else:
                 log(f"[armctl] standoff reached at {distance:.3f}m (target {standoff:.3f}m)")
                 return distance
