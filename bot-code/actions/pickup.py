@@ -71,6 +71,9 @@ ELBOW_EXTENSION = 30.0 / 360.0
 ELBOW_EXTENSION_SPEED = 0.05
 INITIALIZE_SPEED = 0.08
 LIFT_SPEED = 0.4        # turns/s for the loaded ascent
+LIFT_ACCEL = 0.1
+LIFT_FEEDBACK_MAX_AGE = 0.25
+LIFT_LOG_INTERVAL_S = 0.5
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
 ELBOW_SETTLE_S = 0.5    # let the forearm stop swinging before the lift moves
 TOP_SETTLE_S = 0.5      # rest at the top before descending
@@ -153,7 +156,7 @@ class Arm:
         self.side = side
         self.cfg = Config(f"arm_{side}")
         self.dof = self.cfg.dof
-        self.r_state = Reader(f"arm_{side}.state")
+        self.r_state = Reader(f"arm_{side}.state", keeptime=False)
         self.w_ctrl = Writer(f"arm_{side}.ctrl", Type("arm_ctrl"), keeptime=False)
         self.w_torque = Writer(f"arm_{side}.torque", Type("arm_torque"))
         self.cal_min, self.cal_max = load_cal(side)
@@ -202,6 +205,10 @@ class Arm:
             time.sleep(0.005)
         return np.array(self.r_state.data["pos"], dtype=np.float64)
 
+    def latest_state(self):
+        self.r_state.ready()
+        return self.r_state.data.copy() if self.r_state.readable and self.r_state.data is not None else None
+
     def write_cmd(self, pos):
         self.cmd = np.asarray(pos, dtype=np.float64)
         with self.w_ctrl.buf() as b:
@@ -247,6 +254,93 @@ def ramp_joint(arms, joint, targets, speed, ease=smoothstep):
         if t >= duration:
             break
         time.sleep(dt)
+
+
+def sample_lifts(arms):
+    states = [a.latest_state() for a in arms]
+    now = np.datetime64(round(time.time() * 1e9), "ns")
+    ages = [float((now - s["timestamp"]) / np.timedelta64(1, "s")) if s is not None else np.inf
+            for s in states]
+    return states, ages
+
+
+def valid_lift_sample(state, age):
+    return (state is not None and 0 <= age <= LIFT_FEEDBACK_MAX_AGE
+            and np.all(np.isfinite(state["pos"]))
+            and np.all(np.isfinite([state["vel"][J0], state["current"][J0]])))
+
+
+def lifts_arrived(arms, states, ages):
+    return all(valid_lift_sample(s, age) and abs(s["pos"][J0] - a.cmd[J0]) < ARRIVE_TOL
+               for a, s, age in zip(arms, states, ages))
+
+
+def log_lifts(arms, states, ages, phase, elapsed):
+    details, heights = [], []
+    for a, state, age in zip(arms, states, ages):
+        if state is None:
+            details.append(f"{a.side} cmd={a.cmd[J0]:+.3f} feedback=missing")
+            continue
+        valid = valid_lift_sample(state, age)
+        details.append(f"{a.side} cmd={a.cmd[J0]:+.3f} pos={state['pos'][J0]:+.3f}"
+                       f" vel={state['vel'][J0]:+.3f} cur={state['current'][J0]:+.2f}A"
+                       f" age={age:.3f}s {'fresh' if valid else 'invalid/stale'}")
+        if valid:
+            heights.append(np.sign(a.bottom - a.top) * (state["pos"][J0] - a.top)
+                           * 2 * np.pi * a.cfg.wheel_radius)
+    skew = f"{max(heights) - min(heights):.4f}m" if len(heights) == len(arms) else "unavailable"
+    print(f"[pickup] lift {phase} wall={time.time():.3f} t={elapsed:.3f}s "
+          + " | ".join(details) + f" | height_skew={skew}", flush=True)
+
+
+def settle_lift(arms, timeout=ARRIVE_TIMEOUT_S, *, phase="settling"):
+    t0 = next_log = time.monotonic()
+    while not _stop:
+        for a in arms:
+            a.write_cmd(a.cmd)
+        states, ages = sample_lifts(arms)
+        now = time.monotonic()
+        arrived = lifts_arrived(arms, states, ages)
+        finished = arrived or now - t0 >= timeout
+        if finished or now >= next_log:
+            status = ("ready" if arrived else "incomplete") if finished else "waiting"
+            log_lifts(arms, states, ages, f"{phase} {status}", now - t0)
+            next_log = now + LIFT_LOG_INTERVAL_S
+        if finished:
+            return arrived
+        time.sleep(1.0 / RATE_HZ)
+    return False
+
+
+def lift_to_shoulder(arms, speed=LIFT_SPEED, accel=LIFT_ACCEL):
+    if _stop:
+        return False
+    if not settle_lift(arms, timeout=LIFT_FEEDBACK_MAX_AGE, phase="start check"):
+        if not _stop:
+            print("[pickup] lift not started: J0 feedback is missing, invalid, stale, or differs from the held pose", flush=True)
+        return False
+    froms = [a.cmd.copy() for a in arms]
+    dist = max(abs(a.top - p0[J0]) for a, p0 in zip(arms, froms))
+    duration = max(1.875 * dist / speed, np.sqrt((10 / np.sqrt(3)) * dist / accel))
+    print(f"[pickup] lift start wall={time.time():.3f} duration={duration:.3f}s "
+          f"peak_speed<={speed:.3f} turns/s acceleration<={accel:.3f} turns/s^2", flush=True)
+    t0 = next_log = time.monotonic()
+    while not _stop:
+        now = time.monotonic()
+        elapsed = now - t0
+        f = smootherstep(elapsed / duration) if duration > 0 else 1.0
+        for a, p0 in zip(arms, froms):
+            pos = p0.copy()
+            pos[J0] = a.top if elapsed >= duration else p0[J0] + f * (a.top - p0[J0])
+            a.write_cmd(pos)
+        if now >= next_log or elapsed >= duration:
+            states, ages = sample_lifts(arms)
+            log_lifts(arms, states, ages, "ramp end" if elapsed >= duration else "ramping", elapsed)
+            next_log = now + LIFT_LOG_INTERVAL_S
+        if elapsed >= duration:
+            return settle_lift(arms)
+        time.sleep(1.0 / RATE_HZ)
+    return False
 
 
 def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False):
@@ -382,6 +476,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--arm", choices=["left", "right", "both"], default="both")
     ap.add_argument("--speed", type=float, default=J0_SPEED, help="J0 descent speed, turns/s")
+    ap.add_argument("--lift-speed", type=float, default=LIFT_SPEED,
+                    help="maximum final-ascent command speed, turns/s (default: %(default)s)")
+    ap.add_argument("--lift-accel", type=float, default=LIFT_ACCEL,
+                    help="maximum final-ascent command acceleration, turns/s^2; requires load validation (default: %(default)s)")
     ap.add_argument("--hold", type=float, default=None,
                     help="seconds to hold the final pose before disabling torque (default: until Ctrl+C)")
     ap.add_argument("--bottom-margin", type=float, default=J0_BOTTOM_MARGIN,
@@ -399,7 +497,7 @@ def main():
                     help="J3 extension from the 90-degree home bend in turns before descent; 0 disables (default: %(default)s)")
     ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex from the reach pose in turns after gripping; 0 disables")
     args = ap.parse_args()
-    for name in ("speed", "bottom_margin"):
+    for name in ("speed", "bottom_margin", "lift_speed", "lift_accel"):
         value = getattr(args, name)
         if not np.isfinite(value) or value <= 0:
             ap.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
@@ -511,19 +609,26 @@ def main():
             return
 
         print("[pickup] final stage: J0 -> shoulder level, maintaining grasp", flush=True)
-        ramp_joint(arms, J0, [a.top for a in arms], LIFT_SPEED)
+        arrived = lift_to_shoulder(arms, args.lift_speed, args.lift_accel)
         if _stop:
             return
-        settle_joint(arms, J0)
-        if _stop:
-            return
-        for a in arms:
-            live = a.live()
+        states, ages = sample_lifts(arms)
+        arrived = arrived and lifts_arrived(arms, states, ages)
+        for a, state, age in zip(arms, states, ages):
+            if not valid_lift_sample(state, age):
+                print(f"[pickup] {a.side}: final pose feedback unavailable or invalid/stale", flush=True)
+                continue
+            live = state["pos"]
             print(f"[pickup] {a.side}: J0 at {live[J0]:+.3f}  J2 {live[SWING]:+.3f} (cmd {a.cmd[SWING]:+.3f})"
                   f"  J4 {live[WRIST_ROLL]:+.3f} (cmd {a.cmd[WRIST_ROLL]:+.3f})"
                   f"  J6 {live[WRIST_PITCH]:+.3f} (cmd {a.cmd[WRIST_PITCH]:+.3f})"
                   f"  elbow {live[ELBOW]:+.3f}  grip {live[GRIPPER]:+.3f}", flush=True)
-        print(f"[pickup] holding shoulder-level target and grasp {hold_description}; torque drops on exit and releases the box", flush=True)
+        if arrived:
+            print("[pickup] shoulder level reached on every arm", flush=True)
+        else:
+            print("[pickup] lift incomplete: shoulder-level arrival not verified; no application retry", flush=True)
+        target_description = "shoulder-level target" if arrived else "existing J0 targets"
+        print(f"[pickup] holding {target_description} and grasp {hold_description}; torque drops on exit and releases the box", flush=True)
         hold(arms, args.hold)
     finally:
         # Leave the arms limp on exit.

@@ -26,9 +26,12 @@ class FakeClock:
     def monotonic(self):
         return self.now
 
+    def time(self):
+        return 1_700_000_000.0 + self.now
+
     def sleep(self, seconds):
         self.now += seconds
-        if self.now > 60:
+        if self.now > 120:
             raise AssertionError("Motion did not finish within virtual time limit")
 
 
@@ -47,8 +50,9 @@ class FakeArm(pickup.Arm):
         self.contact_position = 0.05 if side == "left" else -0.02
         home = np.zeros(self.dof)
         home[pickup.ELBOW] = self.elbow_90
-        self.cfg = SimpleNamespace(home=home, q2urdf=lambda q: q, ik=SimpleNamespace(fk=self.fk))
+        self.cfg = SimpleNamespace(home=home, q2urdf=lambda q: q, ik=SimpleNamespace(fk=self.fk), wheel_radius=0.0465)
         self.commands = []
+        self.command_times = []
         self.torque = []
         self.closed = False
 
@@ -64,15 +68,45 @@ class FakeArm(pickup.Arm):
                                                self.sign * self.contact_position)
         return pos
 
+    def latest_state(self):
+        return {"pos": self.cmd.copy(), "vel": np.zeros(self.dof), "current": np.zeros(self.dof),
+                "timestamp": np.datetime64(round(pickup.time.time() * 1e9), "ns")}
+
     def write_cmd(self, pos):
         self.cmd = np.asarray(pos).copy()
         self.commands.append(self.cmd.copy())
+        self.command_times.append(pickup.time.monotonic())
 
     def set_torque(self, on):
         self.torque.append(on)
 
     def close(self):
         self.closed = True
+
+
+class CooldownLiftArm(FakeArm):
+    def __init__(self, side):
+        super().__init__(side)
+        self.bottom = self.sign * 3.5269
+        self.cmd = self.initial_pose()
+        self.cmd[pickup.J0] = self.sign * 2.5269
+        self.position = self.cmd[pickup.J0]
+        self.velocity = 0.0
+        self.trips = (0.354, 1.584, 2.779, 3.993) if side == "left" else (0.321, 1.744)
+
+    def advance(self, dt, now):
+        latest_trip = max((t for t in self.trips if t <= now), default=-np.inf)
+        recovery = np.clip((now - latest_trip - 1.0) / 3.0, 0.0, 1.0)
+        delta = np.clip(self.cmd[pickup.J0] - self.position, -1.2 * recovery * dt, 1.2 * recovery * dt)
+        self.position += delta
+        self.velocity = delta / dt
+
+    def latest_state(self):
+        state = super().latest_state()
+        state["pos"][pickup.J0] = self.position
+        state["vel"][pickup.J0] = self.velocity
+        state["current"][pickup.J0] = 13.3 if any(0 <= pickup.time.monotonic() - t < 0.02 for t in self.trips) else 2.0
+        return state
 
 
 class PickupTests(unittest.TestCase):
@@ -84,7 +118,7 @@ class PickupTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def run_main(self, *args, hold_seconds=0.02, settle_effect=None):
+    def run_main(self, *args, hold_seconds=0.02, settle_effect=None, lift_effect=None):
         arms, holds, ramps = [], [], []
         hold_args = [] if hold_seconds is None else ["--hold", str(hold_seconds)]
 
@@ -103,13 +137,313 @@ class PickupTests(unittest.TestCase):
         def hold(selected, seconds):
             holds.append((seconds, [arm.cmd.copy() for arm in selected]))
 
+        def lift(selected, speed, accel):
+            if lift_effect is not None:
+                return lift_effect(selected, speed, accel)
+            ramp(selected, pickup.J0, [arm.top for arm in selected], speed)
+            return True
+
         with patch.object(pickup, "Arm", side_effect=make_arm), \
+                patch.object(pickup, "lift_to_shoulder", side_effect=lift), \
                 patch.object(pickup, "ramp_joint", side_effect=ramp), \
                 patch.object(pickup, "settle_joint", side_effect=settle_effect), \
                 patch.object(pickup, "hold", side_effect=hold), \
                 patch.object(sys, "argv", ["pickup.py", *hold_args, *args]):
             pickup.main()
         return arms, holds, ramps
+
+    def test_final_lift_respects_true_peak_speed_and_acceleration(self):
+        arms = [FakeArm(side) for side in ("left", "right")]
+        with patch.object(pickup, "Arm", side_effect=arms), \
+                patch.object(sys, "argv", ["pickup.py", "--hold", "0.02"]):
+            pickup.main()
+        for arm in arms:
+            low = max(i for i, pos in enumerate(arm.commands) if abs(pos[pickup.J0] - 1.0) < 1e-9)
+            positions = np.array(arm.commands[low:])[:, pickup.J0]
+            times = np.array(arm.command_times[low:])
+            times, unique = np.unique(times, return_index=True)
+            positions = positions[unique]
+            velocities = np.diff(positions) / np.diff(times)
+            accelerations = np.diff(velocities) / np.diff((times[1:] + times[:-1]) / 2)
+            self.assertLessEqual(np.max(np.abs(velocities)), pickup.LIFT_SPEED + 1e-6)
+            self.assertLessEqual(np.max(np.abs(accelerations)), 0.1 + 1e-6)
+
+    def make_lift_arms(self, distances=(1.0, 1.0)):
+        arms = [FakeArm(side) for side in ("left", "right")]
+        for arm, distance, top in zip(arms, distances, (0.02, -0.05)):
+            arm.top, arm.bottom = top, top + arm.sign * 3.5
+            arm.lo[pickup.J0], arm.hi[pickup.J0] = sorted([arm.top, arm.bottom])
+            arm.cmd = arm.initial_pose()
+            arm.cmd[pickup.J0] = arm.top + arm.sign * distance
+            arm.cmd[pickup.ELBOW] = arm.reach_elbow(pickup.ELBOW_EXTENSION)
+            arm.cmd[pickup.SWING] = arm.sign * 0.04
+            arm.cmd[pickup.WRIST_PITCH] = arm.sign * 0.15
+        return arms
+
+    def assert_lift_bounds(self, arm, speed, accel):
+        times, unique = np.unique(arm.command_times, return_index=True)
+        positions = np.array(arm.commands)[unique, pickup.J0]
+        if len(times) > 2:
+            velocity = np.diff(positions) / np.diff(times)
+            acceleration = np.diff(velocity) / np.diff((times[1:] + times[:-1]) / 2)
+            self.assertLessEqual(np.max(np.abs(velocity)), speed + 1e-6)
+            self.assertLessEqual(np.max(np.abs(acceleration)), accel + 1e-6)
+        self.assertTrue(np.all(positions >= arm.lo[pickup.J0] - 1e-9))
+        self.assertTrue(np.all(positions <= arm.hi[pickup.J0] + 1e-9))
+        self.assertTrue(np.all(arm.sign * np.diff(positions) <= 1e-9))
+
+    def test_lift_profile_bounds_mirrored_and_unequal_travel_without_changing_grasp(self):
+        for distances in ((2.5269, 2.5269), (1.0, 0.6), (0.001, 0.03), (0.0, 1.0), (0.0, 0.0)):
+            for speed, accel in ((0.4, 0.1), (0.15, 0.2)):
+                with self.subTest(distances=distances, speed=speed, accel=accel):
+                    self.clock.now = 0.0
+                    arms = self.make_lift_arms(distances)
+                    starts = [arm.cmd.copy() for arm in arms]
+                    with patch.object(FakeArm, "live", side_effect=AssertionError("Blocking feedback in lift")):
+                        self.assertTrue(pickup.lift_to_shoulder(arms, speed, accel))
+                    self.assertEqual(arms[0].command_times, arms[1].command_times)
+                    for arm, start in zip(arms, starts):
+                        self.assert_lift_bounds(arm, speed, accel)
+                        self.assertEqual(arm.cmd[pickup.J0], arm.top)
+                        for pos in arm.commands:
+                            np.testing.assert_array_equal(pos[1:], start[1:])
+                    if all(distances):
+                        progress = [(start[0] - np.array(arm.commands)[:, 0]) / (start[0] - arm.top)
+                                    for arm, start in zip(arms, starts)]
+                        np.testing.assert_allclose(*progress, atol=1e-10)
+
+    def test_single_arm_lift_preserves_cradle_and_closed_gripper(self):
+        for arm in self.make_lift_arms():
+            self.clock.now = 0.0
+            arm.cmd[pickup.ELBOW] = arm.cradle(pickup.CRADLE_TILT, start=arm.cmd[pickup.ELBOW])
+            arm.cmd[pickup.GRIPPER] = arm.grip_closed
+            start = arm.cmd.copy()
+            self.assertTrue(pickup.lift_to_shoulder([arm]))
+            self.assert_lift_bounds(arm, pickup.LIFT_SPEED, pickup.LIFT_ACCEL)
+            for pos in arm.commands:
+                np.testing.assert_array_equal(pos[1:], start[1:])
+
+    def test_logged_cooldowns_reproduce_lag_despite_simultaneous_targets(self):
+        arms = [CooldownLiftArm(side) for side in ("left", "right")]
+        sleep = self.clock.sleep
+        gaps = []
+
+        def tick(dt):
+            sleep(dt)
+            for arm in arms:
+                arm.advance(dt, self.clock.now)
+            gaps.append(abs(abs(arms[0].position) - abs(arms[1].position)))
+
+        with patch.object(self.clock, "sleep", side_effect=tick):
+            pickup.ramp_joint(arms, pickup.J0, [arm.top for arm in arms], pickup.LIFT_SPEED)
+            self.assertEqual(arms[0].command_times, arms[1].command_times)
+            self.assertTrue(all(arm.cmd[pickup.J0] == arm.top for arm in arms))
+            self.assertFalse(pickup.lifts_arrived(arms, *pickup.sample_lifts(arms)))
+            self.assertGreater(max(gaps), 0.3)
+            self.assertTrue(pickup.settle_lift(arms))
+
+    def test_lift_requires_fresh_valid_start_without_reseeding_commands(self):
+        for fault in ("missing", "stale", "future", "nan", "current", "velocity", "nat", "offset"):
+            with self.subTest(fault=fault):
+                self.clock.now = 0.0
+                arms = self.make_lift_arms()
+                starts = [arm.cmd.copy() for arm in arms]
+                state = arms[0].latest_state()
+                if fault == "stale":
+                    state["timestamp"] -= np.timedelta64(1, "s")
+                elif fault == "future":
+                    state["timestamp"] += np.timedelta64(1, "s")
+                elif fault == "nan":
+                    state["pos"][0] = np.nan
+                elif fault in ("current", "velocity"):
+                    state["current" if fault == "current" else "vel"][0] = np.nan
+                elif fault == "nat":
+                    state["timestamp"] = np.datetime64("NaT")
+                elif fault == "offset":
+                    state["pos"][0] += 0.2
+                with patch.object(arms[0], "latest_state", return_value=None if fault == "missing" else state):
+                    self.assertFalse(pickup.lift_to_shoulder(arms))
+                self.assertLessEqual(self.clock.now, pickup.LIFT_FEEDBACK_MAX_AGE + 1 / pickup.RATE_HZ)
+                for arm, start in zip(arms, starts):
+                    for pos in arm.commands:
+                        np.testing.assert_array_equal(pos, start)
+                    self.assertEqual(arm.torque, [])
+                    self.assertFalse(arm.closed)
+
+    def test_lift_start_can_acquire_feedback_without_blocking_command_refresh(self):
+        arms = self.make_lift_arms()
+        read = arms[0].latest_state
+        with patch.object(arms[0], "latest_state", side_effect=lambda: None if self.clock.now < 0.1 else read()):
+            self.assertTrue(pickup.lift_to_shoulder(arms))
+        self.assertGreater(len([t for t in arms[1].command_times if t < 0.1]), 10)
+
+    def test_lost_feedback_during_lift_does_not_block_commands_or_claim_arrival(self):
+        for restored in (False, True):
+            with self.subTest(restored=restored):
+                self.clock.now = 0.0
+                arms = self.make_lift_arms()
+                starts = [arm.cmd.copy() for arm in arms]
+                read = arms[0].latest_state
+
+                def feedback():
+                    return None if self.clock.now > 0.2 and (not restored or self.clock.now < 1.2) else read()
+
+                with patch.object(arms[0], "latest_state", side_effect=feedback), \
+                        patch.object(FakeArm, "live", side_effect=AssertionError("Blocking feedback in lift")):
+                    self.assertEqual(pickup.lift_to_shoulder(arms), restored)
+                for arm, start in zip(arms, starts):
+                    self.assertEqual(arm.cmd[pickup.J0], arm.top)
+                    self.assertLessEqual(max(np.diff(arm.command_times)), 1 / pickup.RATE_HZ + 1e-9)
+                    self.assert_lift_bounds(arm, pickup.LIFT_SPEED, pickup.LIFT_ACCEL)
+                    for pos in arm.commands:
+                        np.testing.assert_array_equal(pos[1:], start[1:])
+                    self.assertEqual(arm.torque, [])
+                if not restored:
+                    self.assertIn("settling incomplete", sys.stdout.getvalue())
+
+    def test_settling_stall_and_stale_arrival_do_not_report_success(self):
+        for fault in ("stall", "stale", "nan"):
+            with self.subTest(fault=fault):
+                self.clock.now = 0.0
+                arms = self.make_lift_arms()
+                for arm in arms:
+                    arm.cmd[0] = arm.top
+                    arm.set_torque(True)
+                read = arms[0].latest_state
+
+                def feedback():
+                    state = read()
+                    if fault == "stall":
+                        state["pos"][0] += 1.0
+                    elif fault == "stale":
+                        state["timestamp"] -= np.timedelta64(1, "s")
+                    else:
+                        state["pos"][0] = np.nan
+                    return state
+
+                with patch.object(arms[0], "latest_state", side_effect=feedback):
+                    self.assertFalse(pickup.settle_lift(arms, timeout=0.05))
+                for arm in arms:
+                    self.assertEqual(arm.torque, [True])
+                    self.assertGreaterEqual(len(arm.commands), 10)
+
+    def test_lift_cancellation_before_during_ramp_and_during_settling(self):
+        for stage in ("before", "ramp", "settling"):
+            with self.subTest(stage=stage):
+                self.clock.now = 0.0
+                pickup._stop = stage == "before"
+                arms = self.make_lift_arms()
+                read, sleep = arms[0].latest_state, self.clock.sleep
+
+                def feedback():
+                    state = read()
+                    if stage == "settling" and arms[0].cmd[0] == arms[0].top:
+                        state["pos"][0] += 0.5
+                    return state
+
+                def tick(dt):
+                    sleep(dt)
+                    if (stage == "ramp" and self.clock.now >= 0.1
+                            or stage == "settling" and arms[0].cmd[0] == arms[0].top):
+                        pickup._sigint()
+
+                with patch.object(arms[0], "latest_state", side_effect=feedback), \
+                        patch.object(self.clock, "sleep", side_effect=tick):
+                    self.assertFalse(pickup.lift_to_shoulder(arms))
+                if stage == "before":
+                    self.assertTrue(all(not arm.commands for arm in arms))
+                self.assertTrue(all(not arm.torque and not arm.closed for arm in arms))
+
+    def test_main_incomplete_lift_holds_without_automatic_torque_off_or_retry(self):
+        for moved in (False, True):
+            with self.subTest(moved=moved):
+                captured = []
+
+                def incomplete(arms, speed, accel):
+                    for arm in arms:
+                        if moved:
+                            pos = arm.cmd.copy()
+                            pos[0] = arm.top
+                            arm.write_cmd(pos)
+                        captured.append(arm.cmd.copy())
+                        self.assertEqual(arm.torque, [False, True])
+                    return False
+
+                arms, holds, _ = self.run_main(lift_effect=incomplete)
+                np.testing.assert_array_equal(holds[-1][1], captured)
+                self.assertIn("lift incomplete", sys.stdout.getvalue())
+                self.assertNotIn("shoulder level reached", sys.stdout.getvalue())
+                for arm in arms:
+                    self.assertEqual(arm.torque, [False, True, False])
+
+    def test_main_real_lift_rejects_unreached_top_and_keeps_grasp_hold(self):
+        read, real_lift = FakeArm.latest_state, pickup.lift_to_shoulder
+        results = []
+
+        def feedback(arm):
+            state = read(arm)
+            if arm.side == "left":
+                state["pos"][0] = 1.0
+            return state
+
+        def lift(arms, speed, accel):
+            result = real_lift(arms, speed, accel)
+            results.append(result)
+            for arm in arms:
+                self.assertEqual(arm.torque, [False, True])
+            return result
+
+        with patch.object(FakeArm, "latest_state", feedback):
+            arms, holds, _ = self.run_main(lift_effect=lift)
+        self.assertEqual(results, [False])
+        self.assertIn("lift incomplete", sys.stdout.getvalue())
+        self.assertNotIn("shoulder level reached", sys.stdout.getvalue())
+        for arm, final in zip(arms, holds[-1][1]):
+            self.assertEqual(final[0], arm.top)
+            np.testing.assert_array_equal(final[1:], arm.cmd[1:])
+            self.assertEqual(arm.torque, [False, True, False])
+
+    def test_lift_diagnostics_are_throttled_and_use_mirrored_height(self):
+        arms = self.make_lift_arms((1.0, 0.5))
+        states, ages = pickup.sample_lifts(arms)
+        pickup.log_lifts(arms, states, ages, "test", 0.0)
+        self.assertIn("height_skew=0.1461m", sys.stdout.getvalue())
+        self.assertTrue(pickup.lift_to_shoulder(arms))
+        lines = [line for line in sys.stdout.getvalue().splitlines() if "lift ramping " in line]
+        self.assertLessEqual(len(lines), self.clock.now / pickup.LIFT_LOG_INTERVAL_S + 1)
+        self.assertGreater(len(lines), 1)
+        for line in lines:
+            for field in ("wall=", "t=", "left cmd=", "right cmd=", "pos=", "vel=", "cur=", "age=", "height_skew="):
+                self.assertIn(field, line)
+
+    def test_arm_latest_state_reads_cached_sample_without_waiting_for_new_frame(self):
+        arm = self.make_lift_arms()[0]
+        dtype = [("pos", "f4", 8), ("vel", "f4", 8), ("current", "f4", 8), ("timestamp", "datetime64[ns]")]
+        state = np.zeros(1, dtype=dtype)[0]
+        for key, value in arm.latest_state().items():
+            state[key] = value
+        arm.r_state = SimpleNamespace(ready=Mock(return_value=False), readable=True, data=state)
+        with patch.object(self.clock, "sleep", side_effect=AssertionError("Blocking state read")):
+            sample = pickup.Arm.latest_state(arm)
+        arm.r_state.ready.assert_called_once_with()
+        self.assertFalse(np.shares_memory(sample, state))
+        arm.r_state.readable = False
+        self.assertIsNone(pickup.Arm.latest_state(arm))
+
+    def test_lift_options_are_independent_and_invalid_values_fail_before_hardware(self):
+        for option in ("--lift-speed", "--lift-accel"):
+            for value in ("0", "-0.1", "nan", "inf"):
+                with self.subTest(option=option, value=value), patch.object(pickup, "Arm") as arm, \
+                        patch.object(sys, "argv", ["pickup.py", option, value]), \
+                        patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                    pickup.main()
+                arm.assert_not_called()
+        lift = Mock(return_value=True)
+        self.run_main("--speed", "0.3", "--lift-speed", "0.2", "--lift-accel", "0.08", lift_effect=lift)
+        self.assertEqual(lift.call_args.args[1:], (0.2, 0.08))
+        lift.reset_mock()
+        self.run_main("--speed", "0.1", lift_effect=lift)
+        self.assertEqual(lift.call_args.args[1:], (pickup.LIFT_SPEED, pickup.LIFT_ACCEL))
 
     def test_default_grasps_inward_then_lifts_and_holds_at_shoulder_level(self):
         self.assertEqual(pickup.LIFT_SPEED, 0.4)
@@ -219,18 +553,15 @@ class PickupTests(unittest.TestCase):
             self.assertTrue(any(abs(pos[pickup.J0] - arm.sign) < 1e-9 for pos in arm.commands))
             self.assertAlmostEqual(final[pickup.J0], arm.top)
 
-    def test_stop_while_settling_final_lift_skips_final_hold(self):
-        lift_settles = 0
+    def test_stop_during_final_lift_skips_final_hold(self):
+        def stop_lift(arms, speed, accel):
+            for arm in arms:
+                arm.cmd[pickup.J0] = arm.top
+            pickup._sigint()
+            return False
 
-        def settle(arms, joint, **kwargs):
-            nonlocal lift_settles
-            if joint == pickup.J0:
-                lift_settles += 1
-                if lift_settles == 3:
-                    pickup._sigint()
-
-        arms, holds, ramps = self.run_main(settle_effect=settle)
-        self.assertEqual(ramps.count(pickup.J0), 3)
+        arms, holds, ramps = self.run_main(lift_effect=stop_lift)
+        self.assertEqual(ramps.count(pickup.J0), 2)
         self.assertNotEqual(holds[-1][0], 0.02)
         for arm in arms:
             self.assertEqual(arm.torque, [False, True, False])
