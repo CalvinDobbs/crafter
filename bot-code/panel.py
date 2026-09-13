@@ -129,9 +129,15 @@ class StructureReceiver:
         self.session.receiver_status(False, self.port)
 
 
-ACTION_SECONDS = {"look_around": 9.0, "approach_box": 6.0, "pickup": 8.0,
-                  "move_to_build": 6.0, "place": 8.0}
+ACTION_SECONDS = {"look_around": 9.0, "approach_box": 4.0, "pickup": 8.0,
+                  "move_to_build": 7.0, "place": 8.0}
 OTHER_ACTION_SECONDS = 6.0
+
+# Where the loose boxes lie before the build starts, in cells of the site's own frame. Scattered
+# around the footprint rather than filed in a row, and close enough that the whole workspace and
+# the structure share one readable frame.
+SCATTER = [(-1.8, 0, 0.7), (2.7, 0, 0.2), (-1.2, 0, 2.6), (2.4, 0, 2.3), (0.5, 0, 3.2),
+           (-1.5, 0, -1.1), (3.1, 0, 1.3), (1.3, 0, -1.4), (-0.5, 0, -1.7), (3.3, 0, -0.7)]
 
 
 class PanelWorld(MockAgentWorld):
@@ -147,6 +153,12 @@ class PanelWorld(MockAgentWorld):
         super().__init__(count)
         self.cancel_event, self.emit, self.pace = cancel, emit, pace
         self.progress = progress
+        # Lay the boxes out in the site's frame, so the preview can draw the pile and the build in
+        # the same coordinates and a box can be watched travelling from one to the other.
+        site = self._site("floor-a")
+        self.cells = {mid: SCATTER[mid % len(SCATTER)] for mid in self.positions}
+        self.positions = {mid: tuple(site.cell_center(cell, self.voxel_size))
+                          for mid, cell in self.cells.items()}
         self.reported = set()
 
     def submit(self, request):
@@ -163,15 +175,23 @@ class PanelWorld(MockAgentWorld):
         # How far through its motion the action is. The feed records transitions; this is for the
         # preview, which wants a continuous number rather than another log line.
         elapsed = (self.now-self._pending[action_id]["started"])/self.action_duration
-        self.progress(operation=request.step.operation, phase=outcome.phase,
-                      cell=list(request.step.cell) if request.step.cell else None,
-                      fraction=min(1.0, max(0.0, elapsed)),
-                      running=outcome.status == "running")
+        carried = request.step.box_id if request.step.operation in {"pickup", "move_to_build", "place"} else None
+        self.progress(loose=self._loose(carried), action={
+            "operation": request.step.operation, "phase": outcome.phase,
+            "origin": list(self.cells.get(request.step.box_id, (0, 0, 0))),
+            "cell": list(request.step.cell) if request.step.cell else None,
+            "fraction": min(1.0, max(0.0, elapsed))} if outcome.status == "running" else None)
         if outcome.status != "running" and action_id not in self.reported:
             self.reported.add(action_id)
             self.emit("tool_result", operation=request.step.operation, request_id=request.request_id,
                       result="success" if outcome.status == "succeeded" else outcome.status)
         return outcome
+
+    def _loose(self, carried=None):
+        """Boxes still lying where they started: not placed, not held, not the one in hand."""
+        held = self.holding.box_id if self.holding.status == "holding" else None
+        taken = set(self.placed.values()) | {held, carried}
+        return [list(cell) for mid, cell in sorted(self.cells.items()) if mid not in taken]
 
     def sleep(self, seconds):
         self.cancel_event.wait(seconds*self.pace*self._seconds()/self.action_duration)
@@ -327,7 +347,7 @@ class PanelSession:
                         "started_at": time.time(), "finished_at": None, "phase": "INVENTORY",
                         "reasoning": "Waiting for the first model decision.", "events": [], "placed": [],
                         "llm_calls": 0, "tool_calls": 0, "current_tool": None, "current_cell": None,
-                        "action": None,
+                        "action": None, "loose": [],
                         "error": None, "result": None}
             self.view, self.worker_busy = "build", True
             self.revision += 1
@@ -360,12 +380,14 @@ class PanelSession:
                 job["placed"].append({"cell": list(data["cell"]), "box_id": data["box_id"]})
                 job["current_cell"] = None
 
-    def _progress(self, job_id, **data):
-        """Motion progress for the preview. Never appends to the feed: it ticks every poll."""
+    def _progress(self, job_id, action=None, loose=None):
+        """Scene state for the preview. Never appends to the feed: it ticks every poll."""
         with self.lock:
             if not self.job or self.job["id"] != job_id or self.job["status"] != "running":
                 return
-            self.job["action"] = data if data.pop("running", False) else None
+            self.job["action"] = action
+            if loose is not None:
+                self.job["loose"] = loose
             self.revision += 1
 
     def _run(self, job_id, cancel):
@@ -375,6 +397,7 @@ class PanelSession:
             with self.lock:
                 blocks = copy.deepcopy(self.job["design"]["blocks"])
             world = PanelWorld(len(blocks), cancel, emit, self.pace, progress)
+            progress(loose=world._loose())   # scattered from the first frame, before anything moves
             reasoner = PanelReasoner((self.reasoner_factory or DeterministicChoice)(), cancel, emit)
             agent = Agent(world.actions, world.observations, config=PANEL_CONFIG, backend="llm", reasoner=reasoner,
                           clock=world.clock, sleep=world.sleep,

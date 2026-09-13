@@ -15,6 +15,7 @@ class VoxelView {
     this.placed = new Set();
     this.active = null;
     this.action = null;
+    this.loose = [];
     this.carried = 0;        // eased toward the action's reported fraction, which arrives in steps
     this.flashes = new Map();
     this.animating = false;
@@ -72,7 +73,7 @@ class VoxelView {
     this.zoom = 1;
     this.invalidate();
   }
-  set(design, mode, placed, active, action) {
+  set(design, mode, placed, active, action, loose) {
     const identity = design ? design.id : 'empty';
     if (identity !== this.identity) {
       this.identity = identity;
@@ -81,7 +82,15 @@ class VoxelView {
     }
     this.blocks = design ? design.blocks : [];
     this.extents = design ? design.size : [3, 2, 3];
-    this.center = [this.extents[0] / 2, this.extents[1] / 2 - .15, this.extents[2] / 2];
+    this.loose = loose || [];
+    // Frame the whole workspace, not just the target: the pile has to be on screen for a box to
+    // be watched leaving it.
+    const points = this.blocks.map(b => [b.x, b.y, b.z]).concat(this.loose);
+    if (!points.length) points.push([0, 0, 0], [this.extents[0] - 1, this.extents[1] - 1, this.extents[2] - 1]);
+    const low = [0, 1, 2].map(i => Math.min(...points.map(p => p[i])));
+    const high = [0, 1, 2].map(i => Math.max(...points.map(p => p[i])) + 1);
+    this.center = [(low[0] + high[0]) / 2, (low[1] + high[1]) / 2 - .15, (low[2] + high[2]) / 2];
+    this.span = Math.max(high[0] - low[0], high[1] - low[1], high[2] - low[2], 2);
     this.mode = mode;
     const settled = new Set((placed || []).map(p => cellKey(p.cell)));
     for (const key of settled) if (!this.placed.has(key)) this.flashes.set(key, performance.now());
@@ -106,6 +115,29 @@ class VoxelView {
     };
     this.spin = requestAnimationFrame(step);
   }
+  inFlight() {
+    // The one box in hand: resting, rising off the pile, crossing to the site, or descending.
+    const a = this.action;
+    if (this.mode !== 'build' || !a || !a.origin) return null;
+    const ease = t => t * t * (3 - 2 * Math.max(0, Math.min(1, t)));
+    const clamp01 = t => Math.max(0, Math.min(1, t));
+    const from = a.origin, to = a.cell, LIFT = 2.6;
+    if (a.operation === 'pickup') {
+      // Nothing leaves the floor until the grasp has it; the lift is the second half of the move.
+      const rise = a.phase === 'lifting' ? ease(clamp01((this.carried - .5) * 2)) : 0;
+      return {x: from[0], y: from[1] + LIFT * rise, z: from[2], flying: true};
+    }
+    if (a.operation === 'move_to_build' && to) {
+      const t = ease(clamp01(this.carried));
+      return {x: from[0] + (to[0] - from[0]) * t, y: to[1] + LIFT, z: from[2] + (to[2] - from[2]) * t, flying: true};
+    }
+    if (a.operation === 'place' && to) {
+      // Seated a little before the motion ends: what is left is releasing and retreating.
+      return {x: to[0], y: to[1] + LIFT * (1 - ease(clamp01(this.carried * 1.35))), z: to[2], flying: true};
+    }
+    return null;
+  }
+
   invalidate() {
     if (this.pending) return;
     this.pending = true;
@@ -139,8 +171,9 @@ class VoxelView {
     const ctx = this.ctx;
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
     ctx.fillStyle = '#f7f3ee'; ctx.fillRect(0, 0, this.width, this.height);
-    const span = Math.max(...this.extents, 2);
-    this.scale = Math.min(this.width, this.height) * .68 / (span + 1.6) * this.zoom;
+    const span = this.span || Math.max(...this.extents, 2);
+    const fill = this.loose.length ? .84 : .68, pad = this.loose.length ? .8 : 1.6;
+    this.scale = Math.min(this.width, this.height) * fill / (span + pad) * this.zoom;
     this.distance = span * 4 + 12;
     const radius = Math.min(Math.ceil(span / 2) + 4, 40);
     const cx = this.center[0], cz = this.center[2];
@@ -159,16 +192,12 @@ class VoxelView {
       {v: [0, 3, 7, 4], color: '#ba8246'}, {v: [1, 5, 6, 2], color: '#ce9857'}
     ];
     const faces = [];
-    // The cell being worked on gets a second, airborne copy: lowered into place as the motion
-    // runs, held up while it is still being carried. It is what makes a build look like building.
-    const flight = this.mode === 'build' && this.action && this.active
-      ? {carrying: this.action.operation === 'move_to_build' || (this.action.operation === 'pickup' && this.action.phase === 'lifting'),
-         lowering: this.action.operation === 'place'} : null;
-    const lift = flight ? (flight.carrying ? 2.4 : flight.lowering ? 2.4 * (1 - Math.min(1, this.carried * 1.35)) : 0) : 0;
-    const airborne = flight && lift > .02 ? this.active.split(',').map(Number) : null;
-    const drawn = airborne ? this.blocks.concat([{x: airborne[0], y: airborne[1], z: airborne[2], flying: lift}]) : this.blocks;
+    const carried = this.inFlight();
+    const drawn = this.blocks
+      .concat(this.loose.map(c => ({x: c[0], y: c[1], z: c[2], loose: true})))
+      .concat(carried ? [carried] : []);
     for (const block of drawn) {
-      const x = block.x + .025, y = block.y + .015 + (block.flying || 0), z = block.z + .025, s = .95, h = .97;
+      const x = block.x + .025, y = block.y + .015, z = block.z + .025, s = .95, h = .97;
       const vertices = [[x,y,z],[x+s,y,z],[x+s,y+h,z],[x,y+h,z],[x,y,z+s],[x+s,y,z+s],[x+s,y+h,z+s],[x,y+h,z+s]].map(p => this.project(p));
       const key = cellKey([block.x, block.y, block.z]);
       for (let i = 0; i < definitions.length; i++) {
@@ -176,9 +205,10 @@ class VoxelView {
         const edge1 = [points[1][0] - points[0][0], points[1][1] - points[0][1]];
         const edge2 = [points[2][0] - points[0][0], points[2][1] - points[0][1]];
         if (edge1[0] * edge2[1] - edge1[1] * edge2[0] < 0) continue;
-        const flying = block.flying !== undefined;
+        const flying = block.flying === true, loose = block.loose === true;
         faces.push({points, depth: points.reduce((sum, p) => sum + p[2], 0) / 4, color: def.color, block, key, face: i,
-          ghost: !flying && this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key),
+          ghost: !flying && !loose && this.mode === 'build' && !this.placed.has(key), placed: this.placed.has(key),
+          loose,
           flying, flash: this.flashes.has(key) ? Math.max(0, 1 - (performance.now() - this.flashes.get(key)) / 1400) : 0,
           active: key === this.active || key === this.selected});
       }
@@ -190,7 +220,7 @@ class VoxelView {
       ctx.fillStyle = face.ghost ? (face.active ? '#b8494630' : '#aa92821a') : face.color;
       ctx.fill();
       if (face.flash > 0) { ctx.fillStyle = `rgba(57,114,83,${(face.flash * .45).toFixed(3)})`; ctx.fill(); }
-      ctx.strokeStyle = face.flying ? '#b84946' : face.active ? '#b84946' : face.placed ? '#397253' : face.ghost ? '#9f897a' : '#533c2690';
+      ctx.strokeStyle = face.flying || face.active ? '#b84946' : face.placed ? '#397253' : face.loose ? '#8a6f5e' : face.ghost ? '#9f897a' : '#533c2690';
       ctx.lineWidth = face.flying || face.active ? 2 : 1;
       ctx.stroke();
       if (!face.ghost && (face.face === 3 || face.face === 0 || face.face === 1)) {
@@ -253,11 +283,11 @@ async function command(path, data) {
   } catch (error) { notice(error.message); }
   finally { submitting = false; if (state) render(state); }
 }
-function scene(name, design, mode, placed, active, action) {
-  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null, action || null]);
+function scene(name, design, mode, placed, active, action, loose) {
+  const signature = JSON.stringify([design ? design.id : null, mode, placed || [], active || null, action || null, loose || []]);
   if (lastScene[name] !== signature) {
     lastScene[name] = signature;
-    views[name].set(design, mode, placed, active, action);
+    views[name].set(design, mode, placed, active, action, loose);
     if (name === 'main') byId('selection').hidden = true;
   }
 }
@@ -380,10 +410,9 @@ function render(s) {
     byId('progress-fill').style.width = `${percent}%`;
     document.querySelector('.progress-track').setAttribute('aria-valuenow', String(percent));
     text('current-action', job.current_tool ? labels[job.current_tool] || job.current_tool : thinking ? 'Choosing the next step' : running ? 'Checking the next step' : job.status === 'completed' ? 'Build verified' : 'Build stopped');
-    text('elapsed', elapsed(job.started_at, job.finished_at));
     text('llm-count', job.llm_calls); text('tool-count', job.tool_calls);
     byId('feed-live').hidden = !running;
-    scene('build', job.design, 'build', job.placed, job.current_cell, job.action);
+    scene('build', job.design, 'build', job.placed, job.current_cell, job.action, job.loose);
     views.build.animate(running && screen === 'build');
     scene('complete', job.design, 'complete', job.placed, null);
     renderFeed(job);
