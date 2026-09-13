@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import math
 
+from agent_types import vector_valid
+
 
 # How stale a sighting may be and still serve as a heading. Measured on hardware: an approach
 # turned 56 degrees to face its box, lost it for 3.2 s while re-acquiring, and gave up just over
@@ -106,7 +108,23 @@ class Geometry:
                 raise StaleGeometry(f"box {box.id} last seen {age:.1f}s ago, beyond the "
                                     f"{limit:.1f}s a heading may be trusted")
             return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
-        raise StaleGeometry(f"box {request.step.box_id} is not in the snapshot at all")
+
+        # The track is gone, not merely stale. This detector's tracker mints a NEW id whenever a
+        # box blinks out and back -- ids climbed 1000, 1003, 1008, 1041 across one session on a
+        # single box -- so the id the controller selected can simply cease to exist mid-approach,
+        # which stopped one drive dead after two centimetres.
+        #
+        # Fall back to the position the request itself carries. That position was measured and
+        # validated at admission, and it is in the same world frame this snapshot uses, which the
+        # epoch check above has already confirmed. Steering toward it is a heading, not a claim
+        # about identity: nothing here asserts that whatever is now in front IS that box.
+        # confirm_graspable still demands a live, identified, confident sighting before anything
+        # closes on it, so a lost track can lead the robot to the right place and still refuse the
+        # grasp -- which is the correct outcome.
+        if request.box is not None and vector_valid(request.box.position):
+            return world_to_base(request.box.position, snapshot.base_position, snapshot.base_yaw)
+        raise StaleGeometry(f"box {request.step.box_id} is not in the snapshot and the request "
+                            f"carries no position to fall back on")
 
     def confirm_graspable(self, request):
         """Re-check the box immediately before closing on it, against the higher bar.

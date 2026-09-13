@@ -23,10 +23,12 @@ def snapshot(epoch=3, captured_at=100.0, valid=True, pose=(0.0, 0.0, 0.0), yaw=0
 def request(epoch=3, cell=(0, 0, 0), site=True, frame_id="session-world"):
     build = BuildSite(id="s1", origin=(1.0, 0.0, 0.0), col=(1.0, 0.0, 0.0), row=(0.0, 1.0, 0.0),
                       dimensions=(1.0, 1.0, 1.0), ts=100.0, epoch=epoch, frame_id=frame_id)
+    from agent_types import BoxObservation
     return SimpleNamespace(
         epoch=epoch, frame_id=frame_id,
         step=Step("place", site_id="s1", cell=cell, box_id=7),
         site=build if site else None,
+        box=BoxObservation(id=7, position=(1.0, 0.0, 0.1), size=None, last_seen=100.0),
         requirements=BuildRequirements(cells=(cell,), voxel_size=VOXEL, extents=(1, 1, 1)))
 
 
@@ -86,11 +88,29 @@ class SteeringStalenessTests(unittest.TestCase):
             g.box_in_base(request(), snapshot=stale)
         self.assertIn("beyond", str(caught.exception))
 
-    def test_a_box_absent_entirely_stops_the_drive(self):
+    def test_a_lost_track_falls_back_to_the_validated_position(self):
+        """The tracker mints a new id when a box blinks, so the selected id can vanish.
+
+        Steering to the position the request carries is a heading, not a claim that whatever is
+        there is that box. The grasp still demands a live identified sighting.
+        """
         g = geometry(snapshot())
         empty = SimpleNamespace(**{**snapshot().__dict__, "boxes": ()})
+        position = g.box_in_base(request(), snapshot=empty)
+        self.assertEqual(len(position), 3)
+
+    def test_a_lost_track_with_no_fallback_position_stops_the_drive(self):
+        g = geometry(snapshot())
+        empty = SimpleNamespace(**{**snapshot().__dict__, "boxes": ()})
+        bare = SimpleNamespace(**{**request().__dict__, "box": None})
         with self.assertRaises(StaleGeometry):
-            g.box_in_base(request(), snapshot=empty)
+            g.box_in_base(bare, snapshot=empty)
+
+    def test_a_cross_epoch_request_is_still_refused_despite_the_fallback(self):
+        # the fallback position is only meaningful in the same world frame
+        g = geometry(snapshot(epoch=4))
+        with self.assertRaises(StaleGeometry):
+            g.box_in_base(request(epoch=3))
 
 
 class ResolveTests(unittest.TestCase):
