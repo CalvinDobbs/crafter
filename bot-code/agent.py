@@ -267,8 +267,14 @@ class Agent:
         return axes_ok and all(a >= b for a, b in zip(site.dimensions, s.job.requirements.dimensions))
 
     def _usable(self, box, current=False):
-        return (box.valid and box.eligible is True and vector_valid(box.size)
-                and all(abs(a-b) <= .01*b for a, b in zip(box.size, self.config.voxel_size))
+        # A size of None means perception did not measure one, which is the honest answer from a
+        # markerless detector: it proposes a rectangle, not dimensions. Where a size IS reported it
+        # must still match, so a measured mismatch is never waved through. Screening such boxes on
+        # other evidence is the provider's selection policy, not this check's job.
+        sized = box.size is None or (vector_valid(box.size)
+                                     and all(abs(a-b) <= .01*b
+                                             for a, b in zip(box.size, self.config.voxel_size)))
+        return (box.valid and box.eligible is True and sized
                 and (not current or (box.current and self._fresh(box.last_seen))))
 
     def _idle(self):
