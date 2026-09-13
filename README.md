@@ -1,133 +1,61 @@
-# [crafter]
+# Crafter
 
-Build a structure in Minecraft, send it to a robot.
+**You build it in Minecraft. Crafter builds it in real life.**
 
-This README is how to build and run the Minecraft mod. For the bot side: **[bot-code/README.md](bot-code/README.md)** is the current architecture and runbook, **[AGENTS.md](AGENTS.md)** has the operational rules and verified commands, and **[PLAN.md](PLAN.md)** is the goals-and-sequencing plan.
+*A hackathon project — built in under 24 hours.*
 
-## Components
+Crafter is a robot that turns virtual block designs into physical structures. Design a build
+in Minecraft, click a button, and a BracketBot finds real cardboard boxes, works out which one
+belongs where, and stacks them until the pile matches your blueprint.
 
-### `minecraft-mod/`
+You design the result. The robot handles everything between the blueprint and the floor.
 
-A Fabric mod for Minecraft 1.21.11. Adds a **Structure Scanner** item: right-click it and the mod
-scans the area above the world origin, then sends every block it finds to the bot as a single JSON
-payload over TCP.
+## How it works
 
-Built against Fabric Loader 0.19.5, Fabric API 0.141.6+1.21.11, Java 21. The Gradle project and
-mod id are still `posstream`, left over from an earlier iteration that streamed player position
-instead of structures.
-
-## The bot side
-
-Python for the robot lives in [`bot-code/`](bot-code/): the reasoning agent, perception, the panel
-and receiver, and voice. The `main.py --ui` panel receives Minecraft designs on TCP 5005 and previews
-them before Start. Builds run on the offline simulator and take the agent's own first legal step, so they
-need no model, no API key and no robot.
-
-Each simulated physical action takes wall-clock seconds, in the proportions the robot's own
-routines have -- a survey is long, a drive is short -- so a four-box build runs about two
-minutes. `--build-pace` scales that, and `--build-pace 0` runs flat out.
-
-Hardware motion is not wired up yet: there is no action provider implementing interface v2, so a live
-build fails preflight by design. See [bot-code/README.md](bot-code/README.md) for the interface and
-[bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md) for how the base and arms
-actually work. Live scans follow [WIRE_FORMAT.md](WIRE_FORMAT.md).
-
-## The panel runs on the bot, never on your PC
-
-`main.py --ui` refuses to start unless it is on the robot. Everything it needs lives there: the
-saved API key, the cameras, the arms, and the TCP:5005 receiver the Minecraft mod points at. A
-panel started on a laptop asks you to paste a key that already exists on the bot, and its debug
-screen can open neither perception nor actions. Run it on the bot and forward port 8005 to your
-browser — the two commands are under [Use the bot-hosted panel from a developer PC](#use-the-bot-hosted-panel-from-a-developer-pc)
-below. `--ui-without-robot` overrides the check for browser layout work only.
-
-
-## Model key and developer access
-
-### Store the key on the bot
-
-The shared panel runs as `bracketbot` on `100.66.148.86`. Its API key belongs on that server,
-not in Git, GitHub variables, chat, or a developer's checkout. Developers using the remote panel
-do not need to retrieve the key or set `OPENAI_API_KEY` on their own PCs.
-
-Connect with your approved SSH identity; [AGENTS.md](AGENTS.md) includes the configured Windows-PC
-command. Do not share SSH private keys. Run the following in **your own interactive Bash terminal
-on the bot**, as `bracketbot`. The prompt hides the key, and the value is not part of shell history:
-
-```bash
-set +x
-read -r -s -p "OpenAI API key (hidden): " OPENAI_API_KEY
-printf '\n'
-export OPENAI_API_KEY
-python -B /home/bracketbot/crafter/bot-code/main.py --save-api-key
-unset OPENAI_API_KEY
+```text
+Minecraft mod  ──▶  Blueprint  ──▶  Reasoning agent  ──▶  Perception  ──▶  Arms + base
+ scan a build       JSON over        picks the next       finds boxes      pick and place
+ with one click     TCP:5005         block and cell       in 3D
 ```
 
-If the key is already exported in that bot terminal, run just the `--save-api-key` command.
-Saving creates `/home/bracketbot/.config/crafter/openai_api_key` with mode `600`, and a newly
-created `crafter` directory has mode `700`. It refuses to overwrite an existing file. Coordinate
-any key rotation with the server owner rather than deleting or replacing a working credential.
+1. **Scan.** A Fabric mod adds a Structure Scanner item. Right-click it and the mod encodes
+   every block above the world origin as a machine-readable blueprint.
+2. **See.** The robot surveys the room with its stereo camera, turning colour and depth into
+   box detections in its own coordinate frame.
+3. **Reason.** An LLM decides which physical box goes in which grid cell, building bottom-up so
+   every block is supported.
+4. **Build.** A tool-calling loop drives real pick-and-place actions, one block at a time, and
+   feeds the result back so the plan can adapt when a box slips.
 
-Panel startup uses `OPENAI_API_KEY` when set, otherwise it loads the saved file. The loader
-rejects symlinks, non-regular files, incorrect ownership, and group/world-accessible files.
-The saved key works across new SSH sessions. A panel that was already running must be restarted
-by its owner to load a newly saved key; saving does not reconfigure that process automatically.
-Never print the key, copy it into logs, or commit a key-containing file.
+## Repo
 
-### Use the bot-hosted panel from a developer PC
+| Path | What's in it |
+| --- | --- |
+| [`minecraft-mod/`](minecraft-mod/) | Fabric mod for Minecraft 1.21.11 — the Structure Scanner |
+| [`bot-code/`](bot-code/) | Robot app: reasoning agent, perception, planner, actions, voice, control panel |
+| [`WIRE_FORMAT.md`](WIRE_FORMAT.md) | The blueprint format on the wire |
 
-On the bot, first check whether the panel or another receiver is already using its ports:
+## Quick start
 
-```bash
-ss -ltnp '( sport = :8005 or sport = :5005 )'
-```
-
-Use an existing panel if it is already running; do not stop another team's service. If the ports
-are free, start the panel on the bot and leave this terminal running:
-
-```bash
-uv run --offline /home/bracketbot/crafter/bot-code/main.py --ui
-```
-
-In a separate terminal **on your PC**, forward the panel using your approved SSH identity
-(add the same `-i`/identity options you use to connect):
-
-```bash
-ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8005:127.0.0.1:8005 bracketbot@100.66.148.86
-```
-
-Open **http://127.0.0.1:8005** locally and keep the tunnel running. The key and model requests
-stay on the bot. Minecraft sends scans directly to the bot on TCP 5005 by default; the tunnel
-above forwards only the browser panel. Review the preview before clicking Start: model calls
-are real and billable, but physical tool execution is simulated. No build starts automatically.
-
-GitHub Actions secrets are for workflow injection, not a downloadable developer key store:
-`gh secret list` and the API expose metadata, not secret values. For model code running natively
-on a developer PC instead of on the bot, obtain a separately authorized local-development key
-from the project owner; do not use a workflow to print or export the server key.
-
-## Building the mod
+### Build the mod
 
 ```bash
 cd minecraft-mod
 ./gradlew build
 ```
 
-The jar lands in `minecraft-mod/build/libs/`. Drop it in `.minecraft/mods` alongside Fabric API.
+The jar lands in `minecraft-mod/build/libs/`. Drop it in `.minecraft/mods` next to Fabric API
+(Fabric Loader 0.19.5, Fabric API 0.141.6+1.21.11, Java 21).
 
-To run a dev client with the mod loaded, optionally aimed at a local receiver instead of the bot:
+To run a dev client aimed at a local receiver instead of the robot:
 
 ```bash
-cd minecraft-mod
 POSSTREAM_HOST=127.0.0.1 ./gradlew runClient
 ```
 
-`POSSTREAM_HOST` defaults to the bot's address when unset.
+### Set up the world
 
-## The world
-
-The mod expects a superflat world whose surface sits at y=0, so the floor is never included in a
-scan. Create one with this preset:
+Crafter expects a superflat world whose surface sits at y=0, so the floor never ends up in a scan:
 
 ```
 65*minecraft:gray_concrete;minecraft:plains
@@ -140,3 +68,36 @@ Then, in game:
 /gamerule doMobSpawning false
 /give @s posstream:structure_scanner
 ```
+
+### Run the panel
+
+The panel receives designs on TCP 5005, previews them, and starts builds. **It runs on the robot,
+not on your laptop** — the cameras, the arms and the saved API key all live there.
+
+```bash
+# on the bot
+uv run --offline /home/bracketbot/crafter/bot-code/main.py --ui
+
+# on your PC
+ssh -N -L 127.0.0.1:8005:127.0.0.1:8005 bracketbot@100.66.148.86
+```
+
+Open <http://127.0.0.1:8005>, review the preview, then press Start. Nothing builds on its own.
+
+## Status
+
+Perception, reasoning and the build loop run end to end against an offline simulator, so a build
+needs no model, no API key and no robot. Physical motion is documented and partly implemented,
+but no live action provider is wired up yet — a hardware build fails preflight by design.
+
+## What's next
+
+- More than cardboard: a wider range of block types, colours and textures
+- Closed-loop visual feedback so Crafter spots a fallen block and fixes it mid-build
+- Larger structures, built alongside you while you're still designing in-game
+
+## More docs
+
+[`bot-code/README.md`](bot-code/README.md) is the robot architecture and runbook.
+[`AGENTS.md`](AGENTS.md) has the operational rules, API-key handling and verified commands.
+[`PLAN.md`](PLAN.md) is the goals-and-sequencing plan.
