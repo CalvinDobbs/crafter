@@ -180,7 +180,17 @@ Relevant results during this work:
 - 33 focused backend/panel/CLI tests passed during key setup.
 - 25 panel tests passed during the Clear blueprint deployment.
 
-These are historical checkpoint results. Other developers have since changed reasoning, perception, voice, and panel code. Use the current commands in `AGENTS.md` for fresh verification. Routine tests must not make paid model calls or move hardware.
+Current baseline, run on Windows at `07664c4`:
+
+- 106 focused reasoning/adapter/backend/CLI/panel tests pass with the command above.
+- 20 pickup motion tests pass with
+  `python -B -m unittest discover -s bot-code/actions -p test_pickup.py` (NumPy
+  required; fake bbos and virtual time, no hardware).
+
+The older numbers are historical checkpoints from a moving codebase. On Windows use
+the focused selection above rather than full discovery — `AGENTS.md` explains why
+`SavedKeyTests` misbehaves there. Routine tests must not make paid model calls or
+move hardware.
 
 ## Important constraints
 
@@ -190,6 +200,12 @@ These are historical checkpoint results. Other developers have since changed rea
 - Placement evidence must be measured after terminal action completion.
 - `ActionOutcome.ts` is immutable transition/completion time; `observed_at` is the heartbeat.
 - Perception provider cleanup closes sensing/transport resources only. It must not park, release, or move a loaded robot.
+- The arm daemon cuts torque as soon as its control writer disappears, and re-sends
+  that every second. **Closing an `arm_*.ctrl` writer drops whatever the arm is
+  holding**, so a load-preserving `cancel()`/`stop()` can never be implemented by
+  closing writers or cutting torque. This is the mechanism behind the rule above.
+- The two arms do not mirror by a single sign flip: `ik_sign`, `gripper_sign` and the
+  J0 term all differ per arm. Convert through each arm's own `q2urdf`/`urdf2q`.
 - `contracts.py` and `WIRE_FORMAT.md` remain frozen.
 - Preserve uncommitted perception work on the bot. Always inspect the remote tree and services before updating or launching anything.
 - The main panel uses a light theme with warm red accents. Preserve native light controls, canvas colors, and viewport containment.
