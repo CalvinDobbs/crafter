@@ -320,6 +320,7 @@ function render(s) {
   if (design && !design.buildable) text('design-warning', `Preview received, but this build cannot start: ${design.error}`);
   const enabled = !!(connected && design && design.buildable && s.llm_ready && !s.worker_busy && !submitting);
   byId('start-build').disabled = !enabled;
+  byId('clear-blueprint').disabled = !connected || !design || submitting;
   text('start-hint', s.worker_busy && screen === 'main' ? 'Finishing the cancelled model request. You can start again shortly.' : !design ? 'Receive a design to get started.' : !s.llm_ready ? 'Configure your API key to enable real reasoning.' : !design.buildable ? 'Adjust the schematic and scan it again.' : 'Uses the model API. Physical actions are simulated.');
   byId('load-example').disabled = submitting;
   text('receiver-detail', s.receiver.listening ? `Minecraft receiver ready on TCP :${s.receiver.port} · latest design only` : s.receiver.error || 'Minecraft receiver is starting');
@@ -371,6 +372,7 @@ for (const button of document.querySelectorAll('[data-angle]')) {
   });
 }
 byId('start-build').addEventListener('click', () => { if (state && state.design) command('/api/builds', {design_id: state.design.id}); });
+byId('clear-blueprint').addEventListener('click', () => { if (state && state.design) command('/api/clear', {design_id: state.design.id}); });
 byId('cancel-build').addEventListener('click', () => command('/api/cancel', {job_id: state.job.id}));
 byId('failed-back').addEventListener('click', () => command('/api/main'));
 byId('back-main').addEventListener('click', () => command('/api/main'));

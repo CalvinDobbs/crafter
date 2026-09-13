@@ -183,6 +183,7 @@ class PanelSession:
         self.view = "main"
         self.notice = ""
         self.sequence = 0
+        self.design_sequence = 0
         self.revision = 0
         self.receiver = {"listening": False, "port": 5005, "error": None}
         self.worker = None
@@ -221,12 +222,21 @@ class PanelSession:
                   "size": [max(b[axis] for b in blocks)+1 for axis in ("x", "y", "z")],
                   "palette": parsed.palette, "buildable": parsed.buildable, "error": parsed.error}
         with self.lock:
-            if self.design and sequence <= int(self.design["id"]):
+            if sequence <= self.design_sequence:
                 return False
-            self.design = design
+            self.design, self.design_sequence = design, sequence
             self.notice = ""
             self.revision += 1
             return True
+
+    def clear_design(self, design_id):
+        with self.lock:
+            if not self.design or self.design["id"] != design_id:
+                raise ValueError("design changed; review the latest preview before clearing")
+            self.design = None
+            self.design_sequence = max(self.design_sequence, self.sequence)
+            self.notice = ""
+            self.revision += 1
 
     def receiver_status(self, listening, port, error=None):
         with self.lock:
@@ -466,6 +476,14 @@ def create_app(session=None, receiver_host="0.0.0.0", receiver_port=5005, model=
     def back():
         try:
             session.back()
+            return {"ok": True}
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @app.post("/api/clear")
+    def clear(body: dict):
+        try:
+            session.clear_design(body.get("design_id"))
             return {"ok": True}
         except ValueError as exc:
             raise HTTPException(409, str(exc)) from exc

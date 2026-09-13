@@ -61,6 +61,64 @@ class PanelTests(unittest.TestCase):
         self.assertFalse(session.receive(payload(), sequence=old))
         self.assertEqual(session.snapshot()["design"]["id"], str(new))
 
+    def test_clear_removes_design_and_preserves_configuration(self):
+        session = self.session()
+        session.receive(payload())
+        session.receiver_notice("Previous scan rejected")
+        before = session.snapshot()
+        session.clear_design(before["design"]["id"])
+        state = session.snapshot()
+        self.assertIsNone(state["design"])
+        self.assertIsNone(state["job"])
+        self.assertEqual(state["notice"], "")
+        self.assertEqual(state["view"], "main")
+        self.assertTrue(state["llm_ready"])
+        self.assertEqual(state["receiver"], before["receiver"])
+        self.assertGreater(state["revision"], before["revision"])
+        with self.assertRaisesRegex(ValueError, "wait for a Minecraft design"):
+            session.start(before["design"]["id"])
+        self.assertTrue(session.receive(payload()))
+        self.assertNotEqual(session.snapshot()["design"]["id"], before["design"]["id"])
+
+    def test_stale_clear_cannot_discard_a_newer_design(self):
+        session = self.session()
+        session.receive(payload())
+        old_id = session.snapshot()["design"]["id"]
+        session.receive(payload())
+        before = session.snapshot()
+        for design_id in (old_id, None):
+            with self.subTest(design_id=design_id), self.assertRaisesRegex(ValueError, "design changed"):
+                session.clear_design(design_id)
+        self.assertEqual(session.snapshot(), before)
+
+    def test_clear_preserves_active_build_and_its_completion(self):
+        started, release = threading.Event(), threading.Event()
+        class Blocking:
+            def decide(self, context, choices):
+                started.set()
+                release.wait(3)
+                return choices[0]
+        session = self.session(Blocking)
+        self.addCleanup(release.set)
+        session.receive(payload())
+        design_id = session.snapshot()["design"]["id"]
+        session.start(design_id)
+        self.assertTrue(started.wait(2))
+        before = session.snapshot()
+        session.clear_design(design_id)
+        state = session.snapshot()
+        self.assertIsNone(state["design"])
+        self.assertEqual(state["job"], before["job"])
+        self.assertEqual(state["view"], "build")
+        self.assertTrue(state["worker_busy"])
+        self.assertFalse(session.cancel_event.is_set())
+        release.set()
+        self.assertTrue(session.wait(5))
+        state = session.snapshot()
+        self.assertEqual(state["job"]["status"], "completed")
+        self.assertEqual(len(state["job"]["placed"]), 4)
+        self.assertIsNone(state["design"])
+
     def test_waits_for_design_and_key(self):
         session = PanelSession(tool_delay=0)
         self.addCleanup(session.close)
@@ -221,6 +279,22 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         await writer.wait_closed()
         self.assertEqual(self.session.snapshot()["design"]["id"], latest)
 
+    async def test_clear_ignores_inflight_scan_and_accepts_next_scan(self):
+        reader, writer = await asyncio.open_connection("127.0.0.1", self.receiver.port)
+        try:
+            writer.write(json.dumps(payload()).encode())
+            await writer.drain()
+            await self.send(payload())
+            self.session.clear_design(self.session.snapshot()["design"]["id"])
+            writer.write_eof()
+            await reader.read()
+            self.assertIsNone(self.session.snapshot()["design"])
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        await self.send(payload())
+        self.assertEqual(self.session.snapshot()["design"]["count"], 4)
+
 
 class PanelAssetsTests(unittest.TestCase):
     def test_script_dom_references_exist(self):
@@ -241,6 +315,12 @@ class PanelAssetsTests(unittest.TestCase):
         self.assertFalse(referenced-set(parser.ids))
         self.assertNotIn("innerHTML", script)
         self.assertNotIn("https://", script)
+
+    def test_clear_button_is_on_main_screen(self):
+        html = (Path(__file__).resolve().parents[1] / "panel.html").read_text()
+        main = html.split('<section id="main-screen"', 1)[1].split("</section>", 1)[0]
+        self.assertRegex(main, r'<button\b[^>]*\bid="clear-blueprint"[^>]*\bdisabled')
+        self.assertIn("Clear blueprint", main)
 
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_javascript_syntax(self):
@@ -270,11 +350,38 @@ class PanelAssetsTests(unittest.TestCase):
         before = context.eval("JSON.stringify(view.project([0, 0, 0]))")
         context.eval("view.yaw += .4; view.draw();")
         self.assertNotEqual(before, context.eval("JSON.stringify(view.project([0, 0, 0]))"))
+        context.eval("view.selected = '0,0,0'; view.set(null, 'design', [], null);")
+        self.assertEqual(context.eval("view.blocks.length"), 0)
+        self.assertEqual(context.eval("view.faces.length"), 0)
+        self.assertIsNone(context.eval("view.selected"))
 
 
 @unittest.skipUnless(importlib.util.find_spec("fastapi") and importlib.util.find_spec("httpx"),
                      "web dependencies available through the uv app environment")
 class PanelHTTPTests(unittest.TestCase):
+    def test_clear_requires_csrf_and_current_design(self):
+        from fastapi.testclient import TestClient
+        from panel import create_app
+        session = PanelSession(FirstChoice, tool_delay=0)
+        with TestClient(create_app(session, receiver_host="127.0.0.1", receiver_port=0)) as client:
+            headers = {"X-Crafter-Token": client.get("/api/state").json()["csrf"]}
+            self.assertEqual(client.post("/api/example", headers=headers).status_code, 200)
+            before = client.get("/api/state").json()
+            body = {"design_id": before["design"]["id"]}
+            self.assertEqual(client.post("/api/clear", json=body).status_code, 403)
+            self.assertEqual(client.post("/api/clear", json={"design_id": "stale"}, headers=headers).status_code, 409)
+            self.assertEqual(client.get("/api/state").json()["design"], before["design"])
+            response = client.post("/api/clear", json=body, headers=headers)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"ok": True})
+            state = client.get("/api/state").json()
+            self.assertIsNone(state["design"])
+            self.assertEqual(state["view"], "main")
+            self.assertTrue(state["llm_ready"])
+            self.assertEqual(client.post("/api/builds", json=body, headers=headers).status_code, 409)
+            self.assertEqual(client.post("/api/example", headers=headers).status_code, 200)
+            self.assertNotEqual(client.get("/api/state").json()["design"]["id"], body["design_id"])
+
     def test_key_entry_requires_csrf_and_is_never_echoed(self):
         from fastapi.testclient import TestClient
         from panel import create_app
