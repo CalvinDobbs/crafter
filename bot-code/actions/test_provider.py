@@ -390,15 +390,15 @@ class DriveTests(unittest.TestCase):
 class YawTests(unittest.TestCase):
     """The base turns clockwise for a positive command; that inversion is corrected once."""
 
-    def test_set_twist_corrects_the_hardware_inversion(self):
+    def test_a_positive_command_reaches_the_hardware_positive(self):
         rig = FakeRig()
         armctl.Rig.set_twist(rig, 0.0, 0.4)          # ask for +CCW
-        # measured on the robot: positive twist[1] turns it clockwise, so the command is negated
-        self.assertAlmostEqual(float(rig._twist[1]), armctl.YAW_COMMAND_SIGN * 0.4)
-        self.assertLess(float(rig._twist[1]), 0.0)
+        # measured against the raw IMU: +twist[1] turns the base CCW, so no correction is applied
+        self.assertAlmostEqual(float(rig._twist[1]), 0.4)
 
-    def test_the_measured_sign_is_recorded_as_inverted(self):
-        self.assertEqual(armctl.YAW_COMMAND_SIGN, -1.0)
+    def test_the_measured_sign_matches_the_documented_convention(self):
+        # perception's base_yaw uses the opposite convention; it is not what drive.ctrl speaks
+        self.assertEqual(armctl.YAW_COMMAND_SIGN, 1.0)
 
     def test_turn_by_stops_on_measured_angle_not_elapsed_time(self):
         rig = FakeRig()
