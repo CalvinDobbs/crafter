@@ -104,15 +104,19 @@ class Geometry:
             if box.id != request.step.box_id:
                 continue
             age = self.clock() - box.last_seen
-            if not box.current and age > limit:
-                raise StaleGeometry(f"box {box.id} last seen {age:.1f}s ago, beyond the "
-                                    f"{limit:.1f}s a heading may be trusted")
-            return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
+            if box.current or age <= limit:
+                return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
+            break       # too old to prefer; fall through to the position the request carries
 
-        # The track is gone, not merely stale. This detector's tracker mints a NEW id whenever a
-        # box blinks out and back -- ids climbed 1000, 1003, 1008, 1041 across one session on a
-        # single box -- so the id the controller selected can simply cease to exist mid-approach,
-        # which stopped one drive dead after two centimetres.
+        # No usable live sighting: the track is gone, or too old to prefer. Both happen
+        # constantly and neither means the box moved.
+        #
+        # The tracker mints a NEW id whenever a box blinks out and back -- ids climbed 1000, 1003,
+        # 1008, 1041 across one session on a single box -- so the selected id can simply cease to
+        # exist mid-approach. And a sighting goes stale fastest during exactly the manoeuvre that
+        # makes seeing impossible: one approach turned 78 degrees onto its box, which put the box
+        # out of frame for the whole turn and burned the entire staleness budget before the robot
+        # had driven anywhere.
         #
         # Fall back to the position the request itself carries. That position was measured and
         # validated at admission, and it is in the same world frame this snapshot uses, which the
