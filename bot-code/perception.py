@@ -5,6 +5,8 @@
 #   "opencv-python-headless",
 #   "fastapi",
 #   "uvicorn",
+#   "onnxruntime==1.22.1",
+#   "tokenizers==0.21.4",
 # ]
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
@@ -46,9 +48,24 @@ geometric consistency only, not successful execution of a motor command.
 
 Run from anywhere: uv run /home/bracketbot/crafter/bot-code/perception.py --viz --mock
 Live: --viz --pose-source wheel-imu; use --pose-source wheel to exclude IMU yaw.
---self-test runs synthetic regressions without bbos. /scan is a versioned JSON
-snapshot; /frame is the matching rectified camera view. All sensor reads occur
-in one worker, not concurrent web handlers. Mock buttons never move hardware.
+--self-test runs synthetic regressions without bbos. /scan includes independent
+stream freshness and sensor telemetry. /frame?view=rect|raw|range selects a
+rectified image, the independent wide left head image, or sparse camera range.
+--capture /tmp/new-frame.jpg --image-view range saves a diagnostic JPEG without
+overwriting. For local markerless proposals, first run --prepare-detector, then
+--viz --detector boxes. Pinned YOLO-World ONNX weights (AGPL-3.0) and CLIP assets
+live in ~/.cache/crafter-perception, not the repo. No images are uploaded.
+Detection uses CPU-only ONNX Runtime in a low-priority spawned process, one
+in-flight frame, full-view plus near-field tile, and timestamp-matched depth.
+The boxes stream is an explicitly delayed snapshot, not a current camera overlay.
+GET /objects exposes session-local track IDs, original bboxes, raw detector scores,
+identity status, age, and visible-surface estimates. Null position means missing
+or unreliable geometry. These are NOT box-center/grasp poses; pick_candidate is
+always false for this experimental backend. Legacy scan_all remains unchanged.
+False positives, missed boxes, merge/split events, odometry drift and depth jitter
+remain possible. Camera/base calibration and build-zone setup are still required.
+All sensor reads occur in one worker, not concurrent web handlers. Mock buttons
+never move hardware.
 """
 from __future__ import annotations
 
@@ -59,7 +76,7 @@ import math
 import threading
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -242,6 +259,7 @@ class Scan:
     warnings: list = field(default_factory=list)
     anchor_seen: bool = False
     diagnostics: dict = field(default_factory=dict)
+    objects: list = field(default_factory=list)
     points: np.ndarray = field(default_factory=lambda: np.empty((0, 3)), repr=False)
 
 
@@ -477,6 +495,9 @@ class LiveSource:
         self.rect = self.stack.enter_context(Reader("camera.rect", keeptime=False, aligned_to=self.points))
         self.wheels = self.stack.enter_context(Reader("drive.state", keeptime=False))
         self.imu = self.stack.enter_context(Reader("imu.orientation", keeptime=False))
+        self.head = self.stack.enter_context(Reader("camera.head.jpeg", keeptime=False))
+        self.raw_jpeg, self.raw_ts = b"", 0.0
+        self.sensor_ts = {"wheel": 0.0, "imu": 0.0}
         drive = Config("drive")
         self.odom = Odometry(drive.wheel_diam, drive.robot_width, source)
         extrinsic = np.asarray(Config("depth").camera_to_base_3x4)
@@ -487,12 +508,19 @@ class LiveSource:
         self.last_frame = 0.0
 
     def poll(self):
+        if self.head.ready():
+            d = self.head.data
+            n = int(d["jpeg_len"])
+            if 0 < n <= len(d["jpeg"]):
+                self.raw_jpeg, self.raw_ts = bytes(d["jpeg"][:n]), _stamp(d)
         if self.imu.ready():
             d = self.imu.data
+            self.sensor_ts["imu"] = _stamp(d)
             self.imu_sample = (_stamp(d), math.radians(float(d["rpy"][2])))
         if self.wheels.ready():
             d, yaw = self.wheels.data, None
             ts = _stamp(d)
+            self.sensor_ts["wheel"] = ts
             if self.imu_sample and abs(ts-self.imu_sample[0]) < .15:
                 yaw = self.imu_sample[1]
             self.odom.update(ts, np.array(d["pos"], dtype=float), yaw)
@@ -526,14 +554,733 @@ def _stamp(data):
 
 # ---- public API -------------------------------------------------------------
 
+MODEL_CACHE = Path.home() / ".cache" / "crafter-perception" / "yolo-world-v2"
+MODEL_ASSETS = (
+    ("detector.onnx", "https://huggingface.co/Instemic/yolo-world-onnx/resolve/7e1d02c9467c32b141df81890737490764776785/yolov8s-worldv2.onnx",
+     51142204, "381ced485b23ed8f06de3e82bb2745e1420c181c64f0a176784c34a959d550a1"),
+    ("text.onnx", "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a/onnx/text_model_quantized.onnx",
+     64504507, "73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a"),
+    ("tokenizer.json", "https://huggingface.co/Xenova/clip-vit-base-patch32/resolve/d15189d7028b43f1d3e65039190477f6af591c2a/tokenizer.json",
+     2224119, "git:bc1f77d20440541dd073ebae6f6c401087c7d34e"),
+)
+
+
+def _check_asset(path, size, expected):
+    import hashlib
+    if path.stat().st_size != size:
+        raise ValueError(f"unexpected size for {path.name}")
+    git = expected.startswith("git:")
+    digest = hashlib.sha1() if git else hashlib.sha256()
+    if git:
+        digest.update(f"blob {size}\0".encode())
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected.removeprefix("git:"):
+        raise ValueError(f"checksum mismatch for {path.name}")
+
+
+def prepare_detector(cache=MODEL_CACHE):
+    """Download pinned ONNX data, never remote Python code. YOLO weights: AGPL-3.0."""
+    import os
+    import tempfile
+    import urllib.request
+    cache = Path(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, url, size, checksum in MODEL_ASSETS:
+        target = cache / name
+        if target.exists():
+            _check_asset(target, size, checksum)
+            print(f"Verified cached {name}", flush=True)
+            continue
+        print(f"Downloading {name} ({size/1e6:.1f} MB)", flush=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cache, delete=False) as f:
+                temporary = Path(f.name)
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    total = 0
+                    while chunk := response.read(1024*1024):
+                        total += len(chunk)
+                        if total > size:
+                            raise ValueError(f"oversized download for {name}")
+                        f.write(chunk)
+            _check_asset(temporary, size, checksum)
+            os.link(temporary, target)
+            print(f"Verified {name}", flush=True)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    return cache
+
+
+def _ort_options():
+    import onnxruntime as ort
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 2
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.log_severity_level = 3
+    return options
+
+
+DETECTOR_PROMPTS = ("cardboard box", "person", "chair", "backpack", "laptop", "table")
+
+
+def _hash_file(path):
+    import hashlib
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024*1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_key(value):
+    import hashlib
+    return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()[:20]
+
+
+def _text_embeddings(cache):
+    cache = Path(cache)
+    key = _cache_key({"assets": [(a[0],a[3]) for a in MODEL_ASSETS[1:]], "prompts": DETECTOR_PROMPTS})
+    path = cache/f"text-embeddings-{key}.npy"
+    if path.exists():
+        values = np.load(path,allow_pickle=False)
+        if values.shape!=(1,len(DETECTOR_PROMPTS),512) or values.dtype!=np.float32 or not np.isfinite(values).all():
+            raise ValueError("invalid cached text embeddings")
+        return values
+    import onnxruntime as ort
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(str(cache/"tokenizer.json"))
+    tokenizer.enable_truncation(max_length=77)
+    tokenizer.enable_padding(length=77,pad_id=49407,pad_token="<|endoftext|>")
+    encoded = tokenizer.encode_batch(list(DETECTOR_PROMPTS))
+    inputs = {"input_ids":np.array([e.ids for e in encoded],np.int64),
+              "attention_mask":np.array([e.attention_mask for e in encoded],np.int64)}
+    session = ort.InferenceSession(str(cache/"text.onnx"),_ort_options(),providers=["CPUExecutionProvider"])
+    embeddings = session.run(["text_embeds"],{i.name:inputs[i.name] for i in session.get_inputs()})[0]
+    values = (embeddings/np.linalg.norm(embeddings,axis=-1,keepdims=True))[None].astype(np.float32)
+    with path.open("xb") as f:
+        np.save(f,values,allow_pickle=False)
+    return values
+
+
+def _tensorrt():
+    import importlib
+    import sys
+    try:
+        return importlib.import_module("tensorrt")
+    except ModuleNotFoundError:
+        if sys.version_info[:2]!=(3,10):
+            raise RuntimeError("JetPack TensorRT bindings require Python 3.10; CPU fallback is not automatic")
+        system_path = "/usr/lib/python3.10/dist-packages"
+        if not (Path(system_path)/"tensorrt"/"tensorrt.so").exists():
+            raise RuntimeError("JetPack TensorRT bindings are unavailable")
+        if system_path not in sys.path:
+            sys.path.append(system_path)
+        return importlib.import_module("tensorrt")
+
+
+def _gpu_identity():
+    import ctypes as c
+    driver = c.CDLL("libcuda.so.1")
+    driver.cuInit.argtypes = [c.c_uint]
+    driver.cuDeviceGetName.argtypes = [c.c_void_p,c.c_int,c.c_int]
+    driver.cuDeviceComputeCapability.argtypes = [c.POINTER(c.c_int),c.POINTER(c.c_int),c.c_int]
+    driver.cuDriverGetVersion.argtypes = [c.POINTER(c.c_int)]
+    name,major,minor,version = c.create_string_buffer(128),c.c_int(),c.c_int(),c.c_int()
+    for code in (driver.cuInit(0),driver.cuDeviceGetName(name,128,0),
+                 driver.cuDeviceComputeCapability(c.byref(major),c.byref(minor),0),
+                 driver.cuDriverGetVersion(c.byref(version))):
+        if code:
+            raise RuntimeError(f"CUDA device query failed: {code}")
+    return {"name":name.value.decode(),"sm":f"{major.value}{minor.value}","cuda_driver":version.value}
+
+
+def _engine_spec(size, precision, embeddings, trt_version=None):
+    import hashlib
+    if size%32 or not 320<=size<=960 or precision not in ("fp16","fp32"):
+        raise ValueError("invalid TensorRT build settings")
+    return {"model":MODEL_ASSETS[0][3],"prompts":DETECTOR_PROMPTS,
+            "embeddings":hashlib.sha256(embeddings.tobytes()).hexdigest(),
+            "image_shape":[1,3,math.ceil(size*.75/32)*32,size],
+            "text_shape":[1,len(DETECTOR_PROMPTS),512],"precision":precision,
+            "tensorrt":trt_version or _tensorrt().__version__,"device":_gpu_identity(),
+            "workspace_mib":128,"builder_level":1,"format":1}
+
+
+def _available_memory_mib():
+    fields = dict(line.split(":",1) for line in Path("/proc/meminfo").read_text().splitlines())
+    return int(fields["MemAvailable"].split()[0])/1024
+
+
+def prepare_gpu_detector(cache=MODEL_CACHE,size=512,precision="fp16"):
+    """Build only this app's engine; abort our builder on excessive memory pressure."""
+    import subprocess
+    import uuid
+    cache = Path(cache)
+    for name,_,count,checksum in MODEL_ASSETS:
+        _check_asset(cache/name,count,checksum)
+    embeddings = _text_embeddings(cache)
+    import importlib.metadata
+    version = next((d.version for d in importlib.metadata.distributions(path=["/usr/lib/python3.10/dist-packages"])
+                    if d.metadata.get("Name")=="tensorrt"),None)
+    if version is None:
+        raise RuntimeError("JetPack TensorRT metadata unavailable")
+    spec = _engine_spec(size,precision,embeddings,version)
+    stem = cache/f"trt-{_cache_key(spec)}"
+    engine,manifest = stem.with_suffix(".engine"),stem.with_suffix(".json")
+    if engine.exists() and manifest.exists():
+        saved = json.loads(manifest.read_text())
+        if saved["spec"]!=json.loads(json.dumps(spec)) or saved["engine_sha256"]!=_hash_file(engine):
+            raise ValueError("engine cache validation failed; refusing to overwrite it")
+        print(f"Verified TensorRT cache: {engine}",flush=True)
+        return engine
+    if engine.exists() or manifest.exists():
+        raise ValueError("incomplete engine cache; choose a clean cache location")
+    if _available_memory_mib()<600:
+        raise RuntimeError("less than 600 MiB available; engine build deferred to protect running services")
+    temporary = cache/f"build-{uuid.uuid4().hex}.engine"
+    log = temporary.with_suffix(".log")
+    shapes = "images:"+"x".join(map(str,spec["image_shape"]))+",txt_feats:"+"x".join(map(str,spec["text_shape"]))
+    command = ["/usr/src/tensorrt/bin/trtexec",f"--onnx={cache/'detector.onnx'}",f"--saveEngine={temporary}",
+               f"--optShapes={shapes}","--memPoolSize=workspace:128","--builderOptimizationLevel=1",
+               "--maxAuxStreams=0","--skipInference",f"--tempdir={cache}"]
+    if precision=="fp16":
+        command.append("--fp16")
+    print(f"Building {precision} on {spec['device']['name']}; build log: {log}",flush=True)
+    process = None
+    try:
+        with log.open("xb") as output:
+            process = subprocess.Popen(command,stdout=output,stderr=subprocess.STDOUT)
+            started = time.monotonic()
+            while process.poll() is None:
+                if _available_memory_mib()<300:
+                    raise RuntimeError(f"builder stopped for low available memory; see {log}")
+                if time.monotonic()-started>900:
+                    raise TimeoutError(f"bounded engine build timed out; see {log}")
+                time.sleep(.1)
+        if process.returncode or not temporary.exists():
+            raise RuntimeError(f"TensorRT build failed (exit {process.returncode}); see {log}")
+        import os
+        os.link(temporary,engine)
+        with manifest.open("x") as f:
+            json.dump({"spec":spec,"engine_sha256":_hash_file(engine)},f,indent=2)
+        print(f"Built and checksummed: {engine}",flush=True)
+        return engine
+    finally:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        temporary.unlink(missing_ok=True)
+
+
+class CudaRuntime:
+    def __init__(self):
+        import ctypes as c
+        self.c = c
+        self.lib = c.CDLL("/usr/local/cuda/lib64/libcudart.so")
+        pointer,size = c.c_void_p,c.c_size_t
+        signatures = {"cudaMalloc":[c.POINTER(pointer),size],"cudaFree":[pointer],
+                      "cudaHostAlloc":[c.POINTER(pointer),size,c.c_uint],"cudaFreeHost":[pointer],
+                      "cudaStreamCreateWithFlags":[c.POINTER(pointer),c.c_uint],
+                      "cudaStreamSynchronize":[pointer],"cudaStreamDestroy":[pointer],
+                      "cudaMemcpyAsync":[pointer,pointer,size,c.c_int,pointer]}
+        for name,args in signatures.items():
+            fn = getattr(self.lib,name)
+            fn.argtypes,fn.restype = args,c.c_int
+        self.lib.cudaGetErrorString.argtypes = [c.c_int]
+        self.lib.cudaGetErrorString.restype = c.c_char_p
+
+    def call(self,name,*args):
+        code = getattr(self.lib,name)(*args)
+        if code:
+            raise RuntimeError(f"{name}: {self.lib.cudaGetErrorString(code).decode()}")
+
+
+class TensorRTSession:
+    def __init__(self,cache,size,precision,embeddings):
+        trt = _tensorrt()
+        cache = Path(cache)
+        spec = _engine_spec(size,precision,embeddings)
+        stem = cache/f"trt-{_cache_key(spec)}"
+        engine_path,manifest = stem.with_suffix(".engine"),stem.with_suffix(".json")
+        if not engine_path.exists() or not manifest.exists():
+            raise FileNotFoundError("TensorRT engine missing; run --prepare-gpu-detector first")
+        saved = json.loads(manifest.read_text())
+        if saved["spec"]!=json.loads(json.dumps(spec)) or saved["engine_sha256"]!=_hash_file(engine_path):
+            raise ValueError("TensorRT engine/model/vocabulary cache mismatch")
+        self.cuda = CudaRuntime()
+        c = self.cuda.c
+        self.stream,self.buffers,self.input_names,self.output_names = c.c_void_p(),{},[],[]
+        self.info = {"backend":"tensorrt","precision":precision,"device":spec["device"],"engine":engine_path.name}
+        self.closed,self.last_ms = False,0.0
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.runtime = trt.Runtime(self.logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        if self.engine is None:
+            raise RuntimeError("TensorRT engine deserialization failed")
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError("TensorRT context creation failed")
+        dtypes = {trt.DataType.FLOAT:np.float32,trt.DataType.HALF:np.float16,
+                  trt.DataType.INT32:np.int32,trt.DataType.INT64:np.int64,trt.DataType.BOOL:np.bool_}
+        try:
+            self.cuda.call("cudaStreamCreateWithFlags",c.byref(self.stream),1)
+            for name,shape in (("images",spec["image_shape"]),("txt_feats",spec["text_shape"])):
+                if not self.context.set_input_shape(name,shape):
+                    raise ValueError(f"TensorRT rejected shape for {name}")
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                shape = tuple(self.context.get_tensor_shape(name))
+                if any(d<=0 for d in shape):
+                    raise ValueError(f"unresolved TensorRT shape: {name} {shape}")
+                dtype = np.dtype(dtypes[self.engine.get_tensor_dtype(name)])
+                count = int(np.prod(shape)); nbytes=count*dtype.itemsize
+                device,host = c.c_void_p(),c.c_void_p()
+                self.buffers[name] = {"device":device,"host":host,"nbytes":nbytes}
+                self.cuda.call("cudaMalloc",c.byref(device),nbytes)
+                self.cuda.call("cudaHostAlloc",c.byref(host),nbytes,0)
+                raw = (c.c_ubyte*nbytes).from_address(host.value)
+                self.buffers[name]["array"] = np.frombuffer(raw,dtype=dtype).reshape(shape)
+                if not self.context.set_tensor_address(name,device.value):
+                    raise RuntimeError(f"cannot bind TensorRT tensor {name}")
+                (self.input_names if self.engine.get_tensor_mode(name)==trt.TensorIOMode.INPUT else self.output_names).append(name)
+        except Exception:
+            self.close()
+            raise
+
+    def run(self,outputs,inputs):
+        c = self.cuda.c
+        started = time.monotonic()
+        for name in self.input_names:
+            b = self.buffers[name]
+            if inputs[name].shape!=b["array"].shape:
+                raise ValueError(f"TensorRT shape mismatch for {name}: {inputs[name].shape}")
+            np.copyto(b["array"],inputs[name],casting="same_kind")
+            self.cuda.call("cudaMemcpyAsync",b["device"],b["host"],b["nbytes"],1,self.stream)
+        if not self.context.execute_async_v3(self.stream.value):
+            raise RuntimeError("TensorRT GPU execution failed; no CPU fallback")
+        for name in self.output_names:
+            b = self.buffers[name]
+            self.cuda.call("cudaMemcpyAsync",b["host"],b["device"],b["nbytes"],2,self.stream)
+        self.cuda.call("cudaStreamSynchronize",self.stream)
+        self.last_ms = (time.monotonic()-started)*1000
+        return [self.buffers[name]["array"].copy() for name in (outputs or self.output_names)]
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.stream.value:
+            self.cuda.call("cudaStreamSynchronize",self.stream)
+        self.context = None
+        for b in self.buffers.values():
+            b.pop("array",None)
+            if b["device"].value:
+                self.cuda.call("cudaFree",b["device"])
+            if b["host"].value:
+                self.cuda.call("cudaFreeHost",b["host"])
+        self.buffers.clear()
+        if self.stream.value:
+            self.cuda.call("cudaStreamDestroy",self.stream)
+        self.engine,self.runtime = None,None
+
+
+class BoxDetector:
+    """YOLO-World with explicit CPU or native TensorRT GPU execution."""
+    def __init__(self, cache=MODEL_CACHE, size=640, threshold=.2, backend="cpu", precision="fp16"):
+        if backend not in ("cpu","tensorrt"):
+            raise ValueError("unknown detector backend")
+        if size % 32 or not 320 <= size <= 960 or not 0 < threshold < 1:
+            raise ValueError("invalid detector size/threshold")
+        cache = Path(cache)
+        for name, _, count, checksum in MODEL_ASSETS:
+            if not (cache/name).exists():
+                raise FileNotFoundError("model assets missing; run --prepare-detector first")
+            _check_asset(cache/name, count, checksum)
+        self.prompts = list(DETECTOR_PROMPTS)
+        self.embeddings = _text_embeddings(cache)
+        self.backend = backend
+        if backend=="tensorrt":
+            self.session = TensorRTSession(cache,size,precision,self.embeddings)
+            self.runtime_info = self.session.info
+        else:
+            import onnxruntime as ort
+            self.session = ort.InferenceSession(str(cache/"detector.onnx"),_ort_options(),providers=["CPUExecutionProvider"])
+            self.runtime_info = {"backend":"cpu","providers":self.session.get_providers(),"precision":"fp32"}
+        self.size, self.threshold = size, threshold
+        self.score_range = None
+        self.timings = []
+
+    def close(self):
+        if self.backend=="tensorrt":
+            self.session.close()
+
+    def detect(self, rgb):
+        import cv2
+        h,w = rgb.shape[:2]
+        found = self._detect_single(rgb)
+        if w>=400 and h>=240:
+            x,y = w//4,h//2
+            for item in self._detect_single(rgb[y:,x:w-x]):
+                item["bbox"] = (np.asarray(item["bbox"])+[x,y,x,y]).tolist()
+                found.append(item)
+        if not found:
+            return []
+        boxes = [d["bbox"][:2]+[d["bbox"][2]-d["bbox"][0],d["bbox"][3]-d["bbox"][1]] for d in found]
+        keep = cv2.dnn.NMSBoxes(boxes,[d["score"] for d in found],self.threshold,.45)
+        return [found[int(i)] for i in np.asarray(keep).reshape(-1)][:12]
+
+    def _detect_single(self, rgb):
+        import cv2
+        started = time.monotonic()
+        h, w = rgb.shape[:2]
+        scale = self.size / max(h, w)
+        nw, nh = round(w*scale), round(h*scale)
+        padded_w, padded_h = math.ceil(nw/32)*32, math.ceil(nh/32)*32
+        left, top = (padded_w-nw)//2, (padded_h-nh)//2
+        image = np.full((padded_h,padded_w,3), 114, np.uint8)
+        image[top:top+nh,left:left+nw] = cv2.resize(rgb, (nw,nh), interpolation=cv2.INTER_LINEAR)
+        tensor = image.transpose(2,0,1)[None].astype(np.float32)/255
+        prepared = time.monotonic()
+        out = self.session.run(None, {"images": tensor, "txt_feats": self.embeddings})[0]
+        inferred = time.monotonic()
+        if hasattr(self,"timings"):
+            self.timings.append({"preprocess_ms":(prepared-started)*1000,"inference_ms":(inferred-prepared)*1000})
+            self.timings = self.timings[-2:]
+        if out.shape[1] != 4+len(self.prompts):
+            raise ValueError(f"unexpected detector output {out.shape}")
+        values = out[0].T
+        scores = values[:,4:]
+        self.score_range = [float(scores.min()), float(scores.max())]
+        if scores.min() < -.001 or scores.max() > 1.001:
+            raise ValueError("pinned detector should output sigmoid scores, not logits")
+        scores = np.clip(scores, 0, 1)
+        target = (scores.argmax(axis=1)==0) & (scores[:,0]>=self.threshold)
+        boxes, confidence = values[target,:4], scores[target,0]
+        if not len(boxes):
+            return []
+        xy = (boxes[:,:2]-boxes[:,2:]/2-[left,top])/scale
+        wh = boxes[:,2:]/scale
+        nms = cv2.dnn.NMSBoxes(np.column_stack((xy,wh)).tolist(), confidence.tolist(), self.threshold, .45)
+        result = []
+        for index in np.asarray(nms).reshape(-1):
+            x1,y1 = np.maximum(xy[index], [0,0])
+            x2,y2 = np.minimum(xy[index]+wh[index], [w,h])
+            if x2-x1 >= 3 and y2-y1 >= 3:
+                result.append({"bbox": [float(x1),float(y1),float(x2),float(y2)],
+                               "score": float(confidence[index]), "label": "cardboard_box"})
+        return sorted(result, key=lambda d: -d["score"])[:12]
+
+
+def benchmark_detector(image_path, cache=MODEL_CACHE, size=640, threshold=.2, output=None, backend="cpu", precision="fp16", iterations=10):
+    import cv2
+    import resource
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError("benchmark image cannot be decoded")
+    start = time.monotonic()
+    detector = BoxDetector(cache,size,threshold,backend,precision)
+    load_s = time.monotonic()-start
+    durations = []
+    for _ in range(iterations):
+        start = time.monotonic()
+        detections = detector.detect(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        durations.append(time.monotonic()-start)
+    print(json.dumps({"load_s": load_s, "inference_s": durations,
+                      "peak_rss_mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
+                      "runtime":detector.runtime_info,"p50_ms":float(np.percentile(durations,50)*1000),
+                      "p95_ms":float(np.percentile(durations,95)*1000),"passes":detector.timings,
+                      "score_range": detector.score_range, "detections": detections}, indent=2))
+    detector.close()
+    if output:
+        for d in detections:
+            x1,y1,x2,y2 = [round(v) for v in d["bbox"]]
+            cv2.rectangle(image, (x1,y1), (x2,y2), (80,240,80), 2)
+            cv2.putText(image, f'cardboard box {d["score"]:.2f}', (x1,max(15,y1-5)), cv2.FONT_HERSHEY_SIMPLEX,.45,(80,240,80),1)
+        with Path(output).open("xb") as f:
+            f.write(_encode_jpeg(image))
+
+
+def _bbox_iou(a, b):
+    a, b = np.asarray(a), np.asarray(b)
+    wh = np.maximum(0, np.minimum(a[2:], b[2:])-np.maximum(a[:2], b[:2]))
+    intersection = float(np.prod(wh))
+    union = float(np.prod(a[2:]-a[:2])+np.prod(b[2:]-b[:2]))-intersection
+    return intersection/max(union, 1e-9)
+
+
+def _support_plane(points):
+    if len(points) < 30:
+        return None
+    points = points[::max(1,len(points)//600)]
+    rng, best = np.random.default_rng(7), None
+    for _ in range(40):
+        a,b,c = points[rng.choice(len(points),3,replace=False)]
+        normal = np.cross(b-a,c-a)
+        length = np.linalg.norm(normal)
+        if length < 1e-7:
+            continue
+        normal /= length
+        if abs(normal[2]) < .8:
+            continue
+        mask = np.abs((points-a) @ normal) < .018
+        if best is None or mask.sum() > best.sum():
+            best = mask
+    if best is None or best.sum() < max(25,.55*len(points)):
+        return None
+    center = np.median(points[best],axis=0)
+    _,_,v = np.linalg.svd(points[best]-center, full_matrices=False)
+    normal = v[-1]
+    if normal[2] < 0:
+        normal = -normal
+    return (normal, -float(center @ normal)) if normal[2] > .8 else None
+
+
+def localize_box(detection, points, indices, shape, camera_origin):
+    """Return a visible-surface estimate, never a grasp pose or invented center."""
+    h,w = shape[:2]
+    x1,y1,x2,y2 = detection["bbox"]
+    bw,bh = x2-x1,y2-y1
+    pixels = np.column_stack((indices%w, indices//w))
+    valid = ((indices>=0)&(indices<h*w)&np.isfinite(points).all(axis=1)
+             &(np.linalg.norm(points,axis=1)>1e-3))
+    inside = (valid & (pixels[:,0]>x1+.15*bw)&(pixels[:,0]<x2-.15*bw)
+              &(pixels[:,1]>y1+.15*bh)&(pixels[:,1]<y2-.15*bh))
+    outer = (valid & (pixels[:,0]>x1-.5*bw)&(pixels[:,0]<x2+.5*bw)
+             &(pixels[:,1]>y1-.5*bh)&(pixels[:,1]<y2+.5*bh))
+    whole = ((pixels[:,0]>=x1)&(pixels[:,0]<=x2)&(pixels[:,1]>=y1)&(pixels[:,1]<=y2))
+    pts = points[inside]
+    result = dict(detection, position_base_m=None, position_kind="visible_surface_centroid",
+                  depth_status="missing", depth_points=len(pts), support_clearance_m=None,
+                  partial_view=bool(x1<2 or y1<2 or x2>w-2 or y2>h-2), grasp_pose=None)
+    if len(pts)<MIN_MASK_PTS:
+        return result
+    plane = _support_plane(points[outer & ~whole])
+    if plane is not None:
+        normal, offset = plane
+        heights = pts @ normal+offset
+        pts = pts[(heights>.022)&(heights<.7)]
+        if len(pts)<MIN_MASK_PTS:
+            result["depth_status"] = "background_or_flat_surface"
+            return result
+        result["support_clearance_m"] = float(np.median(pts @ normal+offset))
+        result["depth_status"] = "surface_supported"
+    else:
+        result["depth_status"] = "weak_no_support_plane"
+    distances = np.linalg.norm(pts-camera_origin,axis=1)
+    median = float(np.median(distances))
+    pts = pts[np.abs(distances-median)<.10]
+    if len(pts)<MIN_MASK_PTS:
+        result["depth_status"] = "inconsistent_depth"
+        return result
+    result["position_base_m"] = np.median(pts,axis=0).tolist()
+    result["depth_points"] = len(pts)
+    return result
+
+
+class ObjectTracker:
+    def __init__(self):
+        import uuid
+        self.session_id = uuid.uuid4().hex[:12]
+        self.tracks, self.next_id, self.epoch = {}, 1000, None
+
+    def update(self, detections, pose, ts):
+        if self.epoch != pose.epoch:
+            self.tracks.clear()
+            self.epoch = pose.epoch
+        self.tracks = {i:t for i,t in self.tracks.items() if 0<=ts-t["last_seen"]<30}
+        used, current = set(), []
+        for d in detections:
+            world = pose.to_world(d["position_base_m"]).tolist() if pose.valid and d["position_base_m"] is not None else None
+            matches = []
+            for mid, old in self.tracks.items():
+                if mid in used or ts-old["last_seen"]>10:
+                    continue
+                previous = old["_pose"]
+                still = (pose.valid and previous.valid and math.hypot(pose.x-previous.x,pose.y-previous.y)<.12
+                         and abs(_wrap(pose.yaw-previous.yaw))<.15)
+                iou = _bbox_iou(d["bbox"],old["bbox"]) if still else 0.0
+                age_cost = .15 * (ts-old["last_seen"])
+                if world is not None and old["world_position_m"] is not None:
+                    distance = float(np.linalg.norm(np.asarray(world)-old["world_position_m"]))
+                    if iou>.3 and distance<.35:
+                        matches.append((.8*(1-iou)+.2*distance/.35+age_cost,mid))
+                    elif distance < .18:
+                        matches.append((.7*distance/.18+.3+age_cost,mid))
+                elif iou>.5 and ts-old["last_seen"]<3:
+                    matches.append((1-iou+age_cost,mid))
+            matches.sort()
+            ambiguous = len(matches)>1 and matches[1][0]-matches[0][0]<.12
+            mid = matches[0][1] if matches and not ambiguous else self.next_id
+            if mid == self.next_id:
+                self.next_id += 1
+            confirmations = self.tracks.get(mid,{}).get("confirmations",0)+1
+            item = dict(d, id=mid, track_id=f"box-{mid-999:03d}", tracker_session=self.session_id,
+                        world_position_m=world, observed_position_base_m=d["position_base_m"],
+                        last_seen=ts, pose_epoch=pose.epoch, confirmations=confirmations,
+                        identity_status="ambiguous" if ambiguous else "tracked" if confirmations>1 else "new",
+                        _pose=Pose(**asdict(pose)))
+            self.tracks[mid] = item
+            used.add(mid)
+            current.append(item)
+        return current
+
+    def snapshot(self, pose, build, now, cfg):
+        output = []
+        for item in self.tracks.values():
+            if not 0 <= now-item["last_seen"] <= cfg.memory_s:
+                continue
+            d = {k:v for k,v in item.items() if not k.startswith("_")}
+            same_epoch = pose.epoch==item["pose_epoch"]
+            world = item["world_position_m"] if same_epoch else None
+            d["world_position_m"] = world
+            if not same_epoch:
+                d["identity_status"] = "pose_epoch_changed"
+            position = pose.to_base(world).tolist() if pose.valid and world is not None else None
+            d.update(position_base_m=position, age_s=max(0,now-item["last_seen"]),
+                     current=same_epoch and now-item["last_seen"]<=cfg.fresh_s, pick_candidate=False,
+                     position_frame="base_at_pose_timestamp", pose_timestamp=pose.ts, snapshot_ts=now,
+                     zone="unassigned" if build is None or position is None else
+                     "protected" if is_in_grid(position,build,settings=cfg) else "outside_build")
+            output.append(d)
+        return output
+
+
+def _detector_process(jobs, results, cache, size, threshold, backend="cpu", precision="fp16"):
+    import os
+    os.nice(5)
+    detector = None
+    try:
+        detector = BoxDetector(cache,size,threshold,backend,precision)
+        results.put({"ready": True,"runtime":detector.runtime_info})
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            ts,rgb = job
+            started = time.monotonic()
+            detections = detector.detect(rgb)
+            results.put({"ts": ts, "detections": detections,
+                         "inference_s": time.monotonic()-started,"passes":detector.timings})
+    except Exception as e:
+        results.put({"error": f"{type(e).__name__}: {e}"})
+    finally:
+        if detector is not None:
+            detector.close()
+
+
+class DetectorWorker:
+    def __init__(self, cache=MODEL_CACHE, size=512, threshold=.10, backend="cpu", precision="fp16"):
+        import multiprocessing
+        context = multiprocessing.get_context("spawn")
+        self.jobs, self.results = context.Queue(1), context.Queue(2)
+        self.process = context.Process(target=_detector_process, args=(self.jobs,self.results,cache,size,threshold,backend,precision), daemon=True)
+        self.process.start()
+        self.pending = None
+        self.tracker = ObjectTracker()
+        self.image = (b"",0.0)
+        self.status = {"enabled": True,"state":"loading","error":"","inference_s":None,"requested_backend":backend}
+
+    def poll(self, data, camera_origin):
+        import queue
+        import cv2
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            result = None
+        if result is not None:
+            if "error" in result:
+                self.status.update(state="error", error=result["error"])
+                self.pending = None
+            elif result.get("ready"):
+                self.status.update(state="ready",runtime=result.get("runtime",{}))
+            elif self.pending is not None:
+                rgb,points,indices,ts,pose = self.pending
+                if result["ts"] != ts:
+                    raise ValueError("detector returned a mismatched frame timestamp")
+                localized = [localize_box(d,points,indices,rgb.shape,camera_origin) for d in result["detections"]]
+                objects = self.tracker.update(localized,pose,ts)
+                overlay = cv2.cvtColor(rgb,cv2.COLOR_RGB2BGR)
+                for d in objects:
+                    x1,y1,x2,y2 = [round(v) for v in d["bbox"]]
+                    color = (80,230,100) if d["position_base_m"] is not None else (40,180,255)
+                    cv2.rectangle(overlay,(x1,y1),(x2,y2),color,2)
+                    cv2.putText(overlay,f'{d["track_id"]} score {d["score"]:.2f}',(max(0,x1),max(13,y1-5)),cv2.FONT_HERSHEY_SIMPLEX,.42,color,1)
+                self.image = (_encode_jpeg(overlay),ts)
+                self.pending = None
+                self.status.update(state="ready",inference_s=result["inference_s"],passes=result.get("passes",[]),frame_ts=ts,
+                                   detections=len(objects),localized=sum(d["position_base_m"] is not None for d in objects))
+        if not self.process.is_alive() and self.status["state"]!="error":
+            self.status.update(state="error",error="detector process stopped")
+            self.pending = None
+        if data is not None and self.status["state"]=="ready" and self.pending is None:
+            rgb,points,indices,ts,pose = data
+            self.pending = (rgb.copy(),points.copy(),indices.copy(),ts,Pose(**asdict(pose)))
+            self.jobs.put_nowait((ts,rgb))
+        return result is not None
+
+    def close(self):
+        try:
+            self.jobs.put_nowait(None)
+        except Exception:
+            pass
+        self.process.join(timeout=2)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=1)
+        for q in (self.jobs,self.results):
+            q.cancel_join_thread()
+            q.close()
+
+
+def range_image(points, indices, shape, camera_origin, maximum=3.0):
+    """Camera-range diagnostic in meters; pixels with no valid depth stay black."""
+    import cv2
+    h, w = shape[:2]
+    points, indices = np.asarray(points), np.asarray(indices)
+    if maximum <= 0 or indices.shape != (len(points),):
+        raise ValueError("invalid range image inputs")
+    distances = np.linalg.norm(points - np.asarray(camera_origin), axis=1)
+    valid = (np.isfinite(points).all(axis=1) & np.isfinite(distances)
+             & (distances > .02) & (indices >= 0) & (indices < h*w))
+    depth = np.full(h*w, np.inf, dtype=np.float32)
+    np.minimum.at(depth, indices[valid], distances[valid])
+    known = np.isfinite(depth)
+    scaled = np.zeros(h*w, np.uint8)
+    scaled[known] = np.clip(depth[known] / maximum * 255, 0, 255).astype(np.uint8)
+    colored = cv2.applyColorMap(scaled.reshape(h, w), cv2.COLORMAP_TURBO)
+    colored[~known.reshape(h, w)] = 0
+    return colored
+
+
+def _encode_jpeg(image):
+    import cv2
+    ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    return encoded.tobytes() if ok else b""
+
+
 class PerceptionSession:
-    def __init__(self, mock=False, settings=None, pose_source="wheel-imu"):
+    def __init__(self, mock=False, settings=None, pose_source="wheel-imu", detector=False,
+                 model_cache=MODEL_CACHE, detector_size=512, detector_threshold=.10,
+                 detector_backend="cpu", precision="fp16"):
         self.mock, self.settings = mock, settings or Settings()
         self.world = WorldModel(self.settings)
+        if not mock:
+            import cv2
+            cv2.setNumThreads(1)
         self.source = None if mock else LiveSource(pose_source, self.settings)
         self.scene = MockSource(self.settings) if mock else None
         self.latest = Scan()
         self.jpeg = b""
+        self.streams = {name: (b"", 0.0) for name in ("rect", "range", "raw", "boxes")}
+        self.detector = DetectorWorker(model_cache,detector_size,detector_threshold,detector_backend,precision) if detector and not mock else None
 
     def poll(self):
         if self.mock:
@@ -541,7 +1288,20 @@ class PerceptionSession:
             warnings = ["SIMULATED observations; not camera detection. Same world classifier as live."]
         else:
             data = self.source.poll()
+            detector_changed = False
+            if self.detector:
+                detector_changed = self.detector.poll(data, self.source.camera_origin)
+                self.streams["boxes"] = self.detector.image
+            import cv2
+            if self.source.raw_ts-self.streams["raw"][1] >= .15 and self.source.raw_jpeg:
+                raw = cv2.imdecode(np.frombuffer(self.source.raw_jpeg, np.uint8), cv2.IMREAD_COLOR)
+                if raw is not None:
+                    self.streams["raw"] = (_encode_jpeg(raw[:, :raw.shape[1]//2]), self.source.raw_ts)
             if data is None:
+                if detector_changed and self.latest.ts:
+                    self.latest = replace(self.latest, objects=self.detector.tracker.snapshot(
+                        self.latest.pose, self.latest.build, time.time(), self.settings))
+                    return self.latest
                 return None
             rgb, points, indices, ts, pose = data
             observations, anchor, warnings, markers = observe(
@@ -551,9 +1311,12 @@ class PerceptionSession:
             for mid, corners in markers:
                 cv2.polylines(image, [corners.astype(np.int32)], True, (0, 210, 255), 1)
                 cv2.putText(image, str(mid), tuple(corners[0].astype(int)), cv2.FONT_HERSHEY_SIMPLEX, .5, (0,210,255), 1)
-            ok, encoded = cv2.imencode(".jpg", image)
-            self.jpeg = encoded.tobytes() if ok else b""
+            self.jpeg = _encode_jpeg(image)
+            self.streams["rect"] = (self.jpeg, ts)
+            self.streams["range"] = (_encode_jpeg(range_image(points, indices, rgb.shape, self.source.camera_origin)), ts)
         self.latest = self.world.update(observations, pose, ts, anchor, points, warnings)
+        if self.detector:
+            self.latest.objects = self.detector.tracker.snapshot(pose, self.latest.build, time.time(), self.settings)
         if not self.mock:
             self.latest.diagnostics = {"depth_yaw_deg": self.source.depth_yaw_deg,
                                        "point_count": len(points), "rect_shape": list(rgb.shape),
@@ -565,6 +1328,8 @@ class PerceptionSession:
     def close(self):
         if self.source:
             self.source.close()
+        if self.detector:
+            self.detector.close()
 
 
 def scan(mock=False, *, timeout=4.0, settings=None, pose_source="wheel-imu") -> Scan:
@@ -723,9 +1488,25 @@ def scan_to_dict(s, settings=None, mock=False):
         t["current"] = t["current"] and not stale
         t["pick_candidate"] = bool(t["current"] and t["classification"] == "loose" and build and build["valid"])
         tracks.append(t)
+    objects = []
+    for item in s.objects:
+        o = dict(item)
+        o["age_s"] = max(0, now-o["last_seen"])
+        o["current"] = o["current"] and not stale and o["age_s"] <= cfg.fresh_s
+        o["visibility"] = "recent_detection" if o["age_s"] < 3 else "remembered"
+        if stale:
+            o["position_base_m"] = None
+        objects.append(o)
+        if o["position_base_m"] is not None:
+            tracks.append({"id": o["id"], "name": o["track_id"], "pos": o["position_base_m"],
+                           "world": o["world_position_m"], "age": o["age_s"], "last_seen": o["last_seen"],
+                           "current": o["current"], "classification": "protected" if o["zone"]=="protected" else
+                           "loose" if o["zone"]=="outside_build" else "unknown",
+                           "size": 0.0, "position_kind": o["position_kind"], "depth_status": o["depth_status"],
+                           "score": o["score"], "pick_candidate": False})
     return {"schema_version": 2, "mock": mock, "ts": s.ts, "stale": stale,
             "frame": "base_at_capture", "pose": asdict(s.pose), "build": build,
-            "anchor_seen": s.anchor_seen, "tracks": tracks,
+            "anchor_seen": s.anchor_seen, "tracks": tracks, "objects": objects,
             "boxes": [asdict(d) for d in s.boxes] if not stale else [],
             "protected": [asdict(d) for d in s.protected], "unknown": [asdict(d) for d in s.unknown],
             "surface_cells": s.surface_cells, "settings": asdict(cfg), "diagnostics": s.diagnostics,
@@ -735,18 +1516,23 @@ def scan_to_dict(s, settings=None, mock=False):
 
 # ---- debug visualizer ---------------------------------------------------------
 
-def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", host="127.0.0.1"):
+def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", host="127.0.0.1",
+              detector=False, model_cache=MODEL_CACHE, detector_size=512, detector_threshold=.10,
+              detector_backend="cpu", precision="fp16"):
     from fastapi import FastAPI, HTTPException, Response
     from fastapi.responses import HTMLResponse
     import uvicorn
     cfg = settings or Settings()
     lock, stop = threading.Lock(), threading.Event()
-    shared = {"scan": Scan(), "jpeg": b"", "error": "waiting for sensors", "actions": deque()}
+    shared = {"scan": Scan(), "streams": {}, "sensor_ts": {}, "sensor_pose": Pose(),
+              "error": "waiting for sensors", "actions": deque(),
+              "detector_status": {"enabled": detector, "state": "loading" if detector else "disabled"}}
 
     def worker():
         session = None
         try:
-            session = PerceptionSession(mock, cfg, pose_source)
+            session = PerceptionSession(mock,cfg,pose_source,detector,model_cache,detector_size,detector_threshold,
+                                        detector_backend,precision)
             while not stop.is_set():
                 with lock:
                     actions = list(shared["actions"])
@@ -754,9 +1540,15 @@ def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", hos
                 for action in actions:
                     session.scene.command(action)
                 result = session.poll()
-                if result is not None:
-                    with lock:
-                        shared.update(scan=result, jpeg=session.jpeg, error="")
+                with lock:
+                    shared["streams"] = dict(session.streams)
+                    if session.detector:
+                        shared["detector_status"] = dict(session.detector.status)
+                    if session.source:
+                        shared["sensor_ts"] = dict(session.source.sensor_ts)
+                        shared["sensor_pose"] = Pose(**asdict(session.source.odom.pose))
+                    if result is not None:
+                        shared.update(scan=result, error="")
                 stop.wait(.2 if mock else .005)
         except Exception as e:
             with lock:
@@ -785,18 +1577,41 @@ def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", hos
     def scan_json():
         with lock:
             out = scan_to_dict(shared["scan"], cfg, mock)
+            now = time.time()
+            out["streams"] = {name: {"ts": ts, "age_s": max(0, now-ts) if ts else None,
+                                      "fresh": bool(data) and 0 <= now-ts <= (3.0 if name=="boxes" else cfg.fresh_s)}
+                              for name, (data, ts) in shared["streams"].items()}
+            out["telemetry"] = {"pose": asdict(shared["sensor_pose"]),
+                                "ages": {name: max(0, now-ts) if ts else None
+                                         for name, ts in shared["sensor_ts"].items()}}
+            out["detector"] = "simulated observations" if mock else (
+                f"YOLO-World / requested {detector_backend}; see runtime status for actual backend" if detector else "ArUco only")
+            out["detector_status"] = dict(shared["detector_status"])
+            if out["detector_status"].get("error"):
+                out["warnings"].append(out["detector_status"]["error"])
             if shared["error"]:
                 out["warnings"].append(shared["error"])
             return out
 
+    @app.get("/objects")
+    def object_json():
+        d = scan_json()
+        return {"schema_version": 1, "snapshot_ts": d["ts"], "pose": d["pose"],
+                "objects": d["objects"], "detector_status": d["detector_status"],
+                "limitations": "surface estimates, not grasp poses; IDs are session-local; ambiguous identity is explicit"}
+
     @app.get("/frame")
-    def frame():
+    def frame(view: str = "rect"):
+        if view not in {"rect", "range", "raw", "boxes"}:
+            raise HTTPException(400, "view must be rect, range, raw or boxes")
         with lock:
             if mock:
                 return Response(status_code=204)
-            if not shared["jpeg"] or time.time()-shared["scan"].ts > cfg.fresh_s:
+            data, ts = shared["streams"].get(view, (b"", 0.0))
+            if not data or not 0 <= time.time()-ts <= (3.0 if view=="boxes" else cfg.fresh_s):
                 return Response(status_code=503)
-            return Response(shared["jpeg"], media_type="image/jpeg", headers={"Cache-Control": "no-store"})
+            return Response(data, media_type="image/jpeg",
+                            headers={"Cache-Control": "no-store", "X-Frame-Timestamp": str(ts)})
 
     @app.post("/mock/{action}")
     def mock_action(action: str):
@@ -814,45 +1629,86 @@ def serve_viz(port=8007, mock=False, settings=None, pose_source="wheel-imu", hos
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
-_VIZ_PAGE = r"""<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Crafter Perception</title>
+_VIZ_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crafter | Perception monitor</title>
 <style>
-*{box-sizing:border-box}body{margin:0;padding:18px;background:#0b111b;color:#dbe5f5;font:14px system-ui,sans-serif}h1{font-size:22px;margin:0 0 5px}p{color:#91a6c3}button,select{background:#1b2a40;color:#eaf1ff;border:1px solid #3c506d;border-radius:5px;padding:8px;cursor:pointer}header{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap}.layout{display:grid;grid-template-columns:minmax(480px,2fr) minmax(280px,1fr);gap:16px;margin-top:12px}section{background:#111d2c;border:1px solid #2c3b52;border-radius:8px;padding:12px}canvas{display:block;width:100%;background:#0c1522}#side{max-height:260px}#cam{width:100%;margin-top:10px}#warning{color:#ffcf80;white-space:pre-wrap}#info{white-space:pre-wrap;font:12px monospace}table{width:100%;border-collapse:collapse;font:12px monospace}td,th{padding:7px 3px;text-align:left;border-bottom:1px solid #29384e}#mock{display:none;margin-top:10px;gap:6px;flex-wrap:wrap}.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin:10px 0}.loose{color:#58dfb6}.protected{color:#ffb85c}.unknown{color:#c8a0ef}.muted{color:#8c9aaf}.status{font:13px monospace}@media(max-width:850px){.layout{grid-template-columns:1fr}}a{color:#92c5ff}
+:root{color-scheme:dark;--bg:#0b1018;--panel:#131d2a;--edge:#2a394f;--text:#e8effa;--muted:#9dafc6;--green:#62dfb6;--amber:#ffbf69;--blue:#74baff;--purple:#c7a5ff}
+*{box-sizing:border-box}body{margin:0;padding:20px;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,sans-serif;max-width:1800px;margin-inline:auto}
+h1{font-size:25px;line-height:1.2;margin:0}h2{font-size:16px;margin:0}p{margin:5px 0;color:var(--muted)}small{color:var(--muted)}button,select,a.button{background:#1c2b3f;border:1px solid #405371;color:var(--text);border-radius:6px;font:inherit;padding:7px 10px;cursor:pointer;text-decoration:none}button:hover,select:hover{border-color:var(--blue)}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--blue)}a{color:var(--blue)}[hidden]{display:none!important}
+header,.panelhead,.toolbar,.legend{display:flex;align-items:center;gap:10px;flex-wrap:wrap}header,.panelhead{justify-content:space-between}header{margin-bottom:16px}.eyebrow{font-size:11px;letter-spacing:.16em;color:var(--blue);margin-bottom:5px}.pill{display:inline-block;border:1px solid var(--edge);padding:4px 10px;border-radius:20px;font:12px ui-monospace,monospace}.ok{color:var(--green)}.warn{color:var(--amber)}.bad{color:#ff8b97}.health{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.health article{background:var(--panel);border:1px solid var(--edge);padding:12px 15px;border-radius:8px}.health strong{display:block;font-size:18px;margin:3px 0}.health small{display:block;min-height:20px}
+.workspace,.lower{display:grid;grid-template-columns:1.1fr 1fr;gap:14px;margin-top:14px}.panel{min-width:0;background:var(--panel);border:1px solid var(--edge);border-radius:9px;overflow:hidden}.panelhead{padding:12px 14px;border-bottom:1px solid var(--edge)}.panelbody{padding:12px 14px}.camera-stage{background:#080e16;aspect-ratio:4/3;display:grid;place-items:center;position:relative}.camera-stage img{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}.placeholder{text-align:center;max-width:380px;padding:24px;color:var(--muted)}.placeholder strong{display:block;color:var(--text);font-size:18px;margin-bottom:8px}.camera-caption{padding:10px 14px;min-height:58px;font-size:13px}.range-legend{padding:8px 14px;border-top:1px solid var(--edge)}.ramp{height:9px;border-radius:4px;background:linear-gradient(90deg,#30123b,#455ad1,#1bd0d5,#a4fc3c,#f8b52a,#7a0403);margin:5px 0}.range-labels{display:flex;justify-content:space-between;font:12px ui-monospace,monospace}.legend{font-size:12px;padding:9px 14px;color:var(--muted)}.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}.legend span{white-space:nowrap}canvas{display:block;width:100%;background:#0b1521}#map{height:clamp(330px,43vw,590px)}#side{height:245px}.map-foot{padding:8px 14px;color:var(--muted);font-size:12px;border-top:1px solid var(--edge)}.notice{padding:10px 14px;background:#142238;border-left:3px solid var(--blue);border-radius:4px;color:#bdd3f0}.mock-controls{padding:10px 14px;background:#26231d;border:1px solid #5c4a2c;border-radius:6px;margin:10px 0}.mock-controls .toolbar{margin-top:8px}.table-wrap{overflow:auto;max-height:285px}table{border-collapse:collapse;width:100%;font:13px ui-monospace,monospace}th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--edge);white-space:nowrap}th{color:var(--muted);font-size:11px;text-transform:uppercase;position:sticky;top:0;background:var(--panel)}tr.selected{background:#243a50}tbody tr{cursor:pointer}tbody tr:hover{background:#1e2f43}.empty{padding:25px;text-align:center;color:var(--muted)}#selection{padding:9px 14px;color:var(--blue);font:12px ui-monospace,monospace;min-height:38px}.diagnostics{margin-top:14px;border:1px solid var(--edge);border-radius:8px;padding:12px 14px;background:var(--panel)}summary{cursor:pointer;font-weight:600}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.6 ui-monospace,monospace}#warnings{color:var(--amber)}footer{color:var(--muted);font-size:12px;margin:14px 0}.nowrap{white-space:nowrap}
+@media(max-width:1050px){.workspace,.lower{grid-template-columns:1fr 1fr}body{padding:12px}.panelhead{align-items:flex-start}.health strong{font-size:16px}}
+@media(max-width:760px){.workspace,.lower{grid-template-columns:1fr}.health{grid-template-columns:1fr 1fr}#map{height:420px}.camera-stage{max-height:65vh}h1{font-size:22px}}
 </style></head><body>
-<header><div><h1>Crafter / perception</h1><p>Surrounding observation grid. Empty space is unknown, not confirmed free.</p></div><div><select id="view"><option value="robot">Robot-centered, heading up</option><option value="world">Session-world view</option></select><select id="range"><option value="2">2 m radius</option><option value="1">1 m radius</option><option value="3">3 m radius</option></select></div></header>
-<div class="status" id="status">Connecting...</div>
-<div id="mock"><button data-action="turn_left">Turn +45°</button><button data-action="turn_right">Turn -45°</button><button data-action="forward">Forward 15 cm</button><button data-action="back">Back 15 cm</button><button data-action="visibility">Toggle all / limited visibility</button><button data-action="anchor">Toggle anchor</button><button data-action="pose">Toggle pose loss</button><button data-action="stack_next">Simulate next placement</button><button data-action="reset">Reset mock</button></div>
-<div class="layout"><section><div class="legend"><span class="loose">Green: loose observation</span><span class="protected">Amber: protected build zone</span><span class="unknown">Purple: unknown</span><span class="muted">Dashed: remembered, NOT pickable</span></div><canvas id="map" width="800" height="800"></canvas><p>Blue cells: measured surfaces (height shown by intensity). No collision-free or grasp-reach claims.</p></section><section><h3>Box heights / base-frame side view</h3><canvas id="side" width="600" height="240"></canvas><p id="cameraLabel">Waiting for mode...</p><img id="cam" hidden alt="Rectified camera frame with marker outlines"><div id="warning"></div><pre id="info"></pre><table><thead><tr><th>ID</th><th>Class</th><th>Age</th><th>Base xyz (m)</th></tr></thead><tbody id="rows"></tbody></table></section></div>
+<header><div><div class="eyebrow">CRAFTER / SENSOR WORKBENCH</div><h1>Perception monitor</h1><p>Inspect the scene. No motors, no autonomous actions.</p></div><div class="toolbar"><span id="mode" class="pill">CONNECTING</span><span id="connection" class="pill">Waiting for server</span><a href="/scan" target="_blank" rel="noopener" class="button">Snapshot JSON</a></div></header>
+<div class="health">
+<article><small>CAMERA</small><strong id="camera-state">Waiting</strong><small id="camera-detail">Checking image stream</small></article>
+<article><small>DEPTH</small><strong id="depth-state">Waiting</strong><small id="depth-detail">Checking sparse pointcloud</small></article>
+<article><small>ROBOT POSE</small><strong id="pose-state">Waiting</strong><small id="pose-detail">Wheel / IMU estimate</small></article>
+<article><small>BUILD ANCHOR</small><strong id="anchor-state">Not observed</strong><small id="anchor-detail">Optional for scene inspection</small></article>
+</div>
+<div id="notice" class="notice">Camera and depth can be inspected without markers. Box identification is a separate stage.</div>
+<div id="mock" class="mock-controls" hidden><strong>Simulation controls — fixture only, not the robot</strong><div class="toolbar"><button data-action="turn_left">Turn +45°</button><button data-action="turn_right">Turn −45°</button><button data-action="forward">Forward 15 cm</button><button data-action="back">Back 15 cm</button><button data-action="visibility">Toggle visibility</button><button data-action="anchor">Hide / show anchor</button><button data-action="pose">Lose / restore pose</button><button data-action="stack_next">Third box placement</button><button data-action="reset">Reset</button></div></div>
+<main class="workspace">
+<section class="panel"><div class="panelhead"><h2>Robot camera</h2><div class="toolbar"><select id="image-view" aria-label="Camera stream"><option value="camera">Camera · auto</option><option value="rect">Rectified + markers</option><option value="raw">Wide head camera</option><option value="range">Depth range</option><option value="boxes">Box detections · snapshot</option></select><a id="open-image" href="/frame" target="_blank" rel="noopener" class="button">Open image</a></div></div><div class="camera-stage"><div id="camera-empty" class="placeholder"><strong>Waiting for an image</strong>Checking camera and depth streams.</div><img id="cam" hidden alt="Robot camera or depth range image"></div><div id="range-legend" class="range-legend" hidden><div>Distance from camera · not height</div><div class="ramp"></div><div class="range-labels"><span>0 m</span><span>1.5 m</span><span>3 m+</span></div><small>Black pixels have no valid depth measurement.</small></div><div id="cameraLabel" class="camera-caption">Images are read-only. A box visible in RGB is not yet a tracked box.</div></section>
+<section class="panel"><div class="panelhead"><h2>Surrounding map</h2><div class="toolbar"><select id="view" aria-label="Map frame"><option value="robot">Robot-centered</option><option value="world">Session world</option></select><select id="range" aria-label="Map radius"><option value="2">2 m radius</option><option value="1">1 m radius</option><option value="3">3 m radius</option><option value="fit">Fit objects</option></select></div></div><div class="legend"><span><i style="background:#62dfb6"></i>Loose</span><span><i style="background:#ffbf69"></i>Protected</span><span><i style="background:#c7a5ff"></i>Unknown</span><span>Dashed = memory, not a fresh candidate</span></div><canvas id="map" width="640" height="520"></canvas><div id="map-foot" class="map-foot">Blue cells are surface observations. Empty cells are unknown—not free space.</div></section>
+</main>
+<div class="lower"><section class="panel"><div class="panelhead"><h2>Height inspection</h2><small id="height-mode">Auto-scaled to observations</small></div><canvas id="side" width="640" height="245"></canvas><div class="map-foot">Objects sharing a horizontal position share a column. This is geometry, not proof of a successful placement.</div></section><section class="panel"><div class="panelhead"><h2>Box tracks</h2><span id="track-count" class="pill">0 tracks</span></div><div id="selection">Select a row to highlight its location.</div><div class="table-wrap"><table><thead><tr><th>ID / state</th><th>Age</th><th>Forward x</th><th>Left y</th><th>Height z</th></tr></thead><tbody id="rows"></tbody></table><div id="no-tracks" class="empty">No box tracks yet. Check the camera and detector status.</div></div></section></div>
+<details class="diagnostics" open><summary>Sensor diagnostics and limitations</summary><div id="warnings"></div><pre id="info">Waiting for telemetry…</pre></details>
+<footer>Read-only perception. Wheel/IMU dead reckoning drifts; this is not a navigation safety map. No pick/place controls are exposed here.</footer>
 <script>
-const cv=document.getElementById('map'),ctx=cv.getContext('2d');
-const side=document.getElementById('side'),sc=side.getContext('2d');
-let data=null;
-function framePoint(p,d){if(document.getElementById('view').value==='robot')return p;const c=Math.cos(d.pose.yaw),s=Math.sin(d.pose.yaw);return [d.pose.x+c*p[0]-s*p[1],d.pose.y+s*p[0]+c*p[1],p[2]];}
-function px(p,d){const q=framePoint(p,d),scale=360/Number(document.getElementById('range').value);return [400-q[1]*scale,400-q[0]*scale];}
-function path(points,d,close=false){ctx.beginPath();points.forEach((p,i)=>{const q=px(p,d);i?ctx.lineTo(...q):ctx.moveTo(...q)});if(close)ctx.closePath();}
-function dot(p,c,r,label,d){ctx.fillStyle=c;ctx.beginPath();ctx.arc(...px(p,d),r,0,Math.PI*2);ctx.fill();if(label){ctx.fillStyle='#e8f0ff';ctx.fillText(label,px(p,d)[0]+9,px(p,d)[1]-8);}}
-function gridSquare(center,col,row,half,d){path([[1,1],[-1,1],[-1,-1],[1,-1]].map(([u,v])=>center.map((n,i)=>n+u*half*col[i]+v*half*row[i])),d,true);}
-function draw(d){
-ctx.clearRect(0,0,800,800);ctx.font='12px monospace';const radius=Number(document.getElementById('range').value),scale=360/radius;
-ctx.strokeStyle='#1d2e43';ctx.lineWidth=1;
-for(let t=-radius;t<=radius+.001;t+=d.settings.resolution){ctx.beginPath();ctx.moveTo(400+t*scale,40);ctx.lineTo(400+t*scale,760);ctx.stroke();ctx.beginPath();ctx.moveTo(40,400+t*scale);ctx.lineTo(760,400+t*scale);ctx.stroke();}
-for(const c of d.surface_cells){const height=Math.max(0,Math.min(1,c.z_max/1.8));ctx.fillStyle=`rgba(49,${Math.round(90+height*110)},220,${Math.max(.07,.4*(1-c.age/d.settings.memory_s))})`;const yaw=d.pose.yaw,co=Math.cos(yaw),si=Math.sin(yaw);gridSquare(c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
-if(d.build){ctx.strokeStyle=d.build.valid?'#ffb85c':'#755f48';for(const c of d.build.cells){gridSquare(c,d.build.col,d.build.row,d.settings.cell/2,d);ctx.stroke();}dot(d.build.marker,'#ff7373',5,'anchor 49',d);ctx.strokeStyle='#ef6479';path([d.build.origin,d.build.origin.map((v,i)=>v+.2*d.build.col[i])],d);ctx.stroke();ctx.strokeStyle='#73d497';path([d.build.origin,d.build.origin.map((v,i)=>v+.2*d.build.row[i])],d);ctx.stroke();}
-ctx.strokeStyle='#3c5b7e';ctx.setLineDash([6,7]);path([[1.5*Math.cos(.838),1.5*Math.sin(.838),0],[0,0,0],[1.5*Math.cos(.838),-1.5*Math.sin(.838),0]],d);ctx.stroke();ctx.setLineDash([]);
-const grouped=new Map();for(const t of d.tracks){const p=px(t.pos,d),k=p.map(v=>Math.round(v/15)).join(',');if(!grouped.has(k))grouped.set(k,[]);grouped.get(k).push(t);}
-for(const group of grouped.values()){const t=group[0],color={loose:'#58dfb6',protected:'#ffb85c',unknown:'#c8a0ef'}[t.classification];ctx.globalAlpha=t.current?1:.45;ctx.strokeStyle=color;ctx.lineWidth=2;ctx.setLineDash(t.current?[]:[3,3]);const p=px(t.pos,d);ctx.beginPath();ctx.arc(...p,8,0,Math.PI*2);ctx.stroke();if(t.current)dot(t.pos,color,5,null,d);ctx.fillStyle='#e8f0ff';ctx.fillText(group.map(b=>'#'+b.id).join(' / '),p[0]+11,p[1]-10);ctx.globalAlpha=1;ctx.setLineDash([]);}
+const $=id=>document.getElementById(id);
+const cv=$('map'),ctx=cv.getContext('2d'),side=$('side'),sc=side.getContext('2d');
+const colors={loose:'#62dfb6',protected:'#ffbf69',unknown:'#c7a5ff'};
+let data=null, selected=null, frameKey='', bounds={w:640,h:520,scale:100}, labels=[];
+const fmt=(v,n=2)=>Number.isFinite(v)?v.toFixed(n):'—';
+const age=v=>Number.isFinite(v)?(v<1?Math.round(v*1000)+' ms':v.toFixed(1)+' s'):'no data';
+const objectName=t=>t.name||('#'+t.id);
+function tableTracks(d){return d.tracks.concat((d.objects||[]).filter(o=>!o.position_base_m).map(o=>({id:o.id,name:o.track_id,pos:[null,null,null],age:o.age_s,current:o.current,classification:'2D only',depth_status:o.depth_status,score:o.score,pick_candidate:false})));}
+function prepare(canvas,c){const b=canvas.getBoundingClientRect(),w=Math.max(100,b.width),h=Math.max(100,b.height),dpr=Math.min(window.devicePixelRatio||1,2);if(canvas.width!==Math.round(w*dpr)||canvas.height!==Math.round(h*dpr)){canvas.width=Math.round(w*dpr);canvas.height=Math.round(h*dpr);}c.setTransform(dpr,0,0,dpr,0,0);c.clearRect(0,0,w,h);c.font='13px system-ui';return {w,h};}
+function framePoint(p,d){if($('view').value==='robot')return p;const c=Math.cos(d.pose.yaw),s=Math.sin(d.pose.yaw);return [d.pose.x+c*p[0]-s*p[1],d.pose.y+s*p[0]+c*p[1],p[2]];}
+function radius(d){if($('range').value!=='fit')return Number($('range').value);const points=[[0,0,0],...d.tracks.map(t=>t.pos),...(d.build?d.build.cells:[])];return d.tracks.length?Math.max(.6,Math.min(5,Math.max(...points.map(p=>Math.max(...framePoint(p,d).slice(0,2).map(Math.abs))))+.25)):2;}
+function px(p,d){const q=framePoint(p,d);return [bounds.w/2-q[1]*bounds.scale,bounds.h/2-q[0]*bounds.scale];}
+function path(points,d,close=false){ctx.beginPath();points.forEach((p,i)=>i?ctx.lineTo(...px(p,d)):ctx.moveTo(...px(p,d)));if(close)ctx.closePath();}
+function square(center,col,row,half,d){path([[1,1],[-1,1],[-1,-1],[1,-1]].map(([u,v])=>center.map((n,i)=>n+u*half*col[i]+v*half*row[i])),d,true);}
+function label(text,p,color){const w=ctx.measureText(text).width+12,h=22;let r;for(const [dx,dy] of [[14,-30],[14,10],[-w-14,-30],[-w-14,12],[14,-55],[-w-14,36]]){const candidate={x:p[0]+dx,y:p[1]+dy,w,h};if(candidate.x<4||candidate.y<30||candidate.x+w>bounds.w-4||candidate.y+h>bounds.h-20)continue;if(!labels.some(a=>candidate.x<a.x+a.w&&candidate.x+w>a.x&&candidate.y<a.y+a.h&&candidate.y+h>a.y)){r=candidate;break;}}if(!r)return;labels.push(r);ctx.strokeStyle=color;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(...p);ctx.lineTo(r.x+w/2,r.y+h/2);ctx.stroke();ctx.fillStyle='#101c2a';ctx.fillRect(r.x,r.y,w,h);ctx.strokeRect(r.x,r.y,w,h);ctx.fillStyle='#eff6ff';ctx.fillText(text,r.x+6,r.y+15);}
+function groups(d){const out=[];for(const t of d.tracks){let g=out.find(g=>Math.hypot(g[0].pos[0]-t.pos[0],g[0].pos[1]-t.pos[1])<.015);if(g)g.push(t);else out.push([t]);}return out;}
+function drawMap(d){bounds=prepare(cv,ctx);const r=radius(d);bounds.scale=(Math.min(bounds.w,bounds.h)-72)/(2*r);labels=[];ctx.lineWidth=1;ctx.strokeStyle='#1b2b40';
+for(let t=-r;t<=r+.001;t+=d.settings.resolution){ctx.beginPath();ctx.moveTo(bounds.w/2+t*bounds.scale,30);ctx.lineTo(bounds.w/2+t*bounds.scale,bounds.h-25);ctx.stroke();ctx.beginPath();ctx.moveTo(20,bounds.h/2+t*bounds.scale);ctx.lineTo(bounds.w-20,bounds.h/2+t*bounds.scale);ctx.stroke();}
+for(const c of d.surface_cells){const height=Math.max(0,Math.min(1,c.z_max/1.8));ctx.fillStyle=`rgba(49,${Math.round(90+height*110)},220,${Math.max(.06,.46*(1-c.age/d.settings.memory_s))})`;const co=Math.cos(d.pose.yaw),si=Math.sin(d.pose.yaw);square(c.pos,[co,-si,0],[si,co,0],d.settings.resolution/2,d);ctx.fill();}
+if(d.build){ctx.lineWidth=1.5;ctx.strokeStyle=d.build.valid?'#ffbf69':'#806c53';for(const c of d.build.cells){square(c,d.build.col,d.build.row,d.settings.cell/2,d);ctx.stroke();}ctx.fillStyle='#ff8087';ctx.beginPath();ctx.arc(...px(d.build.marker,d),5,0,Math.PI*2);ctx.fill();label('Anchor 49',px(d.build.marker,d),'#ff8087');}
+if(d.mock){ctx.strokeStyle='#537694';ctx.setLineDash([5,7]);path([[r*.8*Math.cos(.838),r*.8*Math.sin(.838),0],[0,0,0],[r*.8*Math.cos(.838),-r*.8*Math.sin(.838),0]],d);ctx.stroke();ctx.setLineDash([]);}
+for(const group of groups(d)){const t=group[0],p=px(t.pos,d),color=colors[t.classification],current=group.some(t=>t.current),highlight=group.some(t=>t.id===selected);ctx.globalAlpha=current?1:.45;ctx.strokeStyle=highlight?'#fff':color;ctx.lineWidth=highlight?3:2;ctx.setLineDash(current?[]:[4,3]);ctx.beginPath();ctx.arc(...p,highlight?9:7,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);if(current){ctx.fillStyle=color;ctx.beginPath();ctx.arc(...p,3,0,Math.PI*2);ctx.fill();}ctx.globalAlpha=1;label(group.map(objectName).join(' / '),p,color);}
 // robot
-ctx.fillStyle='#69b7ff';path([[.11,0,0],[-.06,.06,0],[-.06,-.06,0]],d,true);ctx.fill();dot([0,0,0],'#69b7ff',4,null,d);
-ctx.fillStyle='#aec1da';ctx.fillText((document.getElementById('view').value==='robot'?'Forward +x / left +y':'Fixed session axes / robot heading shown by arrow')+' | '+d.settings.resolution.toFixed(2)+' m cells',18,22);ctx.fillText('FOV wedge is illustrative, not a calibrated visibility/free-space mask.',18,786);
-sc.clearRect(0,0,600,240);const maxZ=Math.max(.4,...d.tracks.map(t=>t.pos[2]+t.size)),zscale=175/maxZ;
-sc.strokeStyle='#52657b';sc.beginPath();sc.moveTo(30,215);sc.lineTo(580,215);sc.stroke();sc.font='12px monospace';
-for(const t of d.tracks){const x=300-t.pos[1]*220/radius,z=215-t.pos[2]*zscale;sc.globalAlpha=t.current?1:.4;sc.fillStyle={loose:'#58dfb6',protected:'#ffb85c',unknown:'#c8a0ef'}[t.classification];sc.fillRect(x-8,z-t.size*zscale/2,16,Math.max(4,t.size*zscale));sc.fillText('#'+t.id+' '+t.pos[2].toFixed(2)+'m',x+12,z);sc.globalAlpha=1;}
-sc.fillStyle='#a5b6cc';sc.fillText('Height +z; horizontal = base +y (left)',12,16);
-}
-async function tick(){try{const response=await fetch('/scan',{cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);data=await response.json();const d=data;draw(d);document.getElementById('status').textContent=`${d.mock?'SIMULATION':'LIVE / READ ONLY'} | pose=${d.pose.source} ${d.pose.valid?'valid':'UNAVAILABLE'} | epoch=${d.pose.epoch} | ${d.stale?'STALE':'fresh snapshot'} | anchor=${d.anchor_seen?'seen':d.build?'remembered':'unknown'}`;document.getElementById('mock').style.display=d.mock?'flex':'none';document.getElementById('warning').textContent=d.warnings.join('\n');document.getElementById('info').textContent=`Session pose: x=${d.pose.x.toFixed(2)} y=${d.pose.y.toFixed(2)} yaw=${(d.pose.yaw*180/Math.PI).toFixed(1)}°\n${d.map_semantics}\nAnchor age: ${d.build?d.build.age.toFixed(1)+'s':'unavailable'}\n${d.mock?'Buttons affect this fixture only.':'Wheel/IMU drifts; floor planarity, wheel signs and geometry require calibration.'}`;const rows=document.getElementById('rows');rows.replaceChildren();for(const t of d.tracks){const tr=document.createElement('tr');for(const v of [t.id,t.classification+(t.current?'':' (memory)'),t.age.toFixed(1)+'s',t.pos.map(n=>n.toFixed(2)).join(', ')]){const td=document.createElement('td');td.textContent=v;tr.appendChild(td);}rows.appendChild(tr);}document.getElementById('cameraLabel').textContent=d.mock?'No camera image in mock; geometric observations are simulated.':'Rectified camera image. Markers outlined, depth correspondence uses idx_2d.';const image=document.getElementById('cam');image.hidden=d.mock;if(!d.mock)image.src='/frame?t='+d.ts;}catch(e){document.getElementById('status').textContent='DISCONNECTED: '+e.message;}finally{setTimeout(tick,500);}}
-document.getElementById('cam').onerror=()=>{document.getElementById('cameraLabel').textContent='Camera frame unavailable or stale.';};
-for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{const r=await fetch('/mock/'+b.dataset.action,{method:'POST'});if(!r.ok)throw Error(await r.text());}catch(e){document.getElementById('warning').textContent=e.message;}};
-document.getElementById('view').onchange=()=>data&&draw(data);document.getElementById('range').onchange=()=>data&&draw(data);tick();
+ctx.fillStyle='#74baff';path([[.13,0,0],[-.07,.065,0],[-.07,-.065,0]],d,true);ctx.fill();const robot=px([0,0,0],d);ctx.fillStyle='#a9d5ff';ctx.fillText('Robot',robot[0]+12,robot[1]+18);
+ctx.fillStyle='#b4c5dc';ctx.fillText($('view').value==='robot'?'UP = forward +x   LEFT = +y':'Session world / fixed axes',14,19);ctx.fillText(`${Math.round(d.settings.resolution*100)} cm cells · ${fmt(r,1)} m radius`,14,bounds.h-8);
+$('map-foot').textContent=`${d.surface_cells.length} observed surface cells · blank = unknown. ${d.stale?'Map snapshot STALE. ':''}${d.mock?'Dashed wedge is simulated visibility.':'No calibrated free-space or reachability inference.'}`;}
+function drawHeights(d){const {w,h}=prepare(side,sc),gs=groups(d);if(!gs.length){sc.fillStyle='#9dafc6';sc.fillText('No box geometry to inspect yet.',25,h/2-8);sc.fillText('Camera/depth can be healthy without box tracks.',25,h/2+16);$('height-mode').textContent='Waiting for box detections';return;}
+const anchored=d.build&&d.build.valid,datum=anchored?d.build.origin[2]:0;const lows=d.tracks.map(t=>t.pos[2]-t.size/2-datum),highs=d.tracks.map(t=>t.pos[2]+t.size/2-datum);const lo=(anchored?Math.min(0,...lows):Math.min(...lows))-.025,hi=Math.max(...highs)+.04,scale=(h-58)/(hi-lo),py=z=>h-33-(z-lo)*scale;
+$('height-mode').textContent=d.objects?.length?'Visible-surface z estimates, not box centers':anchored?'Centimeters above build surface':'Absolute z · auto-zoomed';sc.font='12px system-ui';for(let i=0;i<=4;i++){const z=lo+(hi-lo)*i/4,y=py(z);sc.strokeStyle='#293b50';sc.beginPath();sc.moveTo(48,y);sc.lineTo(w-12,y);sc.stroke();sc.fillStyle='#9dafc6';sc.fillText(fmt(z*100,0),8,y+4);}
+if(anchored){sc.strokeStyle='#ffbf69';sc.setLineDash([5,4]);sc.beginPath();sc.moveTo(48,py(0));sc.lineTo(w-12,py(0));sc.stroke();sc.setLineDash([]);sc.fillStyle='#ffbf69';sc.fillText('Build surface',55,py(0)-5);}
+gs.forEach((g,i)=>{const x=60+(w-85)*(i+.5)/gs.length;for(const t of g){const top=py(t.pos[2]+t.size/2-datum),height=t.size*scale;sc.globalAlpha=t.current?1:.4;sc.fillStyle=colors[t.classification];sc.fillRect(x-15,top,30,Math.max(3,height-1));if(t.id===selected){sc.strokeStyle='#fff';sc.strokeRect(x-17,top-2,34,height+3);}if(height>14){sc.fillStyle='#071019';sc.fillText('#'+t.id,x-11,top+Math.min(height-3,16));}sc.globalAlpha=1;}sc.fillStyle='#dbe8f8';sc.fillText(g.map(t=>t.name?t.name.replace('box-','B'):'#'+t.id).join('/'),x-15,h-10);});}
+function setHealth(name,value,detail,tone){$(name+'-state').textContent=value;$(name+'-state').className=tone;$(name+'-detail').textContent=detail;}
+function camera(d){let view=$('image-view').value;if(view==='camera')view=d.detector_status?.enabled&&d.streams?.boxes?.fresh?'boxes':d.streams?.rect?.fresh?'rect':'raw';const s=d.streams?.[view];const image=$('cam'),empty=$('camera-empty');$('range-legend').hidden=view!=='range'||d.mock;
+if(d.mock||!s?.fresh){image.hidden=true;empty.hidden=false;empty.textContent=d.mock?'Simulation has no camera pixels. Use the map controls to exercise memory and classification.':'Selected stream unavailable or stale. Try Camera · auto to inspect the independent head camera.';frameKey='';}else{const key=view+':'+s.ts;if(frameKey!==key){frameKey=key;image.src='/frame?view='+view+'&t='+s.ts;}empty.hidden=true;image.hidden=false;}
+$('open-image').href='/frame?view='+view;
+$('cameraLabel').textContent=d.mock?'Mock geometry only; no computer-vision model runs on this scene.':({raw:'Wide left head camera. Independent of depth; no box recognition overlay.',rect:'Rectified 512×384 camera. Marker outlines only; untagged boxes are not identified.',range:'Sparse camera-range image: cool = nearer, warm = farther. Black = no valid depth.',boxes:'DELAYED detection snapshot. Labels, image and depth use the SAME captured frame. Scores are not calibrated probabilities.'}[view])+' Frame age: '+age(s?.age_s);}
+function render(d){$('mode').textContent=d.mock?'SIMULATION':'LIVE · READ ONLY';$('mode').className='pill '+(d.mock?'warn':'ok');$('connection').textContent=d.stale?'Sensor snapshot stale':'Connected';$('connection').className='pill '+(d.stale?'warn':'ok');$('mock').hidden=!d.mock;
+const streams=d.streams||{},cam=streams.raw?.fresh||streams.rect?.fresh,depth=streams.range?.fresh;const p=d.mock?d.pose:(d.telemetry?.pose||d.pose),ages=d.telemetry?.ages||{};
+setHealth('camera',d.mock?'Simulated':cam?'Receiving':'No fresh image',d.mock?'No camera pixels':`Raw ${age(streams.raw?.age_s)} · rectified ${age(streams.rect?.age_s)}`,d.mock?'warn':cam?'ok':'bad');
+setHealth('depth',d.mock?'Simulated':depth?'Receiving':'Unavailable',d.mock?d.surface_cells.length+' fixture surface cells':(d.diagnostics?.point_count||0).toLocaleString()+' points · '+age(streams.range?.age_s),d.mock?'warn':depth?'ok':'bad');
+setHealth('pose',p.valid?p.source:'Unavailable',`x ${fmt(p.x)} · y ${fmt(p.y)} m · yaw ${fmt(p.yaw*180/Math.PI,1)}°`,p.valid?'ok':'bad');
+setHealth('anchor',d.anchor_seen?'Seen':d.build?.valid?'Remembered':'Not set',d.build?'Last observed '+age(d.build.age):'Only needed for build-zone classification',d.build?.valid?'ok':'warn');
+$('notice').textContent=d.mock?'Mock and live use the same classifier. These buttons only change simulated geometry.':d.detector_status?.enabled?`Local box detector: ${d.detector_status.state} · last inference ${fmt(d.detector_status.inference_s,2)} s. IDs are session-local. Surface estimates are NOT grasp poses; unknown build zone stays unassigned.`:'Camera and depth inspection: active independently of markers. Enable --detector boxes for local markerless box proposals.';
+$('track-count').textContent=tableTracks(d).length+' tracks · '+d.tracks.length+' on map';$('no-tracks').hidden=tableTracks(d).length>0;const rows=$('rows');rows.replaceChildren();for(const t of tableTracks(d)){const tr=document.createElement('tr');tr.className=t.id===selected?'selected':'';for(const v of [objectName(t)+' '+(t.name&&t.classification==='unknown'?'zone unassigned':t.classification)+(t.current?'':' / memory'),age(t.age),fmt(t.pos[0],3),fmt(t.pos[1],3),fmt(t.pos[2],3)]){const td=document.createElement('td');td.textContent=v;tr.appendChild(td);}tr.onclick=()=>{selected=t.id;render(data);};rows.appendChild(tr);}
+const chosen=tableTracks(d).find(t=>t.id===selected);$('selection').textContent=chosen?`${objectName(chosen)} ${chosen.depth_status||''} score ${fmt(chosen.score)}: ${chosen.current?'observed now':'remembered only'} · ${chosen.pick_candidate?'candidate, reach/grasp NOT validated':'not a fresh pick candidate'}`:'Select a track row to highlight it in both views.';
+$('warnings').textContent=d.warnings.join(' | ');$('info').textContent=`Capture pose epoch ${d.pose.epoch} · frame ${d.frame}\nWheel age ${age(ages.wheel)} · IMU age ${age(ages.imu)}\nDepth-to-forward yaw ${fmt(d.diagnostics?.depth_yaw_deg,1)}° · pose/camera skew ${age(d.diagnostics?.pose_camera_skew_s)}\n${d.detector||'Observation source: mock'}\n${p.warning||''}\n${d.map_semantics}`;
+camera(d);drawMap(d);drawHeights(d);}
+async function tick(){const abort=new AbortController(),timer=setTimeout(()=>abort.abort(),3000);try{const response=await fetch('/scan',{cache:'no-store',signal:abort.signal});if(!response.ok)throw Error('HTTP '+response.status);data=await response.json();render(data);}catch(e){$('connection').textContent='Disconnected';$('connection').className='pill bad';$('warnings').textContent='No current snapshot: '+e.message;$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='Disconnected. Last map is not live.';}finally{clearTimeout(timer);setTimeout(tick,400);}}
+$('cam').onerror=()=>{frameKey='';$('cam').hidden=true;$('camera-empty').hidden=false;$('camera-empty').textContent='Image unavailable or stale; checking again.';};
+for(const b of document.querySelectorAll('[data-action]'))b.onclick=async()=>{try{const r=await fetch('/mock/'+b.dataset.action,{method:'POST'});if(!r.ok)throw Error(await r.text());}catch(e){$('warnings').textContent=e.message;}};
+for(const id of ['view','range','image-view'])$(id).onchange=()=>{frameKey='';if(data)render(data);};window.addEventListener('resize',()=>data&&render(data));tick();
 </script></body></html>"""
 
 
@@ -902,6 +1758,193 @@ def self_test():
             np.testing.assert_allclose(rotation @ [1,0,0], [0,-1,0], atol=1e-12)
             identity, _ = depth_heading_rotation(matrix, 0)
             np.testing.assert_allclose(identity, np.eye(3))
+
+        def test_range_image_invalid_and_duplicate_pixels(self):
+            points = np.array([[0,0,2], [0,0,1], [np.nan,0,1], [0,0,1], [0,0,0]], float)
+            image = range_image(points, np.array([0,0,1,-1,2]), (2,2,3), [0,0,0])
+            self.assertEqual(image.shape, (2,2,3))
+            self.assertTrue(image[0,0].any())
+            self.assertFalse(image[0,1].any())
+            self.assertFalse(image[1].any())
+            reference = range_image(np.array([[0,0,1.]]), np.array([0]), (2,2,3), [0,0,0])
+            np.testing.assert_equal(image, reference)
+
+        def test_raw_camera_available_without_depth(self):
+            from unittest.mock import patch
+            from types import SimpleNamespace
+            raw = np.full((80,160,3), 120, np.uint8)
+            fake = SimpleNamespace(raw_jpeg=_encode_jpeg(raw), raw_ts=time.time(), poll=lambda: None, close=lambda: None)
+            with patch(__name__+'.LiveSource', return_value=fake):
+                session = PerceptionSession()
+                self.assertIsNone(session.poll())
+                encoded, ts = session.streams['raw']
+                decoded = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
+                self.assertEqual(decoded.shape, (80,80,3))
+                self.assertEqual(ts, fake.raw_ts)
+                self.assertFalse(session.streams['rect'][0])
+                session.close()
+
+        def test_box_localization_rejects_flat_background(self):
+            y,x = np.mgrid[:40,:40]
+            points = np.column_stack((.5+x.ravel()*.005,y.ravel()*.005,np.zeros(1600)))
+            ids = np.arange(1600)
+            d = {"bbox":[14,14,26,26],"score":.3,"label":"cardboard_box"}
+            flat = localize_box(d,points,ids,(40,40,3),np.array([0,0,1.6]))
+            self.assertIsNone(flat['position_base_m'])
+            self.assertEqual(flat['depth_status'],'background_or_flat_surface')
+            on_box = (x.ravel()>=14)&(x.ravel()<=26)&(y.ravel()>=14)&(y.ravel()<=26)
+            points[on_box,2] = .1
+            box = localize_box(d,points,ids,(40,40,3),np.array([0,0,1.6]))
+            self.assertEqual(box['depth_status'],'surface_supported')
+            self.assertAlmostEqual(box['position_base_m'][2],.1)
+            self.assertEqual(box['position_kind'],'visible_surface_centroid')
+            self.assertIsNone(box['grasp_pose'])
+
+        def test_box_missing_depth_is_still_2d(self):
+            d = {"bbox":[2,2,12,12],"score":.3,"label":"cardboard_box"}
+            item = localize_box(d,np.empty((0,3)),np.empty(0,dtype=int),(20,20,3),np.zeros(3))
+            self.assertIsNone(item['position_base_m'])
+            self.assertEqual(item['bbox'],d['bbox'])
+
+        def test_object_identity_across_ego_motion(self):
+            tracker = ObjectTracker()
+            original = [.7,.1,.1]
+            d = {'bbox':[10,10,30,30], 'position_base_m':original, 'score':.3}
+            first = tracker.update([d],self.pose,self.t)[0]
+            rotated = Pose(.1,0,.6,self.t+.1,'test',True)
+            d2 = dict(d,position_base_m=rotated.to_base(original).tolist())
+            second = tracker.update([d2],rotated,self.t+.1)[0]
+            self.assertEqual(first['id'],second['id'])
+            self.assertEqual(second['identity_status'],'tracked')
+            export = tracker.snapshot(rotated,None,self.t+.2,self.cfg)[0]
+            self.assertEqual(export['zone'],'unassigned')
+            self.assertFalse(export['pick_candidate'])
+            self.assertEqual(export['position_frame'],'base_at_pose_timestamp')
+
+        def test_object_tracker_one_to_one_and_ambiguity(self):
+            tracker = ObjectTracker()
+            a = {'bbox':[0,0,10,10],'position_base_m':[.6,-.01,.1]}
+            b = {'bbox':[20,0,30,10],'position_base_m':[.6,.01,.1]}
+            initial = tracker.update([a,b],self.pose,self.t)
+            self.assertEqual(len({d['id'] for d in initial}),2)
+            merged = tracker.update([{'bbox':[5,0,25,10],'position_base_m':[.6,0,.1]}],self.pose,self.t+.1)[0]
+            self.assertEqual(merged['identity_status'],'ambiguous')
+            self.assertNotIn(merged['id'],[d['id'] for d in initial])
+
+        def test_recent_object_beats_stale_nearby_track(self):
+            tracker = ObjectTracker()
+            d = {'bbox':[10,10,30,30],'position_base_m':[.6,.1,.1]}
+            first = tracker.update([d],self.pose,self.t)[0]
+            recent = dict(first,id=1001,track_id='box-002',last_seen=self.t+4,
+                          bbox=[12,10,32,30],world_position_m=[.65,.1,.1])
+            tracker.tracks[1001] = recent
+            tracker.next_id = 1002
+            result = tracker.update([dict(d,bbox=[13,10,33,30],position_base_m=[.64,.1,.1])],self.pose,self.t+5)[0]
+            self.assertEqual(result['id'],1001)
+            self.assertNotEqual(result['identity_status'],'ambiguous')
+
+        def test_old_epoch_object_keeps_only_2d_evidence(self):
+            tracker = ObjectTracker()
+            tracker.update([{'bbox':[10,10,30,30],'position_base_m':[.6,.1,.1]}],self.pose,self.t)
+            new_pose = Pose(ts=self.t+.1,source='test',valid=True,epoch=1)
+            d = tracker.snapshot(new_pose,None,self.t+.1,self.cfg)[0]
+            self.assertIsNone(d['position_base_m'])
+            self.assertIsNone(d['world_position_m'])
+            self.assertFalse(d['current'])
+            self.assertEqual(d['identity_status'],'pose_epoch_changed')
+
+        def test_object_memory_and_epoch_reset(self):
+            tracker = ObjectTracker()
+            d = {'bbox':[10,10,30,30],'position_base_m':None}
+            first = tracker.update([d],self.pose,self.t)[0]
+            tracker.update([],self.pose,self.t+1)
+            self.assertFalse(tracker.snapshot(self.pose,None,self.t+1,self.cfg)[0]['current'])
+            self.assertFalse(tracker.snapshot(self.pose,None,self.t+31,self.cfg))
+            new = Pose(ts=self.t+2,source='test',valid=True,epoch=1)
+            second = tracker.update([d],new,self.t+2)[0]
+            self.assertNotEqual(first['id'],second['id'])
+
+        def test_detector_tile_offsets_and_duplicate_suppression(self):
+            detector = BoxDetector.__new__(BoxDetector)
+            detector.threshold = .1
+            replies = iter([[{'bbox':[160,220,210,260],'score':.8,'label':'cardboard_box'}],
+                            [{'bbox':[32,28,82,68],'score':.9,'label':'cardboard_box'}]])
+            detector._detect_single = lambda rgb: next(replies)
+            result = detector.detect(np.zeros((384,512,3),np.uint8))
+            self.assertEqual(len(result),1)
+            np.testing.assert_allclose(result[0]['bbox'],[160,220,210,260])
+
+        def test_detector_scores_not_double_sigmoided(self):
+            from types import SimpleNamespace
+            detector = BoxDetector.__new__(BoxDetector)
+            detector.size,detector.threshold,detector.prompts = 512,.1,['cardboard box','chair']
+            detector.embeddings = np.zeros((1,2,512),np.float32)
+            output = np.array([[[100],[100],[40],[40],[.25],[-1e-7]]],np.float32)
+            detector.session = SimpleNamespace(run=lambda *args: [output])
+            result = detector._detect_single(np.zeros((384,512,3),np.uint8))
+            self.assertEqual(len(result),1)
+            self.assertAlmostEqual(result[0]['score'],.25)
+
+        def test_detector_worker_preserves_capture_timestamp(self):
+            import queue
+            from types import SimpleNamespace
+            worker = DetectorWorker.__new__(DetectorWorker)
+            worker.jobs,worker.results = queue.Queue(1),queue.Queue(2)
+            worker.process = SimpleNamespace(is_alive=lambda: True)
+            worker.status = {'state':'ready'}
+            worker.tracker = ObjectTracker()
+            worker.pending = (np.zeros((30,30,3),np.uint8),np.empty((0,3)),np.empty(0,dtype=int),self.t,self.pose)
+            worker.results.put({'ts':self.t,'inference_s':.5,'detections':[{'bbox':[5,5,20,20],'score':.3,'label':'cardboard_box'}]})
+            self.assertTrue(worker.poll(None,np.zeros(3)))
+            self.assertEqual(worker.image[1],self.t)
+            self.assertEqual(worker.status['localized'],0)
+            self.assertEqual(worker.status['detections'],1)
+            self.assertIsNone(worker.pending)
+
+        def test_engine_cache_key_covers_runtime_and_vocab(self):
+            from unittest.mock import patch
+            values = np.zeros((1,len(DETECTOR_PROMPTS),512),np.float32)
+            with patch(__name__+'._gpu_identity',return_value={'name':'test','sm':'87','cuda_driver':12060}):
+                first = _engine_spec(512,'fp16',values,'10.3.0')
+                self.assertEqual(first['image_shape'],[1,3,384,512])
+                self.assertNotEqual(_cache_key(first),_cache_key(_engine_spec(512,'fp32',values,'10.3.0')))
+                self.assertNotEqual(_cache_key(first),_cache_key(_engine_spec(640,'fp16',values,'10.3.0')))
+                changed=values.copy(); changed[0,0,0]=1
+                self.assertNotEqual(_cache_key(first),_cache_key(_engine_spec(512,'fp16',changed,'10.3.0')))
+
+        def test_cached_embeddings_do_not_load_text_runtime(self):
+            import builtins,tempfile
+            from unittest.mock import patch
+            values=np.zeros((1,len(DETECTOR_PROMPTS),512),np.float32); values[:,:,0]=1
+            key=_cache_key({'assets':[(a[0],a[3]) for a in MODEL_ASSETS[1:]],'prompts':DETECTOR_PROMPTS})
+            original=builtins.__import__
+            def guarded(name,*args,**kwargs):
+                if name in ('onnxruntime','tokenizers'):
+                    raise AssertionError('cached embeddings must not reload the text model')
+                return original(name,*args,**kwargs)
+            with tempfile.TemporaryDirectory() as folder:
+                np.save(Path(folder)/f'text-embeddings-{key}.npy',values,allow_pickle=False)
+                with patch('builtins.__import__',side_effect=guarded):
+                    np.testing.assert_equal(_text_embeddings(folder),values)
+
+        def test_missing_engine_does_not_allocate_gpu_buffers(self):
+            import tempfile
+            from unittest.mock import patch
+            with tempfile.TemporaryDirectory() as folder:
+                with patch(__name__+'._tensorrt'),patch(__name__+'._engine_spec',return_value={'test':1}),patch(__name__+'.CudaRuntime') as cuda:
+                    with self.assertRaises(FileNotFoundError):
+                        TensorRTSession(folder,512,'fp16',np.empty(0))
+                    cuda.assert_not_called()
+
+        def test_worker_gpu_request_cannot_silently_fall_back(self):
+            import queue
+            from unittest.mock import patch
+            results=queue.Queue()
+            with patch('os.nice'),patch(__name__+'.BoxDetector',side_effect=FileNotFoundError('engine missing')) as detector:
+                _detector_process(None,results,Path('/missing'),512,.1,'tensorrt','fp16')
+                detector.assert_called_once_with(Path('/missing'),512,.1,'tensorrt','fp16')
+            self.assertIn('engine missing',results.get_nowait()['error'])
+            self.assertTrue(results.empty())
 
         def test_sparse_indices_not_reshape(self):
             mask = np.zeros((3, 4), bool)
@@ -1083,13 +2126,59 @@ if __name__ == "__main__":
     ap.add_argument("--box-size", type=float, default=BOX_SIZE)
     ap.add_argument("--build-cols", type=int, default=FOOTPRINT)
     ap.add_argument("--build-rows", type=int, default=FOOTPRINT)
+    ap.add_argument("--capture", type=Path, help="save one live debug JPEG; refuses to overwrite")
+    ap.add_argument("--image-view", choices=["rect", "range", "raw", "boxes"], default="rect")
+    ap.add_argument("--prepare-detector", action="store_true")
+    ap.add_argument("--prepare-gpu-detector", action="store_true")
+    ap.add_argument("--detector-backend", choices=["cpu","tensorrt"], default="cpu")
+    ap.add_argument("--precision", choices=["fp16","fp32"], default="fp16")
+    ap.add_argument("--benchmark-iterations", type=int, default=10)
+    ap.add_argument("--model-cache", type=Path, default=MODEL_CACHE)
+    ap.add_argument("--detector-benchmark", type=Path)
+    ap.add_argument("--detector", choices=["aruco", "boxes"], default="aruco")
+    ap.add_argument("--detector-size", type=int, default=512)
+    ap.add_argument("--detector-threshold", type=float, default=.10)
+    ap.add_argument("--benchmark-output", type=Path)
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     cfg = Settings(box_size=a.box_size, cell=a.box_size, build_cols=a.build_cols,
                    build_rows=a.build_rows, depth_yaw_deg=a.depth_yaw_deg)
     if a.self_test:
         self_test()
+    elif a.prepare_detector:
+        prepare_detector(a.model_cache)
+    elif a.prepare_gpu_detector:
+        prepare_gpu_detector(a.model_cache,a.detector_size,a.precision)
+    elif a.detector_benchmark:
+        benchmark_detector(a.detector_benchmark,a.model_cache,a.detector_size,
+                           a.detector_threshold,a.benchmark_output,a.detector_backend,a.precision,a.benchmark_iterations)
     elif a.viz:
-        serve_viz(a.port, a.mock, cfg, a.pose_source, a.host)
+        serve_viz(a.port, a.mock, cfg, a.pose_source, a.host, a.detector=="boxes",
+                  a.model_cache,a.detector_size,a.detector_threshold,a.detector_backend,a.precision)
+    elif a.capture:
+        if a.mock:
+            ap.error("capture requires live mode")
+        session = PerceptionSession(settings=cfg, pose_source=a.pose_source,
+                                    detector=a.detector=="boxes" or a.image_view=="boxes",
+                                    model_cache=a.model_cache, detector_size=a.detector_size,
+                                    detector_threshold=a.detector_threshold,
+                                    detector_backend=a.detector_backend,precision=a.precision)
+        try:
+            deadline = time.monotonic()+15
+            while time.monotonic() < deadline:
+                session.poll()
+                data, ts = session.streams[a.image_view]
+                if data and 0 <= time.time()-ts < (3.0 if a.image_view=="boxes" else cfg.fresh_s):
+                    with a.capture.open("xb") as f:
+                        f.write(data)
+                    print(f"Saved {a.image_view} frame to {a.capture}; acquisition timestamp {ts}")
+                    if a.image_view=="boxes":
+                        print(json.dumps(session.latest.objects, indent=2))
+                    break
+                time.sleep(.005)
+            else:
+                raise TimeoutError("requested live image stream unavailable")
+        finally:
+            session.close()
     else:
         print(json.dumps(scan_to_dict(scan(a.mock, settings=cfg, pose_source=a.pose_source), cfg, a.mock), indent=2, allow_nan=False))

@@ -41,6 +41,13 @@ from skills_client import SkillsClient, MockSkills
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Closed-loop floor-box reasoning; mock mode is offline by default.")
+    ap.add_argument("--save-api-key", action="store_true",
+                    help="save exported OPENAI_API_KEY privately in ~/.config/crafter; never overwrite an existing key")
+    ap.add_argument("--ui", action="store_true", help="Minecraft control panel: real LLM decisions, simulated tools")
+    ap.add_argument("--ui-host", default="127.0.0.1")
+    ap.add_argument("--ui-port", type=int, default=8005)
+    ap.add_argument("--receiver-host", default="0.0.0.0")
+    ap.add_argument("--receiver-port", type=int, default=5005)
     ap.add_argument("--mode", choices=["agent", "oneshot"], default="agent",
                     help="agent is default; oneshot is the legacy fixed-grid path, not mobile execution")
     ap.add_argument("--provider", help="explicit live adapter factory: module:function returning AgentProviders")
@@ -66,6 +73,23 @@ def main(argv=None):
     ap.add_argument("--sweeps", type=int, default=1,
                     help=">1 rotates the base between scans to find more boxes")
     a = ap.parse_args(argv)
+    if a.save_api_key:
+        from agent_backend import save_api_key_from_env
+        try:
+            path = save_api_key_from_env()
+        except (OSError, ValueError) as exc:
+            print(f"[key] {exc}", file=sys.stderr)
+            return 2
+        print(f"[key] Saved to {path} (owner-only permissions). Key value not displayed.")
+        if not a.ui:
+            return 0
+    if a.ui:
+        if a.provider or a.grid_ui or a.mode != "agent" or a.planner == "deterministic":
+            ap.error("the UI uses real LLM decisions with simulated tools; do not select another executor")
+        from panel import serve_panel
+        return serve_panel(host=a.ui_host, port=a.ui_port, receiver_host=a.receiver_host,
+                           receiver_port=a.receiver_port, model=a.model, base_url=a.base_url,
+                           model_timeout=a.llm_timeout, json_only=a.json_only)
     if a.mode == "agent" and a.sweeps != 1:
         ap.error("agent surveys through look_around; --sweeps is a legacy option")
 
@@ -157,8 +181,9 @@ def run_agent(args, structure):
                              fresh_s=args.fresh_seconds)
         validate_job(structure, "preflight", config)
         reasoner = None
-        key = os.environ.get("OPENAI_API_KEY")
         use_model = args.planner != "deterministic" and (not args.mock or args.allow_api_with_mock)
+        from agent_backend import load_api_key
+        key = load_api_key() if use_model else None
         if use_model and (key or args.base_url or args.planner == "llm"):
             if not key and not args.base_url:
                 raise ValueError("LLM requires OPENAI_API_KEY or an explicitly configured compatible endpoint")

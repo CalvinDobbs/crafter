@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Crafter / Build control</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script defer src="/panel.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Crafter home">
+      <svg class="brand-mark" viewBox="0 0 32 36" aria-hidden="true"><path d="M16 1 31 9v18l-15 8L1 27V9Z" fill="none" stroke="currentColor" stroke-width="2"/><path d="m1 9 15 9 15-9M16 18v17M8 5l15 9v8" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      <span>crafter<span class="brand-slash"> / </span><span class="brand-sub">build control</span></span>
+    </a>
+    <div class="header-status"><span class="badge simulation">Simulated hardware</span><span id="connection" class="connection"><i></i>Connecting</span></div>
+  </header>
+
+  <main class="shell">
+    <nav class="workflow" aria-label="Build progress"><span data-step="main"><b>01</b> Design</span><i></i><span data-step="build"><b>02</b> Build</span><i></i><span data-step="complete"><b>03</b> Complete</span></nav>
+    <div id="toast" class="toast" role="alert" hidden></div>
+
+    <section id="main-screen" data-screen="main">
+      <div class="page-heading"><div><div class="eyebrow">FROM BLOCKS TO BOXES</div><h1 id="main-title">Your next build starts here.</h1><p>Send a shape from Minecraft. Let the agent take it from there.</p></div><span class="live-label"><i></i>Listening for designs</span></div>
+      <div class="design-layout">
+        <div class="scene-card">
+          <div class="scene-toolbar"><span class="small-label">SCHEMATIC PREVIEW</span><div class="view-controls"><button data-view="main" data-angle="orbit" title="Reset 3D view">3D</button><button data-view="main" data-angle="top" title="View from above">Top</button><button data-view="main" data-angle="reset" aria-label="Reset preview"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1 0 5M4 3v5h5"/></svg></button></div></div>
+          <div class="canvas-wrap"><canvas id="main-canvas" tabindex="0" aria-label="Interactive 3D design. Drag to rotate, scroll to zoom, or use arrow keys."></canvas>
+            <div id="waiting" class="waiting"><div class="waiting-icon"><svg viewBox="0 0 60 60" aria-hidden="true"><path d="m30 10 19 10v22L30 52 11 42V20Zm-19 10 19 11 19-11M30 31v21M23 6h14M30 1v10"/></svg></div><h2>Waiting for a schematic</h2><p>Right-click the Structure Scanner in Minecraft.<br>Your latest design will appear here automatically.</p><span class="mono receiver-port">TCP :5005</span></div>
+            <div id="selection" class="selection" hidden></div>
+          </div>
+          <div class="scene-footer"><span><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3v14M3 10h14M7 6l3-3 3 3M7 14l3 3 3-3M6 7l-3 3 3 3M14 7l3 3-3 3"/></svg> Drag to orbit <span class="separator">/</span> Scroll to zoom <span class="separator">/</span> Click a box</span><span class="mono">SHAPE, NOT SCALE</span></div>
+        </div>
+        <aside class="design-sidebar">
+          <div class="info-card design-info"><div class="card-heading"><h2>Latest design</h2><span id="design-source" class="badge subtle">Awaiting scan</span></div><div class="design-metrics"><div><strong id="box-count">—</strong><span>boxes</span></div><div><strong id="layer-count">—</strong><span>layers</span></div></div><div class="rule"></div><dl class="details"><div><dt>Arrangement</dt><dd id="design-size">No design yet</dd></div><div><dt>Received</dt><dd id="received-at">—</dd></div><div><dt>Design ID</dt><dd id="design-id">—</dd></div></dl><p class="muted-note">One Minecraft block becomes one cardboard box. Stacking and relative placement are preserved.</p></div>
+          <div class="info-card runtime-info"><div class="card-heading"><h2>The demo setup</h2><span class="tiny-dot"></span></div><div class="runtime-row"><span class="runtime-icon">AI</span><div><strong id="model-name">LLM planner</strong><span id="model-status">Checking configuration</span></div></div><div class="runtime-row"><span class="runtime-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 16v-4l4-3V5h4v4l3 3v4M7 16h6M8 3h6"/></svg></span><div><strong>Mock action tools</strong><span>Successful results, no robot motion</span></div></div></div>
+          <div id="configuration-warning" class="inline-warning" hidden><strong>Connect your model</strong><p>Enter your OpenAI API key below. It stays in server memory for this session and is never written to disk.</p><form id="api-key-form" autocomplete="off"><label for="api-key">OpenAI API key</label><input id="api-key" type="password" placeholder="Paste your API key" autocomplete="off" spellcheck="false" minlength="16" maxlength="512" required><button id="save-api-key" class="button secondary" type="submit">Use key for this session</button></form></div>
+          <div id="design-warning" class="inline-warning" hidden></div>
+          <button id="start-build" class="button primary start-button" disabled><span>Start build</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button>
+          <p id="start-hint" class="button-hint">Receive a design to get started.</p>
+        </aside>
+      </div>
+      <div class="bottom-note"><span><i class="signal-dot"></i><span id="receiver-detail">Connecting to Minecraft receiver</span></span><button id="load-example" class="text-button">Try a four-box example <span aria-hidden="true">↗</span></button></div>
+      <div id="receive-notice" class="inline-warning" hidden></div>
+    </section>
+
+    <section id="build-screen" data-screen="build" hidden>
+      <div class="page-heading"><div><div class="eyebrow">AGENT AT WORK</div><h1 id="build-title">Making the shape happen.</h1><p>Real model decisions. Simulated actions. One box at a time.</p></div><button id="cancel-build" class="button danger"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>Cancel build</button><button id="failed-back" class="button secondary" hidden>Back to design</button></div>
+      <div id="new-design-notice" class="new-design" hidden>A newer Minecraft design has arrived. It will be ready on the main screen; this build stays unchanged.</div>
+      <div id="build-error" class="inline-warning" role="alert" hidden></div>
+      <div class="activity-layout">
+        <div class="build-left">
+          <div class="thinking-card"><div class="thinking-label"><span id="thinking-indicator" class="thinking-indicator"></span><span id="thinking-label">AGENT REASONING</span><span id="phase-label" class="badge subtle">Inventory</span></div><p id="reasoning-text" aria-live="polite">Waiting for the first decision.</p></div>
+          <div class="scene-card assembly"><div class="scene-toolbar"><span class="small-label">ASSEMBLY PREVIEW</span><div class="view-controls"><button data-view="build" data-angle="reset" aria-label="Reset assembly view"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1 0 5M4 3v5h5"/></svg></button></div></div><div class="canvas-wrap"><canvas id="build-canvas" tabindex="0" aria-label="Interactive assembly preview. Filled boxes are simulated placements."></canvas></div><div class="scene-footer legend"><span><i class="legend-target"></i>Target</span><span><i class="legend-active"></i>Current</span><span><i class="legend-placed"></i>Placed</span></div></div>
+          <div class="progress-card"><div class="progress-top"><strong id="progress-label">0 / 4 boxes placed</strong><span id="progress-percent" class="mono">0%</span></div><div class="progress-track" role="progressbar" aria-label="Build progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progress-fill"></div></div><div class="progress-bottom"><span id="current-action">Preparing the scene</span><span id="elapsed" class="mono">00:00</span></div></div>
+        </div>
+        <div class="activity-card"><div class="activity-header"><h2>Activity feed</h2><span id="feed-live" class="live-label"><i></i>Live</span></div><div class="activity-stats"><span><b id="llm-count">0</b> model calls</span><span><b id="tool-count">0</b> tool calls</span><span class="badge simulation">Tools mocked</span></div><div id="activity-feed" class="activity-feed" tabindex="0" aria-label="Agent decisions and tool calls"><div class="feed-empty">The agent’s next steps will appear here.</div></div><div class="activity-footer">Decision summaries are model output. All physical tool results are simulated.</div></div>
+      </div>
+    </section>
+
+    <section id="complete-screen" data-screen="complete" hidden>
+      <div class="completion-layout"><div class="completion-copy"><div class="complete-check"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="m7 14 5 5 9-10"/></svg></div><div class="eyebrow">BUILD COMPLETE</div><h1>Built, block<br>by block.</h1><p id="complete-description">Your shape is complete. Every placement has been verified in the simulated scene.</p><div class="completion-metrics"><div><strong id="complete-boxes">4</strong><span>boxes placed</span></div><div><strong id="complete-time">00:00</strong><span>elapsed</span></div><div><strong id="complete-tools">0</strong><span>tool calls</span></div></div><button id="back-main" class="button primary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5m6 6-6-6 6-6"/></svg>Back to main screen</button><p id="complete-next" class="button-hint">Ready for the next idea.</p><span class="badge simulation">Simulation complete · no hardware moved</span></div><div class="scene-card finished-scene"><div class="scene-toolbar"><span class="small-label">THE FINISHED SHAPE</span><span class="badge success">Verified</span></div><div class="canvas-wrap"><canvas id="complete-canvas" tabindex="0" aria-label="Interactive preview of the completed simulated structure."></canvas></div><div class="scene-footer"><span>Drag to inspect the finished arrangement</span><button class="text-button" data-view="complete" data-angle="reset">Reset view</button></div></div></div>
+    </section>
+    <footer class="page-footer"><span>CRAFTED IN MINECRAFT. ASSEMBLED BY AN AGENT.</span><span>Demo control panel <span class="separator">/</span> v1</span></footer>
+  </main>
+</body>
+</html>

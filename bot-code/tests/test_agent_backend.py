@@ -1,14 +1,17 @@
 import json
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from agent_backend import OpenAIReasoner, STEP_SCHEMA, parse_step
+from agent_backend import OpenAIReasoner, STEP_SCHEMA, load_api_key, parse_step, save_api_key_from_env
 from agent_types import Step
 
 
@@ -74,6 +77,45 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             OpenAIReasoner(client=client).decide({"huge": "x"*100000}, (Step("done"),))
         client.chat.completions.create.assert_not_called()
+
+
+class SavedKeyTests(unittest.TestCase):
+    def test_saved_key_is_private_and_loaded_without_environment(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"HOME": home, "OPENAI_API_KEY": "sk-test-persistent-placeholder"}):
+            path = save_api_key_from_env()
+            self.assertEqual(path, Path(home) / ".config" / "crafter" / "openai_api_key")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+            os.environ["OPENAI_API_KEY"] = ""
+            self.assertEqual(load_api_key(), "sk-test-persistent-placeholder")
+            os.environ["OPENAI_API_KEY"] = "sk-test-environment-override"
+            self.assertEqual(load_api_key(), "sk-test-environment-override")
+            with self.assertRaises(FileExistsError):
+                save_api_key_from_env()
+            os.environ["OPENAI_API_KEY"] = ""
+            self.assertEqual(load_api_key(), "sk-test-persistent-placeholder")
+
+    def test_missing_key_is_not_saved_as_an_empty_file(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"HOME": home, "OPENAI_API_KEY": ""}):
+            self.assertIsNone(load_api_key())
+            with self.assertRaises(ValueError):
+                save_api_key_from_env()
+            self.assertFalse((Path(home) / ".config" / "crafter" / "openai_api_key").exists())
+
+    def test_insecure_or_symlinked_file_is_not_loaded(self):
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"HOME": home, "OPENAI_API_KEY": "sk-test-private-placeholder"}):
+            path = save_api_key_from_env()
+            os.environ["OPENAI_API_KEY"] = ""
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                load_api_key()
+            path.unlink()
+            target = Path(home) / "unrelated"
+            target.write_text("sk-test-unrelated-placeholder")
+            target.chmod(0o600)
+            path.symlink_to(target)
+            with self.assertRaises(OSError):
+                load_api_key()
 
 
 if __name__ == "__main__":
