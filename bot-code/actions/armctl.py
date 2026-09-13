@@ -59,11 +59,17 @@ GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open
 # Driving. Limits borrowed from bbapps/nav, which is the autonomy reference on this robot;
 # they sit well under the daemon's clamps (v_max 0.3 m/s, w_max 0.9 rad/s) because the clamp
 # is a hardware limit, not a target.
-# MEASURED on bracketbot-184, 2026-09-13: commanding twist[1] = +0.4 rad/s turned the base
-# CLOCKWISE by 136.6 deg. motion_and_arms.md:44 documents positive as CCW and flags it unverified;
-# it is verified now, and it is backwards. Callers below all work in the documented +CCW
-# convention and set_twist applies this once, so no caller has to remember the exception.
-YAW_COMMAND_SIGN = -1.0
+# MEASURED on bracketbot-184, 2026-09-13, against the raw IMU heading:
+#   drive.ctrl twist[1] = +0.30 rad/s  ->  imu.orientation yaw  +33.3 deg  (counter-clockwise)
+#   drive.ctrl twist[1] = -0.30 rad/s  ->  imu.orientation yaw  -29.7 deg  (clockwise)
+# So positive really is CCW, as motion_and_arms.md:44 documents, and no correction is needed.
+#
+# An earlier survey concluded the opposite because it measured the turn with perception's
+# base_yaw, which carries the OPPOSITE sign convention to the raw IMU. That is self-consistent
+# inside perception -- pose and box positions share it, so world_to_base stays correct -- but it
+# is not the convention drive.ctrl speaks, and it is not a sign to calibrate a command against.
+# Trust the IMU for what the base physically did.
+YAW_COMMAND_SIGN = 1.0
 
 YAW_TOL = 0.03          # rad; a turn is finished within this of its target
 YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believed
