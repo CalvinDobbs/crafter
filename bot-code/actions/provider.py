@@ -24,8 +24,10 @@ from agent_types import ExecutorState, Holding
 
 try:                        # flat, when actions/ is on the path (tests, direct runs)
     import armctl
+    from geometry import Geometry
 except ImportError:         # as actions.provider, which is how load_providers imports it
     from actions import armctl
+    from actions.geometry import Geometry
 Cancelled = armctl.Cancelled
 
 # place: reverses where a two-arm cradle grasp leaves the box. TUNE on the robot.
@@ -218,6 +220,8 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
     rig = rig or armctl.Rig(log=log)
     rig.start()
     executor = Executor(rig, holding_source=holding_source, log=log)
+    if geometry is None and observations is not None:
+        geometry = Geometry(observations, carry_height=rig.carry_height)
 
     # look_around needs no target geometry: it surveys where it stands.
     functions = {"look_around": _wrap(executor, look_around, lambda r: {})}

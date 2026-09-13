@@ -136,6 +136,12 @@ class Arm:
             time.sleep(0.005)
         return np.array(self.r_state.data["pos"], dtype=np.float64)
 
+    def ee_height(self):
+        """Base-frame z of this arm's end effector at its current command, via FK."""
+        q = np.asarray(self.cmd, dtype=np.float64)
+        pos, _ = self.cfg.ik.fk(list(self.cfg.q2urdf(q.copy())[:7]))
+        return float(pos[2])
+
     def set_target(self, pos):
         """Move the commanded pose. The publisher thread is what actually writes it."""
         self.cmd = np.asarray(pos, dtype=np.float64)
@@ -249,6 +255,17 @@ class Rig:
 
     def stop_base(self):
         self.set_twist(0.0, 0.0)
+
+    def carry_height(self):
+        """Base-frame z of the cradle: where a held box's centre sits right now.
+
+        Measured from the arms' own FK rather than assumed from J0, so it stays correct
+        whatever the elbows are doing. Both forearms carry the box, so they agree.
+        """
+        heights = [a.ee_height() for a in self.arms if a.cmd is not None]
+        if not heights:
+            return float("nan")
+        return sum(heights) / len(heights)
 
     def hold(self, cancel=None):
         """Freeze the arms at their current command and stop the base. Torque stays on."""
