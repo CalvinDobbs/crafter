@@ -410,15 +410,30 @@ class DriveTests(unittest.TestCase):
                     state["range"] * math.sin(state["bearing"]), 0.0)
         return target_fn
 
-    def test_a_badly_misaligned_target_is_turned_to_first(self):
+    def test_it_drives_and_steers_from_the_start(self):
+        """No turn-in-place phase: look_around hands this a roughly centred box, so a bearing
+        error just curves the path instead of stopping the approach to rotate."""
         seen = []
         real = self.rig.set_twist
         self.rig.set_twist = lambda v, w: (seen.append((v, w)), real(v, w))[1]
-        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=1.2), 0.45,
+        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.5), 0.45,
                                  log=lambda *a: None)
-        # arcing from a large bearing swings wide, so the first commands must not translate
-        early = [(v, w) for v, w in seen[:5]]
-        self.assertTrue(all(v == 0.0 for v, _ in early), f"expected pure rotation first, got {early}")
+        self.assertTrue(seen)
+        self.assertGreater(seen[0][0], 0.0, "it should be moving forward from the first command")
+        self.assertNotEqual(seen[0][1], 0.0, "and steering at the same time")
+
+    def test_a_large_bearing_eases_the_throttle(self):
+        def first_speed(bearing):
+            rig = FakeRig()
+            seen = []
+            real = rig.set_twist
+            rig.set_twist = lambda v, w: (seen.append(v), real(v, w))[1]
+            self.rig = rig
+            armctl.drive_to_standoff(rig, self.moving_target(bearing=bearing), 0.45,
+                                     log=lambda *a: None)
+            return seen[0]
+        self.assertLess(first_speed(0.5), first_speed(0.02),
+                        "a large bearing error should slow the approach, tightening the curve")
 
     def test_a_box_off_to_one_side_is_corrected_while_driving(self):
         seen = []
