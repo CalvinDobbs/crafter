@@ -327,6 +327,16 @@ class PanelAssetsTests(unittest.TestCase):
         self.assertRegex(main, r'<button\b[^>]*\bid="clear-blueprint"[^>]*\bdisabled')
         self.assertIn("Clear blueprint", main)
 
+    def test_main_screen_omits_design_and_runtime_cards(self):
+        html = (Path(__file__).resolve().parents[1] / "panel.html").read_text()
+        main = html.split('<section id="main-screen"', 1)[1].split("</section>", 1)[0]
+        self.assertNotIn("<h2>Latest design</h2>", main)
+        self.assertNotIn("<h2>The demo setup</h2>", main)
+        self.assertNotRegex(main, r'id="(?:design-source|box-count|layer-count|design-size|received-at|design-id|model-name|model-status)"')
+        for element in ("main-canvas", "start-build", "clear-blueprint", "configuration-warning", "design-warning"):
+            with self.subTest(element=element):
+                self.assertIn(f'id="{element}"', main)
+
     @unittest.skipUnless(os.environ.get("CRAFTER_LAYOUT_CDP") and shutil.which("node"),
                          "optional layout check requires Node 22+ and an isolated Chromium CDP endpoint")
     def test_screens_fit_the_browser_viewport(self):
@@ -389,6 +399,11 @@ class PanelAssetsTests(unittest.TestCase):
                             const problems=[],root=document.documentElement;
                             if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
                             const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#load-example','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
+                            if(${JSON.stringify(mode)}==='configuration')controls.push('#api-key','#save-api-key');
+                            if(${JSON.stringify(screen)}==='main'){
+                                const layout=document.querySelector('.design-layout').getBoundingClientRect(),preview=document.querySelector('.design-layout>.scene-card').getBoundingClientRect();
+                                if(Math.abs(preview.width-layout.width)>2)problems.push('preview does not use the full width');
+                            }
                             for(const selector of controls){
                                 const element=document.querySelector(selector),r=element.getBoundingClientRect();
                                 if(!r.width||!r.height||r.top<-.5||r.left<-.5||r.bottom>innerHeight+.5||r.right>innerWidth+.5)problems.push(selector+' outside viewport');

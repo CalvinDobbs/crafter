@@ -305,17 +305,9 @@ function render(s) {
   connection.classList.toggle('offline', !connected);
   connection.lastChild.textContent = connected ? 'Panel online' : 'Disconnected';
   text('main-title', design ? 'A shape worth building.' : 'Your next build starts here.');
-  text('model-name', s.model);
-  text('model-status', s.llm_ready ? 'API configured · real model calls' : 'API key not configured');
   byId('configuration-warning').hidden = s.llm_ready;
   byId('save-api-key').disabled = submitting || s.worker_busy;
   byId('waiting').hidden = !!design;
-  text('box-count', design ? design.count : '—');
-  text('layer-count', design ? new Set(design.blocks.map(b => b.y)).size : '—');
-  text('design-size', design ? `${design.size.join(' × ')} cells` : 'No design yet');
-  text('design-id', design ? `SCAN ${design.id.padStart(3, '0')}` : '—');
-  text('design-source', design ? design.source : 'Awaiting scan');
-  text('received-at', design ? new Date(design.received_at * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'}) : '—');
   byId('design-warning').hidden = !design || design.buildable;
   if (design && !design.buildable) text('design-warning', `Preview received, but this build cannot start: ${design.error}`);
   const enabled = !!(connected && design && design.buildable && s.llm_ready && !s.worker_busy && !submitting);
