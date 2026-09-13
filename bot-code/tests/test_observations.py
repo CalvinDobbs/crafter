@@ -210,6 +210,24 @@ class EligibilityTests(unittest.TestCase):
     def test_a_non_detector_track_is_rejected(self):
         self.assertFalse(observations.eligible_box(proposal(source="aruco"), VOXEL))
 
+    def test_rejection_names_the_gate_that_stopped_it(self):
+        # "nothing was eligible" is useless when a build will not start; this layer knows why
+        cases = {
+            "confidence": proposal(score=0.19),
+            "depth": proposal(depth_status="background_or_flat_surface"),
+            "clipped by the frame": proposal(partial_view=True),
+            "inside the build footprint": proposal(classification="protected"),
+            "identity": proposal(identity_status="ambiguous"),
+            "remembered": proposal(current=False),
+        }
+        for expected, track in cases.items():
+            reason = observations.box_rejection(track, VOXEL)
+            self.assertIsNotNone(reason)
+            self.assertIn(expected, reason)
+
+    def test_an_eligible_proposal_has_no_rejection_reason(self):
+        self.assertIsNone(observations.box_rejection(proposal(), VOXEL))
+
 
 if __name__ == "__main__":
     unittest.main()

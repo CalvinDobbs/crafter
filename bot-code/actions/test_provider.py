@@ -94,11 +94,18 @@ class FakeRig(armctl.Rig):
         self._threads = []
         self.closed = False
         self.cfg_drive = SimpleNamespace(max_linear_vel=0.3, max_angular_vel=0.9)
+        self._r_imu = None
+        self.yaw = 0.0          # simulated body yaw, advanced by whatever is commanded
+
+    def measured_yaw(self):
+        return self.yaw
 
     def set_twist(self, v, w):
-        self.twists.append((v, w))
-        with self._twist_lock:
-            self._twist[:] = (v, w)
+        self.twists.append((v, w))                 # as requested, in the +CCW convention
+        armctl.Rig.set_twist(self, v, w)           # real clamping and hardware inversion
+        # the base physically turns opposite the commanded sign, which is the inversion being
+        # corrected: applying it twice lands back on the direction the caller asked for
+        self.yaw += armctl.YAW_COMMAND_SIGN * float(self._twist[1]) / armctl.MOTION_RATE_HZ
 
 
 class PlaceTests(unittest.TestCase):
@@ -188,13 +195,18 @@ class LookAroundTests(unittest.TestCase):
         self.assertEqual(self.phases, ["surveying", "settling"])
         self.assertEqual(terminal, "completed")
 
-    def test_rotates_once_per_station_and_stops_between(self):
+    def test_a_survey_covers_a_full_turn(self):
+        # the first live run swept 137 deg of an intended 360 on open-loop timing
+        start = self.rig.yaw
         provider.look_around(self.executor, {"stations": 4})
-        turning = [t for t in self.rig.twists if t != (0.0, 0.0)]
-        self.assertEqual(len(turning), 4, "one twist command per station")
-        for v, w in turning:
+        swept = abs(self.rig.yaw - start)
+        self.assertAlmostEqual(swept, 2 * math.pi, delta=0.2,
+                               msg=f"survey swept {math.degrees(swept):.0f} deg, expected 360")
+
+    def test_a_survey_turns_in_place_and_never_translates(self):
+        provider.look_around(self.executor, {"stations": 4})
+        for v, _ in self.rig.twists:
             self.assertEqual(v, 0.0, "a survey turns in place; it must not translate")
-            self.assertAlmostEqual(abs(w), provider.SURVEY_YAW_RATE)
 
     def test_base_is_zeroed_on_the_way_out(self):
         provider.look_around(self.executor, {"stations": 4})
@@ -299,7 +311,9 @@ class DriveTests(unittest.TestCase):
         dt = 1.0 / armctl.MOTION_RATE_HZ
 
         def target_fn():
-            v, w = self.rig._twist[0], self.rig._twist[1]
+            v = float(self.rig._twist[0])
+            # _twist carries the hardware inversion; the base physically turns the other way
+            w = armctl.YAW_COMMAND_SIGN * float(self.rig._twist[1])
             state["range"] = max(0.0, state["range"] - v * dt)
             state["bearing"] -= w * dt
             return (state["range"] * math.cos(state["bearing"]),
@@ -371,6 +385,46 @@ class DriveTests(unittest.TestCase):
         for arm, start in zip(self.rig.arms, before):
             np.testing.assert_allclose(arm.cmd, start)
             self.assertEqual(arm.torque, [], "a carry must not disturb the squeeze holding the box")
+
+
+class YawTests(unittest.TestCase):
+    """The base turns clockwise for a positive command; that inversion is corrected once."""
+
+    def test_set_twist_corrects_the_hardware_inversion(self):
+        rig = FakeRig()
+        armctl.Rig.set_twist(rig, 0.0, 0.4)          # ask for +CCW
+        # measured on the robot: positive twist[1] turns it clockwise, so the command is negated
+        self.assertAlmostEqual(float(rig._twist[1]), armctl.YAW_COMMAND_SIGN * 0.4)
+        self.assertLess(float(rig._twist[1]), 0.0)
+
+    def test_the_measured_sign_is_recorded_as_inverted(self):
+        self.assertEqual(armctl.YAW_COMMAND_SIGN, -1.0)
+
+    def test_turn_by_stops_on_measured_angle_not_elapsed_time(self):
+        rig = FakeRig()
+        turned = armctl.Rig.turn_by(rig, 0.5, 1.0, log=lambda *a: None)
+        self.assertAlmostEqual(turned, 0.5, delta=armctl.YAW_TOL + 0.05)
+        self.assertAlmostEqual(rig.yaw, 0.5, delta=armctl.YAW_TOL + 0.05)
+        self.assertEqual(rig.twists[-1], (0.0, 0.0), "a finished turn leaves the base stopped")
+
+    def test_turn_by_goes_the_way_it_was_asked_to(self):
+        rig = FakeRig()
+        armctl.Rig.turn_by(rig, -0.4, 1.0, log=lambda *a: None)
+        self.assertLess(rig.yaw, 0.0, "a negative target must turn the base negative")
+
+    def test_turn_by_accumulates_across_the_pi_seam(self):
+        rig = FakeRig()
+        rig.yaw = math.pi - 0.05          # a short turn from here wraps to -pi
+        turned = armctl.Rig.turn_by(rig, 0.2, 1.0, log=lambda *a: None)
+        self.assertAlmostEqual(turned, 0.2, delta=armctl.YAW_TOL + 0.05)
+
+    def test_no_imu_falls_back_to_open_loop_and_says_so(self):
+        rig = FakeRig()
+        rig.measured_yaw = lambda: None
+        said = []
+        self.assertIsNone(armctl.Rig.turn_by(rig, 0.3, 1.0, log=said.append))
+        self.assertTrue(any("open-loop" in m for m in said))
+        self.assertEqual(rig.twists[-1], (0.0, 0.0))
 
 
 class OwnershipTests(unittest.TestCase):

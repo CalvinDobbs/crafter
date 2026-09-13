@@ -59,6 +59,14 @@ GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open
 # Driving. Limits borrowed from bbapps/nav, which is the autonomy reference on this robot;
 # they sit well under the daemon's clamps (v_max 0.3 m/s, w_max 0.9 rad/s) because the clamp
 # is a hardware limit, not a target.
+# MEASURED on bracketbot-184, 2026-09-13: commanding twist[1] = +0.4 rad/s turned the base
+# CLOCKWISE by 136.6 deg. motion_and_arms.md:44 documents positive as CCW and flags it unverified;
+# it is verified now, and it is backwards. Callers below all work in the documented +CCW
+# convention and set_twist applies this once, so no caller has to remember the exception.
+YAW_COMMAND_SIGN = -1.0
+
+YAW_TOL = 0.03          # rad; a turn is finished within this of its target
+YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believed
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
 ALIGN_TOL = 0.05        # rad; inside this the base is considered pointed at the target
@@ -230,6 +238,10 @@ class Rig:
         self.arms = [Arm(s) for s in sides]
         self.by_side = {a.side: a for a in self.arms}
         self.w_drive = Writer("drive.ctrl", Type("drive_ctrl"), keeptime=False)
+        try:
+            self._r_imu = Reader("imu.orientation", keeptime=False)
+        except Exception:       # no IMU: turns fall back to open-loop timing
+            self._r_imu = None
         self.cfg_drive = Config("drive")
         self._twist = np.zeros(2, dtype=np.float64)
         self._twist_lock = threading.Lock()
@@ -320,14 +332,70 @@ class Rig:
 
     # -- base --------------------------------------------------------------
 
+    def measured_yaw(self):
+        """Body yaw in radians from the IMU, or None when it is unavailable.
+
+        Read-only: readers are unlimited, so this competes with nothing.
+        """
+        if self._r_imu is None:
+            return None
+        try:
+            if not self._r_imu.ready():
+                return None
+            return float(np.asarray(self._r_imu.data["rpy"], dtype=np.float64)[2])
+        except Exception:
+            return None
+
+    def turn_by(self, radians, rate, cancel=None, log=None):
+        """Rotate by a measured angle rather than for a computed duration.
+
+        Open-loop timing under-rotated badly in the first live survey -- eight 45 degree steps
+        covered 137 degrees, not 360 -- because a commanded rate is not an achieved rate: the base
+        spends much of a short step accelerating. Closing the loop on the IMU removes the guess.
+        Yaw is accumulated from wrapped increments, so it stays correct across the +-pi seam.
+        """
+        log = log or self.log
+        start = self.measured_yaw()
+        if start is None:                      # no IMU: fall back to timing, and say so
+            log("[armctl] no IMU yaw; turning open-loop, angle is approximate")
+            self.set_twist(0.0, math.copysign(rate, radians))
+            dwell(abs(radians) / rate, cancel)
+            self.stop_base()
+            return None
+        turned, last = 0.0, start
+        deadline = time.monotonic() + abs(radians) / rate * 4.0 + 10.0
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled("cancelled mid-turn")
+                now_yaw = self.measured_yaw()
+                if now_yaw is not None:
+                    step = (now_yaw - last + math.pi) % (2 * math.pi) - math.pi
+                    turned += step
+                    last = now_yaw
+                remaining = radians - turned
+                if abs(remaining) <= YAW_TOL or time.monotonic() > deadline:
+                    break
+                # ease down over the last part so the base does not overshoot and hunt
+                self.set_twist(0.0, math.copysign(min(rate, max(0.08, abs(remaining))), remaining))
+                _tick(cancel)
+        finally:
+            self.stop_base()
+        dwell(YAW_SETTLE_S, cancel)
+        settled = self.measured_yaw()
+        if settled is not None:
+            turned += (settled - last + math.pi) % (2 * math.pi) - math.pi
+        return turned
+
     def set_twist(self, v, w):
-        """Set the commanded body twist, clamped into the drive config's own limits."""
+        """Set the commanded body twist. ``w`` is positive-CCW; the hardware's inversion is
+        applied here so it is corrected in exactly one place."""
         v_max = float(self.cfg_drive.max_linear_vel)
         w_max = float(self.cfg_drive.max_angular_vel)
         v = 0.0 if not np.isfinite(v) else float(np.clip(v, -v_max, v_max))
         w = 0.0 if not np.isfinite(w) else float(np.clip(w, -w_max, w_max))
         with self._twist_lock:
-            self._twist[:] = (v, w)
+            self._twist[:] = (v, YAW_COMMAND_SIGN * w)
 
     def stop_base(self):
         self.set_twist(0.0, 0.0)
