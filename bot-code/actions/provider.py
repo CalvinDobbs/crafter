@@ -178,7 +178,23 @@ def look_around(executor, request):
             executor.log(f"[provider] facing best candidate: bearing {np.degrees(best['bearing']):+.0f} deg,"
                          f" score {best['score']:.2f}, range {best['range']:.2f} m,"
                          f" {'seen now' if best.get('current') else 'remembered from the sweep'}")
-            rig.turn_by(best["bearing"], SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
+            turned = rig.turn_by(best["bearing"], SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
+            executor.log(f"[provider] facing turn asked {np.degrees(best['bearing']):+.0f} deg, "
+                         f"achieved {np.degrees(turned):+.0f} deg"
+                         if turned is not None else "[provider] facing turn ran open-loop")
+            # Did it actually end up pointed at anything? Facing has been assumed to work rather
+            # than checked, and a survey that reports success while aimed at nothing is worse
+            # than one that admits it missed.
+            armctl.dwell(SURVEY_SETTLE_S, cancel)
+            try:
+                after = face_best()
+            except Exception:
+                after = None
+            if after:
+                executor.log(f"[provider] after facing: best is {np.degrees(after['bearing']):+.0f} deg"
+                             f" off, score {after['score']:.2f}, range {after['range']:.2f} m")
+            else:
+                executor.log("[provider] after facing: nothing visible at all")
         elif best:
             executor.log(f"[provider] best candidate already ahead (score {best['score']:.2f})")
         else:
