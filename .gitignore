@@ -9,6 +9,9 @@ run/
 __pycache__/
 *.pyc
 
+# Local agent plans (do not push)
+*.local.md
+
 # Editors / OS
 .idea/
 .vscode/
