@@ -14,7 +14,17 @@ from __future__ import annotations
 import math
 
 
-STEER_MAX_AGE = 3.0     # s; how stale a sighting may be and still serve as a heading to drive on
+# How stale a sighting may be and still serve as a heading. Measured on hardware: an approach
+# turned 56 degrees to face its box, lost it for 3.2 s while re-acquiring, and gave up just over
+# the old 3.0 s bound with the box centred and 0.63 m away.
+#
+# The first bound was picked on the wrong intuition -- that a heading decays as the robot drives.
+# It does not: perception tracks the box in world coordinates and re-projects it through the
+# CURRENT pose, so translation is already accounted for. What the bound actually has to cover is
+# the box being moved or the odometry drifting under it, and for a static box on a floor that is
+# comfortably a matter of seconds. This detector drops a box for that long routinely while the
+# robot turns, so 3 s was a bound on the detector rather than on the evidence.
+STEER_MAX_AGE = 8.0
 
 
 class StaleGeometry(RuntimeError):

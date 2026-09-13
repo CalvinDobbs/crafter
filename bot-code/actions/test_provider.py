@@ -437,29 +437,88 @@ class DriveTests(unittest.TestCase):
                         "the approach should end pointed much closer at the box than it started")
 
     def test_drift_while_driving_is_corrected_continuously(self):
-        # the base yaws 0.1 rad/s that nobody asked for, for the whole drive
-        target = self.drifting_target(bearing=0.0, drift=0.10)
+        # measured drift on this robot is about 0.011 rad/s: 2.5 degrees over 4 seconds, stationary
+        target = self.drifting_target(bearing=0.0, drift=0.011)
         armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
-        self.assertLess(abs(target.state["bearing"]), 0.15,
-                        "constant drift must be absorbed, not accumulated over the approach")
+        self.assertLess(abs(target.state["bearing"]), 0.06,
+                        "drift at the real rate must leave only a small standing offset")
 
     def test_correction_authority_exceeds_the_cruise_rate(self):
         # a controller whose maximum correction is below the drift it must reject cannot
         # converge; clamping correction to the cruise rate ran the heading away unbounded
         self.assertGreater(armctl.STEER_MAX, armctl.DRIVE_OMEGA)
 
-    def test_heavy_drift_is_still_absorbed(self):
-        # 0.3 rad/s of uncommanded yaw, twice the old cruise-rate clamp
+    def test_heavy_drift_is_held_bounded_even_if_not_removed(self):
+        """Drift far beyond anything measured here must stay bounded, not run away.
+
+        Proportional control leaves a standing offset of drift/gain, so 0.3 rad/s -- around
+        thirty times this robot's actual drift -- parks the heading roughly half a radian off
+        rather than driving it to zero. The property that matters is that it converges to a
+        bounded offset and still arrives: before correction authority was raised, this same case
+        ran the bearing away to thousands of degrees.
+        """
         target = self.drifting_target(start=1.5, bearing=0.79, drift=0.30)
         reached = armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
-        self.assertIsNotNone(reached)
-        self.assertLess(abs(target.state["bearing"]), 0.35,
-                        "heavy drift must be held bounded, not allowed to run away")
+        self.assertIsNotNone(reached, "it must still arrive")
+        offset = abs(target.state["bearing"])
+        self.assertLess(offset, 0.30 / armctl.STEER_GAIN + 0.15,
+                        "the offset must settle near drift/gain, not diverge")
 
     def test_it_still_arrives_despite_drift(self):
         target = self.drifting_target(start=1.5, bearing=0.2, drift=0.08)
         reached = armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
         self.assertLessEqual(reached, 0.30 + armctl.RANGE_TOL + 1e-6)
+
+    def delayed_target(self, start=1.2, bearing=0.98, delay=0.27, update_hz=9.0, drift=0.0):
+        """A target seen through the real sensor: stale and slow to refresh.
+
+        The bearing handed to the controller is what the box looked like ~270 ms ago, refreshed
+        about nine times a second, because that is what this detector delivers. Modelling the
+        sensor as instantaneous hides the failure that matters: a controller that reacts hard to
+        an old bearing turns past the box and swings back, which is what the robot actually did.
+        """
+        import collections
+        state = {"range": start, "bearing": bearing, "crossings": 0}
+        history, published, last_pub, previous = collections.deque(), [bearing], [-99.0], [bearing]
+        dt = 1.0 / armctl.MOTION_RATE_HZ
+
+        def target_fn():
+            v = float(self.rig._twist[0])
+            w = armctl.YAW_COMMAND_SIGN * float(self.rig._twist[1])
+            state["range"] = max(0.0, state["range"] - v * dt)
+            state["bearing"] -= (w + drift) * dt
+            now = armctl.time.monotonic()
+            history.append((now, state["bearing"]))
+            while history and history[0][0] < now - delay:
+                history.popleft()
+            if now - last_pub[0] >= 1.0 / update_hz:
+                last_pub[0] = now
+                published[0] = history[0][1] if history else state["bearing"]
+            if state["bearing"] * previous[0] < 0:
+                state["crossings"] += 1
+            previous[0] = state["bearing"]
+            seen = published[0]
+            return (state["range"] * math.cos(seen), state["range"] * math.sin(seen), 0.0)
+
+        target_fn.state = state
+        return target_fn
+
+    def test_it_does_not_oscillate_against_a_delayed_sensor(self):
+        # the base swung side to side on hardware; gain 1.5 crosses the target eight times here
+        target = self.delayed_target(bearing=0.98)
+        armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertLessEqual(target.state["crossings"], 2,
+                             f"overshot and swung back {target.state['crossings']} times")
+
+    def test_the_gain_is_low_enough_for_the_sensor_delay(self):
+        # a controller reacting hard to a 270 ms old bearing turns past where the box now is
+        self.assertLessEqual(armctl.STEER_GAIN, 0.9)
+
+    def test_a_delayed_sensor_still_converges(self):
+        target = self.delayed_target(bearing=0.98)
+        armctl.drive_to_standoff(self.rig, target, 0.30, log=lambda *a: None)
+        self.assertLess(abs(target.state["bearing"]), 0.12,
+                        "it must still end pointed at the box, not merely stop swinging")
 
     def test_stops_at_the_standoff_not_at_the_target(self):
         final = armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)

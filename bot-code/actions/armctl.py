@@ -77,7 +77,19 @@ YAW_SETTLE_S = 0.3      # let the base stop coasting before the angle is believe
 DRIVE_SPEED = 0.08      # m/s creeping toward a target
 DRIVE_OMEGA = 0.15      # rad/s turning to face one
 TURN_FIRST = 0.60       # rad; beyond this, turn in place -- arcing from here swings wide
-STEER_GAIN = 1.5        # rad/s of correction per rad of bearing error while driving
+# Correction gain. Kept low because the bearing being corrected is OLD: the detector delivers a
+# sighting 235-284 ms after the fact and refreshes it only ~9 times a second, so a controller that
+# reacts hard is reacting to where the box was, not where it is, and turns past it. On hardware
+# that showed up as the base swinging side to side and overshooting instead of settling onto the
+# box, and it is reproducible in simulation once the sensor is modelled with its real delay and
+# rate: gain 1.5 crosses the target eight times before converging, gain 0.6 does not cross at all.
+#
+# The cost of a low gain is a steady-state offset under constant drift, equal to drift/gain. At the
+# drift this robot actually has -- about 0.011 rad/s, measured as 2.5 degrees over 4 seconds while
+# stationary -- that is roughly one degree, and a few degrees at several times that rate. Cheap.
+# Authority (STEER_MAX) is a separate knob and stays high, so a genuinely large error is still
+# corrected quickly; only the reaction to small errors is gentle.
+STEER_GAIN = 0.6
 # Correction authority, deliberately far above the gentle cruising rate. This base yaws
 # constantly without being asked, and a controller whose maximum correction is below the drift it
 # must reject cannot converge at all: measured in simulation, clamping correction to the 0.15
