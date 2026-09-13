@@ -26,6 +26,7 @@ Two things differ from pickup.py, and both exist because a provider outlives one
 Cancellation is a threading.Event passed in by the caller, never a module global.
 """
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -53,6 +54,17 @@ STALL_EPS = 0.003       # turns; less motion than this for STALL_S = the joint i
 STALL_S = 0.75
 RANGE_MARGIN = 0.02     # turns; stay this far inside every calibrated joint range
 GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open
+
+# Driving. Limits borrowed from bbapps/nav, which is the autonomy reference on this robot;
+# they sit well under the daemon's clamps (v_max 0.3 m/s, w_max 0.9 rad/s) because the clamp
+# is a hardware limit, not a target.
+DRIVE_SPEED = 0.08      # m/s creeping toward a target
+DRIVE_OMEGA = 0.15      # rad/s turning to face one
+ALIGN_TOL = 0.05        # rad; inside this the base is considered pointed at the target
+RANGE_TOL = 0.02        # m; inside this the standoff is reached
+STUCK_S = 15.0          # no range progress for this long = give up rather than grind
+STUCK_EPS = 0.01        # m of range change that counts as progress
+DRIVE_TIMEOUT_S = 120.0
 
 
 class Cancelled(Exception):
@@ -273,6 +285,54 @@ class Rig:
         for a in self.arms:
             if a.cmd is not None:
                 a.set_target(a.cmd)
+
+
+class Stuck(RuntimeError):
+    """The base stopped making progress toward its target."""
+
+
+def drive_to_standoff(rig, target_fn, standoff, cancel=None, log=print,
+                      speed=DRIVE_SPEED, omega=DRIVE_OMEGA, timeout=DRIVE_TIMEOUT_S):
+    """Turn to face a target, then creep toward it until ``standoff`` metres remain.
+
+    ``target_fn`` returns the target in the CURRENT base frame and is called every cycle, so
+    the robot steers to where the target is now rather than to an integrated pose. There is no
+    SLAM here: dead reckoning drifts, and a pose epoch roll is fatal to the job, so a remembered
+    goal is worse than useless. If target_fn cannot produce a fresh target it raises, and that
+    ends the drive rather than letting it continue blind.
+
+    The base is zeroed on every exit path. The daemon's 100 ms command timeout is a backstop,
+    not the brake.
+    """
+    t0 = time.monotonic()
+    best_range, last_progress = float("inf"), t0
+    try:
+        while True:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled("cancelled while driving")
+            target = target_fn()
+            bearing = math.atan2(target[1], target[0])
+            distance = math.hypot(target[0], target[1])
+
+            if distance < best_range - STUCK_EPS:
+                best_range, last_progress = distance, time.monotonic()
+            elif time.monotonic() - last_progress > STUCK_S:
+                raise Stuck(f"no progress for {STUCK_S:.0f}s at {distance:.2f}m")
+            if time.monotonic() - t0 > timeout:
+                raise Stuck(f"drive exceeded {timeout:.0f}s")
+
+            if abs(bearing) > ALIGN_TOL:
+                # Turn in place first. Creeping while badly misaligned arcs the robot around
+                # the target instead of closing on it.
+                rig.set_twist(0.0, math.copysign(min(omega, abs(bearing)), bearing))
+            elif distance > standoff + RANGE_TOL:
+                rig.set_twist(min(speed, distance - standoff), 0.0)
+            else:
+                log(f"[armctl] standoff reached at {distance:.3f}m (target {standoff:.3f}m)")
+                return distance
+            _tick(cancel)
+    finally:
+        rig.stop_base()
 
 
 # -- motion primitives -----------------------------------------------------

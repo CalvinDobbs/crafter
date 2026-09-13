@@ -68,6 +68,31 @@ class Geometry:
         world = request.site.cell_center(request.step.cell, voxel)
         return world_to_base(world, snapshot.base_position, snapshot.base_yaw)
 
+    def box_in_base(self, request, snapshot=None):
+        """Base-frame position of the request's target box, as currently observed.
+
+        The carried box's remembered pre-grasp position is never used: the box must still be
+        current in this snapshot, or there is nothing to approach.
+        """
+        snapshot = snapshot or self._fresh_snapshot(request)
+        if request.step.box_id is None:
+            raise StaleGeometry("request carries no box to resolve")
+        for box in snapshot.boxes:
+            if box.id == request.step.box_id:
+                if not box.current:
+                    raise StaleGeometry(f"box {box.id} is remembered, not currently observed")
+                return world_to_base(box.position, snapshot.base_position, snapshot.base_yaw)
+        raise StaleGeometry(f"box {request.step.box_id} is not in the current snapshot")
+
+    def approach_box(self, request):
+        """A target callable the drive loop re-reads every cycle, never a remembered pose."""
+        self._fresh_snapshot(request)       # refuse up front if the request cannot be resolved at all
+        return {"target_fn": lambda: self.box_in_base(request), "loaded": False}
+
+    def move_to_build(self, request):
+        self._fresh_snapshot(request)
+        return {"target_fn": lambda: self.cell_in_base(request), "loaded": True}
+
     def place(self, request):
         """How far the cradled box must descend, measured rather than assumed.
 

@@ -61,6 +61,13 @@ CRADLE_SPEED = 0.05      # turns/s; slow so the box rolls back onto the forearms
 LIFT_SPEED = 1.2         # turns/s for the final shoot-up
 HOME_JOINTS = (1, 2, 4, 5, 6)   # returned to configured home while raised, during initialize
 
+# Driving. The standoff is what leaves the box inside the forearm spread when pickup starts, so
+# it is geometry, not preference: MEASURE it against the arms rather than trusting this default.
+APPROACH_STANDOFF = 0.45    # m from base centre to box centre when the approach completes. TUNE
+BUILD_STANDOFF = 0.55       # m from base centre to the target cell. TUNE
+CARRY_SPEED = 0.05          # m/s while loaded; slower than an empty approach
+CARRY_OMEGA = 0.10          # rad/s while loaded; a cradled box is held by squeeze, not a grip
+
 # look_around: an in-place survey, stationed rather than continuous. Perception rejects frames
 # older than its 0.8 s freshness window, so a frame grabbed mid-rotation ages out before it can be
 # used; the robot has to actually stop to buy a usable observation.
@@ -150,6 +157,36 @@ def look_around(executor, request):
         rig.stop_base()
     executor.phase("settling")
     armctl.dwell(SURVEY_SETTLE_S, cancel)
+    return "completed"
+
+
+def approach_box(executor, request):
+    """Drive until the box sits at the grasp standoff, steering to where it is seen now.
+
+    Empty grippers only. The drive re-observes every cycle, so a box that stops being visible
+    ends the approach rather than letting the robot continue toward a remembered position.
+    """
+    executor.phase("approaching")
+    armctl.drive_to_standoff(executor.rig, request["target_fn"], APPROACH_STANDOFF,
+                             cancel=executor.cancel, log=executor.log)
+    executor.phase("settling")
+    armctl.dwell(SURVEY_SETTLE_S, executor.cancel)   # buy perception a usable post-motion frame
+    return "completed"
+
+
+def move_to_build(executor, request):
+    """Carry the held box to the build site.
+
+    Same drive loop as the approach, but loaded: slower, gentler, and the arms hold the cradle
+    they were left in. Nothing here touches the arms, because anything that moves them mid-carry
+    risks the squeeze that is the only thing holding the box.
+    """
+    executor.phase("carrying")
+    armctl.drive_to_standoff(executor.rig, request["target_fn"], BUILD_STANDOFF,
+                             cancel=executor.cancel, log=executor.log,
+                             speed=CARRY_SPEED, omega=CARRY_OMEGA)
+    executor.phase("settling")
+    armctl.dwell(SURVEY_SETTLE_S, executor.cancel)
     return "completed"
 
 
@@ -314,6 +351,8 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
                  "pickup": _wrap(executor, pickup, lambda r: {})}
     if geometry is not None:
         functions["place"] = _wrap(executor, place, geometry.place)
+        functions["approach_box"] = _wrap(executor, approach_box, geometry.approach_box)
+        functions["move_to_build"] = _wrap(executor, move_to_build, geometry.move_to_build)
 
     actions = FunctionActions(
         functions, read_state=executor.read_state, stop=executor.stop,

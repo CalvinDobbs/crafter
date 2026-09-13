@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import math
 import sys
 import threading
 import unittest
@@ -92,6 +93,7 @@ class FakeRig(armctl.Rig):
         self._running = threading.Event()
         self._threads = []
         self.closed = False
+        self.cfg_drive = SimpleNamespace(max_linear_vel=0.3, max_angular_vel=0.9)
 
     def set_twist(self, v, w):
         self.twists.append((v, w))
@@ -275,6 +277,100 @@ class PickupTests(unittest.TestCase):
         for arm in self.rig.arms:
             self.assertLessEqual(arm.cmd[armctl.SWING], arm.hi[armctl.SWING])
             self.assertGreaterEqual(arm.cmd[armctl.SWING], arm.lo[armctl.SWING])
+
+
+class DriveTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        for patcher in (patch.object(armctl, "time", self.clock),
+                        patch.object(provider, "time", self.clock)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.rig = FakeRig()
+        self.executor = provider.Executor(self.rig, log=lambda *a: None)
+
+    def moving_target(self, start=2.0, bearing=0.0):
+        """A target in the base frame that responds to the robot's own motion.
+
+        Driving forward closes the range; turning reduces the bearing. Without the second half
+        the robot would turn forever and the stuck detector would fire.
+        """
+        state = {"range": start, "bearing": bearing}
+        dt = 1.0 / armctl.MOTION_RATE_HZ
+
+        def target_fn():
+            v, w = self.rig._twist[0], self.rig._twist[1]
+            state["range"] = max(0.0, state["range"] - v * dt)
+            state["bearing"] -= w * dt
+            return (state["range"] * math.cos(state["bearing"]),
+                    state["range"] * math.sin(state["bearing"]), 0.0)
+        return target_fn
+
+    def test_turns_before_it_creeps(self):
+        seen = []
+        real = self.rig.set_twist
+
+        def record(v, w):
+            seen.append((v, w))
+            real(v, w)
+        self.rig.set_twist = record
+        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.6), 0.45,
+                                 log=lambda *a: None)
+        turning = [i for i, (v, w) in enumerate(seen) if w != 0.0]
+        creeping = [i for i, (v, w) in enumerate(seen) if v != 0.0]
+        self.assertTrue(turning and creeping)
+        self.assertLess(max(turning), min(creeping), "must finish turning before creeping")
+        for v, w in seen:
+            self.assertFalse(v != 0.0 and w != 0.0, "turn and creep are separate phases")
+
+    def test_stops_at_the_standoff_not_at_the_target(self):
+        final = armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)
+        self.assertLessEqual(abs(final - 0.45), armctl.RANGE_TOL + 1e-6)
+
+    def test_respects_the_speed_limits(self):
+        seen = []
+        self.rig.set_twist = lambda v, w: (seen.append((v, w)), armctl.Rig.set_twist(self.rig, v, w))[1]
+        armctl.drive_to_standoff(self.rig, self.moving_target(bearing=0.6), 0.45,
+                                 log=lambda *a: None, speed=0.05, omega=0.10)
+        for v, w in seen:
+            self.assertLessEqual(abs(v), 0.05 + 1e-9)
+            self.assertLessEqual(abs(w), 0.10 + 1e-9)
+
+    def test_base_is_zeroed_on_every_exit_path(self):
+        armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, log=lambda *a: None)
+        self.assertEqual(self.rig.twists[-1], (0.0, 0.0))
+
+    def test_cancel_stops_the_base(self):
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(armctl.Cancelled):
+            armctl.drive_to_standoff(self.rig, self.moving_target(), 0.45, cancel=cancel,
+                                     log=lambda *a: None)
+        self.assertEqual(self.rig.twists[-1], (0.0, 0.0))
+
+    def test_a_target_that_stops_closing_is_stuck_not_an_infinite_grind(self):
+        with self.assertRaises(armctl.Stuck):
+            armctl.drive_to_standoff(self.rig, lambda: (2.0, 0.0, 0.0), 0.45, log=lambda *a: None)
+        self.assertEqual(self.rig.twists[-1], (0.0, 0.0))
+
+    def test_a_target_that_cannot_be_resolved_ends_the_drive_and_stops(self):
+        def gone():
+            raise RuntimeError("box is not in the current snapshot")
+        with self.assertRaises(RuntimeError):
+            armctl.drive_to_standoff(self.rig, gone, 0.45, log=lambda *a: None)
+        self.assertEqual(self.rig.twists[-1], (0.0, 0.0),
+                         "losing the target must stop the base, not continue blind")
+
+    def test_move_to_build_is_slower_than_an_empty_approach(self):
+        self.assertLess(provider.CARRY_SPEED, armctl.DRIVE_SPEED)
+        self.assertLess(provider.CARRY_OMEGA, armctl.DRIVE_OMEGA)
+
+    def test_move_to_build_does_not_touch_the_arms(self):
+        before = [a.cmd.copy() for a in self.rig.arms]
+        provider.move_to_build(self.executor, {"target_fn": self.moving_target(), "loaded": True})
+        for arm, start in zip(self.rig.arms, before):
+            np.testing.assert_allclose(arm.cmd, start)
+            self.assertEqual(arm.torque, [], "a carry must not disturb the squeeze holding the box")
 
 
 class ExecutorTests(unittest.TestCase):
