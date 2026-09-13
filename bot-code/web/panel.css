@@ -142,8 +142,9 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 #build-error{margin-bottom:17px}
 .completion-layout{display:grid;grid-template-columns:.85fr 1.15fr;align-items:center;gap:60px;min-height:610px;padding:35px 0 10px}
 .completion-copy{max-width:420px}
-#complete-screen .eyebrow{font-size:clamp(24px,4.2dvh,38px);letter-spacing:.05em;line-height:1.15;margin-bottom:6px}
-.complete-check{width:46px;height:46px;border-radius:50%;background:var(--success-soft);border:1px solid var(--success-line);color:var(--green);display:flex;align-items:center;justify-content:center;margin-bottom:28px}
+#complete-screen .eyebrow{font-size:clamp(24px,4.2dvh,38px);letter-spacing:.05em;line-height:1.15;margin:0}
+.complete-heading{display:flex;align-items:center;gap:clamp(10px,1.6vw,18px)}
+.complete-check{flex:none;width:46px;height:46px;border-radius:50%;background:var(--success-soft);border:1px solid var(--success-line);color:var(--green);display:flex;align-items:center;justify-content:center}
 .complete-check svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .completion-copy h1{font-size:clamp(40px,4.5vw,62px);letter-spacing:-2px;line-height:1.07;margin-bottom:22px}
 .completion-copy>p{color:var(--muted);font-size:13px;line-height:1.9;max-width:330px}
@@ -211,7 +212,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .completion-copy h1{font-size:48px}
 .completion-copy h1 br{display:none}
 .completion-copy>p{max-width:440px}
-.complete-check{margin-bottom:23px}
 .finished-scene .canvas-wrap{min-height:330px}
 .completion-metrics{gap:42px}
 .bottom-note{align-items:flex-start;gap:15px}
@@ -232,7 +232,7 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .brand-logo{display:block;width:auto;height:clamp(46px,9dvh,84px);max-width:40vw;max-height:100%;object-fit:contain}
 .shell{width:100%;flex:1;min-height:0;display:flex;flex-direction:column;margin:0 auto;padding:clamp(10px,2dvh,22px) clamp(16px,3vw,40px);overflow:hidden}
 [data-screen]{flex:1;min-height:0;display:flex;flex-direction:column}
-.page-heading{flex:none;gap:16px;padding:clamp(12px,2.5dvh,24px) 0}
+.page-heading{flex:none;gap:16px;padding:0 0 clamp(10px,2dvh,18px)}
 .page-heading>div{min-width:0}
 .page-heading h1{font-size:clamp(24px,4.5dvh,36px)}
 .page-heading p{margin-top:7px;font-size:12px}
@@ -268,10 +268,10 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .activity-stats{padding:0 16px 12px}
 .activity-feed{min-height:0;padding:16px 16px 0;overscroll-behavior:contain}
 .activity-footer{padding:8px 16px}
-.completion-layout{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);align-items:stretch;padding:16px 0 0;gap:clamp(16px,4vw,48px)}
+.completion-layout{grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr);align-items:stretch;padding:0;gap:clamp(16px,4vw,48px)}
 .completion-copy{min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:center;gap:16px}
 .completion-details{flex:0 1 auto;min-height:0;overflow:auto;scrollbar-width:thin;scrollbar-color:#c4b4a9 transparent;overscroll-behavior:contain}
-.complete-check{width:48px;height:48px;margin-bottom:14px}
+.complete-check{width:clamp(34px,4.6dvh,48px);height:clamp(34px,4.6dvh,48px)}
 .completion-copy h1{font-size:clamp(28px,6dvh,54px);margin-bottom:12px}
 .completion-details>p{color:var(--muted);font-size:12px;line-height:1.7;max-width:330px}
 .completion-metrics{gap:24px;margin:18px 0;padding:12px 0}
@@ -290,7 +290,7 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .page-heading .eyebrow,.page-heading p,.page-heading h1{font-size:24px}
 .thinking-card{max-height:64px}
 .build-left{gap:8px}
-.complete-check{width:36px;height:36px;margin-bottom:10px}
+.complete-check{width:32px;height:32px}
 }
 @media(max-width:640px){.topbar{padding-inline:12px;height:48px}
 .brand{font-size:19px;gap:8px}
@@ -313,7 +313,7 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .text-button{font-size:9px}
 .activity-layout{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1.7fr) minmax(0,1fr);gap:8px}
 .build-left{gap:6px}
-.completion-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(100px,.7fr);gap:12px;padding-top:12px}
+.completion-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(100px,.7fr);gap:12px;padding-top:0}
 .completion-copy{max-width:none;gap:8px}
 .completion-actions{gap:6px}
 .completion-actions>.badge{font-size:8px}
