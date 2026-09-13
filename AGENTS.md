@@ -2,6 +2,7 @@
 
 - Commit and push changes regularly at meaningful, verified checkpoints. Stage only intended files; never include secrets or unrelated work.
 - When working from the Windows PC, use SSH for bot-side commands, including pulls and scripts. `/home/bracketbot/...` paths are on the bot, not the PC. Inspect the remote working tree and running services before updating or starting anything.
+- Passwordless bot access from this Windows PC: `ssh -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -i ~/.config/devin/crafter-ssh/id_ed25519 bracketbot@100.66.148.86 '<command>'`. Verified hostname: `bracketbot-184`. The dedicated private key stays outside the repository; never display or commit it.
 - Offline tests: `python -m unittest discover -s bot-code/tests -v` (stdlib only).
 - Four-box demo: `uv run --offline bot-code/main.py --mock --planner deterministic`. Alternatively `python -S bot-code/main.py --mock` works without installed robot or model packages.
 - Agent is the default CLI mode. `--mode oneshot` is the separate legacy fixed-grid pipeline, not a mobile fallback.
