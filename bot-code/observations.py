@@ -458,8 +458,15 @@ class RobotObservations(ObservationWorker):
 
     def __init__(self, voxel_size, *, session_factory=None, settings=None, mock=False,
                  interval=0.1, timeout=0.2, clock=time.time, **session_kwargs):
+        # fresh_s has to exceed the pipeline's own latency or nothing is ever fresh. Measured on
+        # this robot: GPU inference is ~20 ms, but the CPU depth association adds ~26 ms, results
+        # land 235 ms old at p50 and 284 ms at p95, and upstream camera.rect publishes on a 500 ms
+        # window. Perception's 0.8 s default sits barely above that sum, so sightings flickered
+        # across the current/remembered boundary and a survey would report several proposals with
+        # none of them current. This is not a slow detector -- it is a freshness window set for a
+        # faster pipeline than this one.
         self.settings = settings or perception.Settings(
-            box_size=voxel_size[0], cell=voxel_size[0])
+            box_size=voxel_size[0], cell=voxel_size[0], fresh_s=PERCEPTION_FRESH_S)
         self.voxel_size = tuple(voxel_size)
         self.selection = _Selection()
         self._sessions = []
@@ -606,6 +613,7 @@ DETECTOR_LABEL = "cardboard_box"
 SCORE_SELECT = 0.12       # eligible as a target, WITH the confirmation count below
 SCORE_PICKUP = 0.20       # required again, immediately before closing on it
 MIN_CONFIRMATIONS = 4     # sightings of the same track before it may be selected at all
+PERCEPTION_FRESH_S = 1.8  # s; must clear rect cadence + detector latency with room to spare
 DEPTH_OK = frozenset({"surface_supported"})   # has real depth AND rests on a measured plane      # depth returns needed before "nothing there" means empty rather than blind
 
 
