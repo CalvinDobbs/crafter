@@ -279,6 +279,23 @@ class Rig:
             return float("nan")
         return sum(heights) / len(heights)
 
+    def carry_centre(self):
+        """Base-frame xyz midway between the two forearms: where a held box sits.
+
+        Derived from the arms' own FK at their current command, so it tracks the spread and
+        cradle rather than assuming a fixed pose. With one arm there is no sandwich and no
+        meaningful centre, so this reports None.
+        """
+        points = []
+        for arm in self.arms:
+            if arm.cmd is None:
+                return None
+            pos, _ = arm.cfg.ik.fk(list(arm.cfg.q2urdf(np.asarray(arm.cmd, dtype=np.float64).copy())[:7]))
+            points.append(np.asarray(pos, dtype=np.float64))
+        if len(points) < 2:
+            return None
+        return tuple(np.mean(points, axis=0).tolist())
+
     def hold(self, cancel=None):
         """Freeze the arms at their current command and stop the base. Torque stays on."""
         self.stop_base()

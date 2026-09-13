@@ -332,7 +332,8 @@ def _wrap(executor, routine, resolve):
     return call
 
 
-def build_providers(rig=None, observations=None, geometry=None, holding_source=None, log=print):
+def build_providers(rig=None, observations=None, geometry=None, holding_source=None,
+                    voxel_size=None, log=print):
     """Factory for ``--provider actions.provider:build_providers``.
 
     ``geometry`` resolves an ActionRequest's world-frame site/box against a fresh pose. Without it
@@ -342,9 +343,16 @@ def build_providers(rig=None, observations=None, geometry=None, holding_source=N
     """
     rig = rig or armctl.Rig(log=log)
     rig.start()
-    executor = Executor(rig, holding_source=holding_source, log=log)
     if geometry is None and observations is not None:
         geometry = Geometry(observations, carry_height=rig.carry_height)
+    if holding_source is None and observations is not None and voxel_size is not None:
+        try:                    # perception supplies possession; without it, unknown stands
+            from observations import CarryVolume
+        except ImportError:
+            CarryVolume = None
+        if CarryVolume is not None:
+            holding_source = CarryVolume(observations, rig, voxel_size)
+    executor = Executor(rig, holding_source=holding_source, log=log)
 
     # look_around needs no target geometry: it surveys where it stands.
     functions = {"look_around": _wrap(executor, look_around, lambda r: {}),

@@ -20,6 +20,8 @@ import base64
 import math
 import threading
 import time
+
+import numpy as np
 from dataclasses import replace
 
 from agent_adapters import ObservationWorker, normalize_scan
@@ -386,3 +388,57 @@ class RobotObservations(ObservationWorker):
     def _scan(self):
         session = self._sessions[-1] if self._sessions else None
         return getattr(session, "latest_scan", None)
+
+
+# Possession. A box held between the forearms occupies a known volume; a detection there is
+# independent measured evidence, which a rise in joint tracking error is not. The volume is
+# generous around the box because the cradle tilts it back against the upper arms.
+CARRY_TOLERANCE = 0.6     # fraction of a box edge the centre may sit off the cradle midpoint
+CARRY_MIN_POINTS = 8      # depth returns needed before "nothing there" means empty rather than blind
+
+
+class CarryVolume:
+    """Possession evidence from what the sensor sees between the forearms.
+
+    Answers unknown far more readily than it answers empty. The forearms and the box itself
+    occlude the volume at exactly the moment the answer matters, so "I cannot see it" is a
+    frequent and correct verdict; reporting empty there would tell the agent a box had been
+    dropped when it is simply hidden.
+
+    Reads the most recently polled scan rather than requesting a new one, because this is called
+    from the provider's status path, which is bounded at 250 ms and must not block on sensing.
+    """
+
+    def __init__(self, observations, rig, voxel_size, settings=None):
+        self.observations = observations
+        self.rig = rig
+        self.voxel_size = tuple(voxel_size)
+        self.settings = settings or observations.settings
+
+    def __call__(self):
+        return self.holding()
+
+    def holding(self):
+        from agent_types import Holding
+        now = time.time()
+        scan = self.observations._scan()
+        centre = self.rig.carry_centre()
+        if scan is None or centre is None or not scan.pose.valid:
+            return Holding("unknown", ts=now, source="carry-volume-unobserved")
+        if now - scan.ts > self.settings.fresh_s:
+            return Holding("unknown", ts=scan.ts, source="carry-volume-stale")
+
+        reach = self.voxel_size[0] * CARRY_TOLERANCE
+        for detection in list(getattr(scan, "boxes", ())) + list(getattr(scan, "unknown", ())):
+            if all(abs(detection.pos[i] - centre[i]) <= reach for i in range(3)):
+                return Holding("holding", detection.id, scan.ts, "carry-volume-detector")
+
+        # No box was identified there. Only call that empty if the volume was actually seen:
+        # without depth returns this is a blind spot, not an absence.
+        points = np.asarray(getattr(scan, "points", []), dtype=float).reshape(-1, 3)
+        if len(points):
+            finite = points[np.isfinite(points).all(axis=1)]
+            near = finite[np.all(np.abs(finite - np.asarray(centre)) <= reach, axis=1)]
+            if len(near) >= CARRY_MIN_POINTS:
+                return Holding("empty", ts=scan.ts, source="carry-volume-detector")
+        return Holding("unknown", ts=scan.ts, source="carry-volume-occluded")

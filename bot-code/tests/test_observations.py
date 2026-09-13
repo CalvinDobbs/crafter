@@ -157,3 +157,56 @@ class EligibilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CarryVolumeTests(unittest.TestCase):
+    """Possession must answer unknown readily and empty only when it truly looked."""
+
+    def source(self, s, centre=(0.4, 0.0, 0.3)):
+        holder = SimpleNamespace(_scan=lambda: s, settings=SETTINGS)
+        rig = SimpleNamespace(carry_centre=lambda: centre)
+        return observations.CarryVolume(holder, rig, VOXEL, settings=SETTINGS)
+
+    def box(self, pos, mid=7):
+        return SimpleNamespace(id=mid, pos=list(pos), size=0.2, color=None)
+
+    def test_a_box_in_the_volume_is_possession_with_its_identity(self):
+        s = scan(boxes=[self.box((0.4, 0.0, 0.3))])
+        held = self.source(s).holding()
+        self.assertEqual((held.status, held.box_id), ("holding", 7))
+        self.assertEqual(held.source, "carry-volume-detector")
+
+    def test_a_box_outside_the_volume_is_not_possession(self):
+        s = scan(boxes=[self.box((1.4, 0.0, 0.3))])
+        self.assertNotEqual(self.source(s).holding().status, "holding")
+
+    def test_no_scan_is_unknown(self):
+        self.assertEqual(self.source(None).holding().status, "unknown")
+
+    def test_no_carry_centre_is_unknown(self):
+        self.assertEqual(self.source(scan(), centre=None).holding().status, "unknown")
+
+    def test_an_invalid_pose_is_unknown(self):
+        self.assertEqual(self.source(scan(valid=False)).holding().status, "unknown")
+
+    def test_a_stale_scan_is_unknown_not_empty(self):
+        s = scan(ts=time.time() - 100.0)
+        held = self.source(s).holding()
+        self.assertEqual(held.status, "unknown")
+        self.assertEqual(held.source, "carry-volume-stale")
+
+    def test_an_unseen_volume_is_unknown_not_empty(self):
+        # no depth returns between the forearms: a blind spot, not an absence
+        held = self.source(scan(points=[])).holding()
+        self.assertEqual(held.status, "unknown")
+        self.assertEqual(held.source, "carry-volume-occluded")
+
+    def test_a_seen_but_boxless_volume_is_empty(self):
+        seen = [[0.4 + 0.001 * i, 0.0, 0.3] for i in range(20)]
+        held = self.source(scan(points=seen)).holding()
+        self.assertEqual(held.status, "empty")
+        self.assertEqual(held.source, "carry-volume-detector")
+
+    def test_evidence_carries_the_measurement_time_not_the_read_time(self):
+        s = scan(boxes=[self.box((0.4, 0.0, 0.3))])
+        self.assertEqual(self.source(s).holding().ts, s.ts)
