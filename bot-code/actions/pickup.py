@@ -6,32 +6,34 @@
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
 # ///
-"""Spread the arms, turn the wrists inward, lower with clearance, and squeeze around a box.
+"""Initialize a calibrated reference pose, then spread, turn the wrists, lower and squeeze.
 
-By default, prepare the wrists at the top before descent, then bring the arms inward
-and hold the squeeze until Ctrl+C (or --hold SECS). Torque stays on during the hold;
+Every run first reaches the same calibrated home angles with the lift raised and
+claws open. This is a pose reset for an already-homed, unloaded robot, not encoder
+homing. By default, prepare the wrists before descent, bring the arms inward, and
+hold the squeeze until Ctrl+C (or --hold SECS). Torque stays on during the hold;
 exiting disables torque and releases the box. --lower-only skips wrist preparation
-and grasping. --pickup opts into the extra grip, cradle and lift stages. The bottom
+and grasping, but not initialization. --pickup adds grip, cradle and lift. The bottom
 margin is a lift offset, not a measured floor distance.
 
 Joint-space, no IK. Stages:
-  1. elbow (J3) -> 90 deg, held until the optional cradle so the forearm clears the table
-  2. grippers (J7) open
-  3. lift (J0) -> top
-  4. spread: both arms swing J2 (the sideways swing) OUT to the calibrated edge of their range,
+  1. initialize: elbow (J3) -> calibrated 90 deg, grippers (J7) open, then lift (J0) -> top;
+     while raised, return J1, J2, J4, J5 and J6 to each arm's configured home angles.
+     Verify every joint reached the reference pose before starting the pickup.
+  2. spread: both arms swing J2 (the sideways swing) OUT to the calibrated edge of their range,
      so the forearms straddle a box much wider than the shoulders
-  5. prepare wrists: rotate J5 inward toward the box while J0 stays at the top, preserving
-     the J6 pitch and open J7 claw setpoints; --hook caps J5 travel and 0 skips this stage
-  6. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
-  7. cage the box, keeping the prepared wrist angles:
+  3. prepare wrists: rotate J5 inward toward the box while J0 stays at the top, preserving
+     the initialized J6 pitch and open J7 claw setpoints; --hook caps J5 travel and 0 skips this stage
+  4. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
+  5. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
           (tracking error rises), then holds --squeeze turns past contact; hold here by default
        b. with --pickup, grip: grippers close (on a rim/corner if there is one; otherwise they just stiffen the
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
        c. with --pickup, cradle: the elbows flex a little past 90 deg, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
-  8. with --pickup, shoot J0 back up to the top (shoulder level) and hold
-All other joints hold their live pose. Range edges come from the per-robot
+  6. with --pickup, shoot J0 back up to the top (shoulder level) and hold
+All other joints hold their initialized pose. Range edges come from the per-robot
 ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outward" and
 "inward" signs are per-arm (the arms are mirror images in motor-turn space) and are derived
 from FK, never hard-coded.
@@ -59,6 +61,7 @@ GRIPPER = 7
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
 J0_BOTTOM_MARGIN = 1.0
+INITIALIZE_SPEED = 0.08
 LIFT_SPEED = 1.2        # turns/s for the final shoot-up
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
 ELBOW_SETTLE_S = 0.5    # let the forearm stop swinging before the lift moves
@@ -160,6 +163,15 @@ class Arm:
         """The calibrated end of ``joint``'s range in the ``sign`` direction, ``margin`` inside it."""
         return self.hi[joint] - margin if sign > 0 else self.lo[joint] + margin
 
+    def initial_pose(self):
+        pose = np.asarray(self.cfg.home, dtype=np.float64).copy()
+        if pose.shape != (self.dof,) or not np.all(np.isfinite(pose)):
+            raise ValueError(f"{self.side}: invalid calibrated home pose")
+        pose[J0], pose[GRIPPER] = self.top, self.grip_open
+        if not np.all(np.isfinite(pose)) or np.any(pose < self.lo) or np.any(pose > self.hi):
+            raise ValueError(f"{self.side}: initialization pose is outside calibrated ranges")
+        return pose
+
     def cradle(self, tilt):
         """Elbow target ``tilt`` turns past 90 deg: 'more flex' is the sign of home[ELBOW] on this arm."""
         return self.elbow_90 + float(np.sign(self.elbow_90) or 1.0) * tilt
@@ -218,10 +230,11 @@ def ramp_joint(arms, joint, targets, speed, ease=smoothstep):
         time.sleep(dt)
 
 
-def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S):
+def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False):
     """Hold the command until ``joint`` arrives on every arm, or stops moving (a hard stop /
     obstacle), or ``timeout``. The daemon clips ctrl to +-0.5 turns of the live position, so a
-    fast ramp can outrun the joint; this is where it catches up."""
+    fast ramp can outrun the joint; this is where it catches up. With ``require_arrival``,
+    a stall or timeout without reaching the command fails instead of allowing the next stage."""
     dt = 1.0 / RATE_HZ
     t0 = time.monotonic()
     last_pos = [a.live()[joint] for a in arms]
@@ -229,6 +242,7 @@ def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S):
     while not _stop:
         now = time.monotonic()
         done = True
+        all_arrived = True
         for i, a in enumerate(arms):
             a.write_cmd(a.cmd)
             p = a.live()[joint]
@@ -239,9 +253,39 @@ def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S):
             if stalled and not arrived:
                 print(f"[pickup] {a.side}: J{joint} stalled at {p:+.3f} (cmd {a.cmd[joint]:+.3f})", flush=True)
             done &= arrived or stalled
+            all_arrived &= arrived
         if done or now - t0 > timeout:
+            if require_arrival and not all_arrived:
+                raise RuntimeError(f"[pickup] initialization: J{joint} did not reach its target on every arm")
             break
         time.sleep(dt)
+
+
+def initialize_pose(arms, targets, lift_speed):
+    stages = [(ELBOW, ELBOW_SPEED, ELBOW_SETTLE_S),
+              (GRIPPER, GRIP_SPEED, GRIP_SETTLE_S), (J0, lift_speed, TOP_SETTLE_S)]
+    stages.extend((joint, INITIALIZE_SPEED, 0.0) for joint in (1, SWING, 4, WRIST_YAW, WRIST_PITCH))
+    print("[pickup] initialization: calibrated home, raised lift, open claws", flush=True)
+    for joint, speed, pause in stages:
+        if _stop:
+            return False
+        for a, target in zip(arms, targets):
+            print(f"[pickup] {a.side}: initialize J{joint} {a.cmd[joint]:+.3f} -> {target[joint]:+.3f}", flush=True)
+        ramp_joint(arms, joint, [target[joint] for target in targets], speed,
+                   ease=smoothstep if joint in (J0, GRIPPER) else smootherstep)
+        if _stop:
+            return False
+        settle_joint(arms, joint, require_arrival=True)
+        if pause:
+            hold(arms, pause)
+    hold(arms, TOP_SETTLE_S)
+    if _stop:
+        return False
+    for a, target in zip(arms, targets):
+        if not np.all(np.abs(a.live() - target) < ARRIVE_TOL):
+            raise RuntimeError(f"[pickup] {a.side}: initialization pose was not reached; pickup cancelled")
+    print("[pickup] initialization complete", flush=True)
+    return True
 
 
 def pinch_direction(arm):
@@ -349,6 +393,7 @@ def main():
 
     arms = [Arm(s) for s in sides]
     try:
+        initial_targets = [a.initial_pose() for a in arms]
         # Only an OFF->ON transition reseeds the daemon's command filter, so disable first
         # and flush ctrl to the live pose before energizing.
         for a in arms:
@@ -358,22 +403,16 @@ def main():
                   f"  elbow {a.cmd[ELBOW]:+.3f} -> {a.elbow_90:+.3f}"
                   f"  grip {a.cmd[GRIPPER]:+.3f} open {a.grip_open:+.3f} closed {a.grip_closed:+.3f}", flush=True)
         hold(arms, ENABLE_FLUSH_S)
+        if _stop:
+            return
         for a in arms:
             a.set_torque(True)
         hold(arms, ENABLE_SETTLE_S)
 
         # J3 carries the forearm, so it eases on a quintic (as in homing.py). It is held at
         # 90 deg by every later stage, which only moves other joints and keeps the rest of the command.
-        print("[pickup] elbow -> 90 deg", flush=True)
-        ramp_joint(arms, ELBOW, [a.elbow_90 for a in arms], ELBOW_SPEED, ease=smootherstep)
-        hold(arms, ELBOW_SETTLE_S)
-
-        print("[pickup] grippers -> open", flush=True)
-        ramp_joint(arms, GRIPPER, [a.grip_open for a in arms], GRIP_SPEED)
-
-        print("[pickup] J0 -> top", flush=True)
-        ramp_joint(arms, J0, [a.top for a in arms], args.speed)
-        hold(arms, TOP_SETTLE_S)
+        if not initialize_pose(arms, initial_targets, args.speed):
+            return
 
         # Swing out to the far edge of the J2 range so the forearms clear the width of the box.
         # "Outward" is the opposite of the FK-derived inward sign; the daemon clips to the range anyway.
