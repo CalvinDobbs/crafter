@@ -36,7 +36,9 @@ Joint-space, no IK. Stages:
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
        c. with --pickup, cradle: the elbows flex a little from the reach pose, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
-  6. lift J0 back up to the top (shoulder level), preserving the grasp, and hold until termination
+  6. lift J0 back up to the top (shoulder level), pacing both sides from the slower lift's
+     measured height with bounded command lead; preserve the grasp and wait through stalls.
+     Only enter the final hold after both lifts reach the top; hold until termination.
 All other joints hold their initialized pose. Range edges come from the per-robot
 ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outward" and
 "inward" signs are per-arm (the arms are mirror images in motor-turn space) and are derived
@@ -70,7 +72,10 @@ J0_BOTTOM_MARGIN = 1.0
 ELBOW_EXTENSION = 30.0 / 360.0
 ELBOW_EXTENSION_SPEED = 0.05
 INITIALIZE_SPEED = 0.08
-LIFT_SPEED = 1.2        # turns/s for the final shoot-up
+LIFT_SPEED = 0.4        # turns/s for the loaded ascent
+LIFT_ACCEL = 0.4
+LIFT_SYNC_LEAD = 0.04
+LIFT_ARRIVE_TOL = 0.01
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
 ELBOW_SETTLE_S = 0.5    # let the forearm stop swinging before the lift moves
 TOP_SETTLE_S = 0.5      # rest at the top before descending
@@ -247,6 +252,65 @@ def ramp_joint(arms, joint, targets, speed, ease=smoothstep):
         if t >= duration:
             break
         time.sleep(dt)
+
+
+def lift_together(arms):
+    dt = 1.0 / RATE_HZ
+    froms = [a.cmd.copy() for a in arms]
+    tops = np.array([a.top for a in arms])
+    down = np.sign([a.bottom - a.top for a in arms])
+    starts = None
+    remaining = velocity = 0.0
+    last_tick = last_move = time.monotonic()
+    progress_ref = 0.0
+    waiting = invalid_feedback = False
+    while not _stop:
+        now = time.monotonic()
+        step_dt = min(max(now - last_tick, 0.0), dt)
+        last_tick = now
+        live = np.array([a.live()[J0] for a in arms])
+        if not np.all(np.isfinite(live)):
+            if not invalid_feedback:
+                print("[pickup] lift waiting for valid J0 feedback; holding targets and grasp", flush=True)
+            invalid_feedback = True
+            velocity = 0.0
+            for a in arms:
+                a.write_cmd(a.cmd)
+            time.sleep(dt)
+            continue
+        if invalid_feedback:
+            print("[pickup] lift feedback restored", flush=True)
+            invalid_feedback = False
+        measured = np.maximum(down * (live - tops), 0.0)
+        slowest = float(measured.max())
+        if starts is None:
+            starts = measured.copy()
+            remaining = progress_ref = slowest
+            last_move = now
+        if slowest < progress_ref - STALL_EPS:
+            progress_ref, last_move = slowest, now
+            if waiting:
+                print("[pickup] synchronized lift resumed", flush=True)
+                waiting = False
+        if slowest > LIFT_ARRIVE_TOL and now - last_move > STALL_S and not waiting:
+            lagging = ", ".join(a.side for a, distance in zip(arms, measured)
+                                if distance >= slowest - LIFT_ARRIVE_TOL)
+            print(f"[pickup] lift waiting on {lagging}; holding synchronized targets and grasp", flush=True)
+            waiting = True
+        speed = min(LIFT_SPEED, velocity + LIFT_ACCEL * step_dt,
+                    np.sqrt(2.0 * LIFT_ACCEL * remaining))
+        next_remaining = min(remaining, max(0.0, remaining - speed * step_dt,
+                                             slowest - LIFT_SYNC_LEAD))
+        velocity = (remaining - next_remaining) / step_dt if step_dt > 0 else 0.0
+        remaining = next_remaining
+        for a, p0, top, sign, start in zip(arms, froms, tops, down, starts):
+            pos = p0.copy()
+            pos[J0] = top + sign * min(start, remaining)
+            a.write_cmd(pos)
+        if remaining == 0.0 and np.all(np.abs(live - tops) <= LIFT_ARRIVE_TOL):
+            return True
+        time.sleep(dt)
+    return False
 
 
 def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False):
@@ -510,12 +574,8 @@ def main():
         if _stop:
             return
 
-        print("[pickup] final stage: J0 -> shoulder level, maintaining grasp", flush=True)
-        ramp_joint(arms, J0, [a.top for a in arms], LIFT_SPEED)
-        if _stop:
-            return
-        settle_joint(arms, J0)
-        if _stop:
+        print("[pickup] final stage: synchronized J0 ascent to shoulder level, maintaining grasp", flush=True)
+        if not lift_together(arms):
             return
         for a in arms:
             live = a.live()

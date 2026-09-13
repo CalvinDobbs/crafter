@@ -75,6 +75,29 @@ class FakeArm(pickup.Arm):
         self.closed = True
 
 
+class LaggingLiftArm(FakeArm):
+    def __init__(self, side, speed, blocked_until=0.0, distance=1.0):
+        super().__init__(side)
+        self.bottom = self.sign * 3.5
+        self.lo[pickup.J0], self.hi[pickup.J0] = sorted([self.top, self.bottom])
+        self.cmd = self.initial_pose()
+        self.cmd[pickup.J0] = self.sign * distance
+        self.cmd[pickup.SWING] = -self.sign * 0.01
+        self.cmd[pickup.WRIST_PITCH] = self.sign * pickup.HOOK_MAX_TRAVEL
+        self.position = self.cmd[pickup.J0]
+        self.speed = speed
+        self.blocked_until = blocked_until
+
+    def live(self):
+        pos = self.cmd.copy()
+        pos[pickup.J0] = self.position
+        return pos
+
+    def advance(self, dt, now):
+        if now >= self.blocked_until:
+            self.position += np.clip(self.cmd[pickup.J0] - self.position, -self.speed * dt, self.speed * dt)
+
+
 class PickupTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
@@ -84,7 +107,7 @@ class PickupTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def run_main(self, *args, hold_seconds=0.02, settle_effect=None):
+    def run_main(self, *args, hold_seconds=0.02, settle_effect=None, lift_effect=None):
         arms, holds, ramps = [], [], []
         hold_args = [] if hold_seconds is None else ["--hold", str(hold_seconds)]
 
@@ -103,13 +126,170 @@ class PickupTests(unittest.TestCase):
         def hold(selected, seconds):
             holds.append((seconds, [arm.cmd.copy() for arm in selected]))
 
+        def lift(selected):
+            ramp(selected, pickup.J0, [arm.top for arm in selected], pickup.LIFT_SPEED)
+            return True if lift_effect is None else lift_effect(selected)
+
         with patch.object(pickup, "Arm", side_effect=make_arm), \
                 patch.object(pickup, "ramp_joint", side_effect=ramp), \
+                patch.object(pickup, "lift_together", side_effect=lift), \
                 patch.object(pickup, "settle_joint", side_effect=settle_effect), \
                 patch.object(pickup, "hold", side_effect=hold), \
                 patch.object(sys, "argv", ["pickup.py", *hold_args, *args]):
             pickup.main()
         return arms, holds, ramps
+
+    def test_ascent_waits_for_delayed_left_lift_instead_of_running_right_ahead(self):
+        arms = [LaggingLiftArm("left", 0.2, blocked_until=1.0), LaggingLiftArm("right", 1.2)]
+        sleep = self.clock.sleep
+        gaps = []
+
+        def tick(dt):
+            sleep(dt)
+            for arm in arms:
+                arm.advance(dt, self.clock.now)
+            gaps.append(abs(abs(arms[0].position) - abs(arms[1].position)))
+
+        with patch.object(self.clock, "sleep", side_effect=tick):
+            self.assertTrue(pickup.lift_together(arms))
+        self.assertLessEqual(max(gaps), 0.04 + 1e-9)
+        for arm in arms:
+            self.assertLessEqual(abs(arm.position - arm.top), 0.01)
+
+    def simulate_lift(self, arms, *, stop_after=None, tick_effect=None):
+        self.clock.now = 0.0
+        pickup._stop = False
+        sleep = self.clock.sleep
+        samples = []
+
+        def tick(dt):
+            sleep(dt)
+            if tick_effect is not None:
+                tick_effect(self.clock.now)
+            for arm in arms:
+                arm.advance(dt, self.clock.now)
+            samples.append((self.clock.now, [arm.position for arm in arms],
+                            [arm.cmd[pickup.J0] for arm in arms]))
+            if stop_after is not None and self.clock.now >= stop_after:
+                pickup._sigint()
+
+        with patch.object(self.clock, "sleep", side_effect=tick):
+            result = pickup.lift_together(arms)
+        return result, samples
+
+    def test_synchronized_lift_handles_either_side_lagging_and_mid_ascent_stalls(self):
+        for slow_side in ("left", "right"):
+            with self.subTest(side=slow_side):
+                arms = [LaggingLiftArm(side, 0.2 if side == slow_side else 1.2)
+                        for side in ("left", "right")]
+                slow = next(arm for arm in arms if arm.side == slow_side)
+
+                def stall(now):
+                    slow.speed = 0.0 if 1.5 <= now < 3.0 else 0.2
+
+                result, samples = self.simulate_lift(arms, tick_effect=stall)
+                self.assertTrue(result)
+                for _, live, _ in samples:
+                    self.assertLessEqual(abs(abs(live[0]) - abs(live[1])), pickup.LIFT_SYNC_LEAD + 1e-9)
+                for arm in arms:
+                    self.assertLessEqual(abs(arm.position - arm.top), pickup.LIFT_ARRIVE_TOL)
+                _, _, commands = zip(*samples)
+                for previous, current in zip(commands, commands[1:]):
+                    self.assertTrue(np.all(np.abs(np.array(current) - previous) <= pickup.LIFT_SPEED / pickup.RATE_HZ + 1e-9))
+
+    def test_permanent_lift_stall_holds_both_sides_and_grasp_until_stop(self):
+        arms = [LaggingLiftArm("left", 0.0), LaggingLiftArm("right", 1.2)]
+        for arm in arms:
+            arm.set_torque(True)
+        starts = [arm.cmd.copy() for arm in arms]
+        result, samples = self.simulate_lift(arms, stop_after=3.0)
+        self.assertFalse(result)
+        self.assertLessEqual(max(abs(1.0 - abs(live[1])) for _, live, _ in samples), pickup.LIFT_SYNC_LEAD + 1e-9)
+        self.assertEqual(sys.stdout.getvalue().count("lift waiting on left"), 1)
+        for arm, start in zip(arms, starts):
+            self.assertGreater(abs(arm.cmd[pickup.J0]), 0.9)
+            for pos in arm.commands:
+                np.testing.assert_array_equal(pos[1:], start[1:])
+            self.assertEqual(arm.torque, [True])
+
+    def test_synchronized_lift_handles_different_start_heights_and_already_raised_arm(self):
+        for left_distance, right_distance in ((1.0, 0.6), (1.0, 0.0), (0.0, 0.0)):
+            with self.subTest(distances=(left_distance, right_distance)):
+                arms = [LaggingLiftArm("left", 0.3, distance=left_distance),
+                        LaggingLiftArm("right", 1.2, distance=right_distance)]
+                result, _ = self.simulate_lift(arms)
+                self.assertTrue(result)
+                for arm in arms:
+                    self.assertLessEqual(abs(arm.position - arm.top), pickup.LIFT_ARRIVE_TOL)
+                    distances = [abs(pos[pickup.J0]) for pos in arm.commands]
+                    self.assertTrue(all(a >= b - 1e-9 for a, b in zip(distances, distances[1:])))
+                    for pos in arm.commands:
+                        self.assertGreaterEqual(pos[pickup.J0], arm.lo[pickup.J0] - 1e-9)
+                        self.assertLessEqual(pos[pickup.J0], arm.hi[pickup.J0] + 1e-9)
+
+    def test_synchronized_lift_handles_single_arm(self):
+        for side in ("left", "right"):
+            with self.subTest(side=side):
+                arm = LaggingLiftArm(side, 0.2, blocked_until=0.5)
+                result, _ = self.simulate_lift([arm])
+                self.assertTrue(result)
+                self.assertLessEqual(abs(arm.position - arm.top), pickup.LIFT_ARRIVE_TOL)
+
+    def test_invalid_lift_feedback_freezes_commands_and_recovers_without_jump(self):
+        arms = [LaggingLiftArm("left", 0.2), LaggingLiftArm("right", 1.2)]
+        live = arms[0].live
+
+        def faulty_live():
+            pos = live()
+            if 1.0 <= self.clock.now < 2.0:
+                pos[pickup.J0] = np.nan
+            return pos
+
+        with patch.object(arms[0], "live", side_effect=faulty_live):
+            result, samples = self.simulate_lift(arms)
+        self.assertTrue(result)
+        frozen = [cmd for now, _, cmd in samples if 1.01 <= now < 2.0]
+        self.assertTrue(frozen)
+        for command in frozen:
+            np.testing.assert_array_equal(command, frozen[0])
+        for arm in arms:
+            self.assertTrue(np.all(np.isfinite(arm.commands)))
+        for (_, _, previous), (_, _, current) in zip(samples, samples[1:]):
+            self.assertTrue(np.all(np.abs(np.array(current) - previous) <= pickup.LIFT_SPEED / pickup.RATE_HZ + 1e-9))
+
+    def test_synchronized_lift_measures_height_from_each_calibrated_top(self):
+        arms = [LaggingLiftArm("left", 0.2), LaggingLiftArm("right", 1.2)]
+        for arm, top in zip(arms, (0.02, -0.05)):
+            arm.top = top
+            arm.position += top
+            arm.cmd[pickup.J0] += top
+        result, samples = self.simulate_lift(arms)
+        self.assertTrue(result)
+        for _, live, _ in samples:
+            heights = [abs(position - arm.top) for position, arm in zip(live, arms)]
+            self.assertLessEqual(abs(heights[0] - heights[1]), pickup.LIFT_SYNC_LEAD + 1e-9)
+        for arm in arms:
+            self.assertAlmostEqual(arm.cmd[pickup.J0], arm.top)
+            self.assertLessEqual(abs(arm.position - arm.top), pickup.LIFT_ARRIVE_TOL)
+
+    def test_missing_initial_lift_feedback_keeps_existing_targets_until_stop(self):
+        arms = [LaggingLiftArm("left", 0.2), LaggingLiftArm("right", 1.2)]
+        starts = [arm.cmd.copy() for arm in arms]
+        invalid = arms[0].live()
+        invalid[pickup.J0] = np.nan
+        with patch.object(arms[0], "live", return_value=invalid):
+            result, _ = self.simulate_lift(arms, stop_after=1.0)
+        self.assertFalse(result)
+        for arm, start in zip(arms, starts):
+            for pos in arm.commands:
+                np.testing.assert_array_equal(pos, start)
+
+    def test_stop_before_synchronized_lift_never_moves(self):
+        arms = [LaggingLiftArm(side, 1.0) for side in ("left", "right")]
+        pickup._stop = True
+        self.assertFalse(pickup.lift_together(arms))
+        for arm in arms:
+            self.assertEqual(arm.commands, [])
 
     def test_default_grasps_inward_then_lifts_and_holds_at_shoulder_level(self):
         arms, holds, ramps = self.run_main()
@@ -218,17 +398,12 @@ class PickupTests(unittest.TestCase):
             self.assertTrue(any(abs(pos[pickup.J0] - arm.sign) < 1e-9 for pos in arm.commands))
             self.assertAlmostEqual(final[pickup.J0], arm.top)
 
-    def test_stop_while_settling_final_lift_skips_final_hold(self):
-        lift_settles = 0
+    def test_stop_during_synchronized_lift_skips_final_hold(self):
+        def stop_lift(arms):
+            pickup._sigint()
+            return False
 
-        def settle(arms, joint, **kwargs):
-            nonlocal lift_settles
-            if joint == pickup.J0:
-                lift_settles += 1
-                if lift_settles == 3:
-                    pickup._sigint()
-
-        arms, holds, ramps = self.run_main(settle_effect=settle)
+        arms, holds, ramps = self.run_main(lift_effect=stop_lift)
         self.assertEqual(ramps.count(pickup.J0), 3)
         self.assertNotEqual(holds[-1][0], 0.02)
         for arm in arms:
