@@ -20,8 +20,8 @@ Joint-space, no IK. Stages:
   3. lift (J0) -> top
   4. spread: both arms swing J2 (the sideways swing) OUT to the calibrated edge of their range,
      so the forearms straddle a box much wider than the shoulders
-  5. prepare wrists: J5 yaw, blended with J6 to keep the hand level, turns each hand inward
-     toward the box while J0 stays at the top; --hook caps travel and 0 skips this stage
+  5. prepare wrists: rotate J5 inward toward the box while J0 stays at the top, preserving
+     the J6 pitch and open J7 claw setpoints; --hook caps J5 travel and 0 skips this stage
   6. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
   7. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
@@ -58,7 +58,7 @@ WRIST_PITCH = 6         # tips the hand about base y; blended with J5 so the hoo
 GRIPPER = 7
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
-J0_BOTTOM_MARGIN = 0.75
+J0_BOTTOM_MARGIN = 1.0
 LIFT_SPEED = 1.2        # turns/s for the final shoot-up
 ELBOW_SPEED = 0.15      # turns/s bending the elbow (~0.25 turns in ~1.7 s)
 ELBOW_SETTLE_S = 0.5    # let the forearm stop swinging before the lift moves
@@ -251,10 +251,14 @@ def pinch_direction(arm):
     return d
 
 
-def hook_direction(arm):
-    """Joint-space step (turns, largest component 1) that sweeps the hand toward the centreline
-    while keeping its height. Once the arm is swung out on J2 the wrist axes are tilted, so a pure
-    J5 yaw would drive the hand into the floor; blend J5 and J6 so the FK Jacobian's z-row cancels."""
+def hook_direction(arm, keep_height=False):
+    """Rotate J5 inward without changing pitch or claw extension. Yaw can change hand height,
+    so prepare it while raised. The optional keep_height blend retains the J5/J6 level sweep;
+    it is not used for wrist preparation because pitch compensation can dominate the motion."""
+    if not keep_height:
+        d = np.zeros(arm.dof)
+        d[WRIST_YAW] = inward_sign(arm.cfg, arm.cmd, WRIST_YAW)
+        return d
     q = np.asarray(arm.cmd, dtype=np.float64)
     p0, _ = arm.cfg.ik.fk(list(arm.cfg.q2urdf(q.copy())[:7]))
     cols = []
@@ -325,7 +329,7 @@ def main():
     ap.add_argument("--spread", type=float, default=None,
                     help="cap the outward J2 swing at this many turns from the start pose (default: full calibrated range)")
     ap.add_argument("--hook", type=float, default=HOOK_MAX_TRAVEL,
-                    help="max blended wrist-joint travel in turns inward before descent; 0 disables (default: %(default)s)")
+                    help="max inward J5 wrist rotation in turns before descent; pitch and claws hold, 0 disables (default: %(default)s)")
     ap.add_argument("--squeeze", type=float, default=PINCH_SQUEEZE,
                     help="extra inward J2 turns past detected contact, capped by calibration (default: %(default)s)")
     ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex in turns after gripping; 0 disables")
@@ -387,11 +391,10 @@ def main():
         hold(arms, SPREAD_SETTLE_S)
 
         if not args.lower_only and args.hook > 0:
-            print("[pickup] prepare grasp: wrists -> inward before descent", flush=True)
+            print("[pickup] prepare grasp: rotate wrists inward (J5), holding pitch and claw extension", flush=True)
             creep_to_contact(arms, hook_direction, HOOK_SPEED, HOOK_CONTACT_ERR, HOOK_SQUEEZE,
-                             max_travel=args.hook, label="wrist inward")
+                             max_travel=args.hook, label="wrist yaw inward")
             settle_joint(arms, WRIST_YAW)
-            settle_joint(arms, WRIST_PITCH)
             hold(arms, TOP_SETTLE_S)
         if _stop:
             return
