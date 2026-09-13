@@ -45,65 +45,86 @@ BOX_CLEARANCE = 0.15      # m a loose box must be clear of the footprint for it 
 SITE_COVERAGE = 0.8       # fraction of the footprint that must actually have been observed
 
 
-def _cell_bounds(cell, build, settings):
-    """(bottom, top) z of a cell in the build frame, in metres."""
-    centre = perception.cell_center(cell[0], cell[1], cell[2], build, settings)
-    half = settings.box_size / 2.0
+def world_to_base(point, pose):
+    """Session-world xyz -> the scan's base-at-capture frame. Planar, like the pose itself."""
+    dx, dy = point[0] - pose.x, point[1] - pose.y
+    c, s = math.cos(-pose.yaw), math.sin(-pose.yaw)
+    return (c * dx - s * dy, s * dx + c * dy, point[2])
+
+
+def _cell_bounds(site, cell, voxel_size, pose):
+    """(bottom, top, base-frame centre) of a cell of the SELECTED site.
+
+    The site the controller chose is the frame that matters. Measuring against perception's own
+    anchor instead would sample the depth cloud in a different place entirely and report occupancy
+    for cells nobody asked about.
+    """
+    centre = world_to_base(site.cell_center(cell, voxel_size), pose)
+    half = voxel_size[1] / 2.0
     return centre[2] - half, centre[2] + half, centre
 
 
-def classify_cells(scan, cells, settings):
-    """Measured occupancy per cell: occupied, empty, or unknown.
+def classify_cells(scan, site, cells, voxel_size, settings):
+    """Measured occupancy per cell of the selected site: occupied, empty, or unknown.
 
     A column height near the cell's top face means something fills it. A height near its bottom
     face means the supporting surface is bare, which is the only positive evidence of empty there
     is. Anything else -- no depth return, too few points, an occluded view, a height that matches
     neither face -- is unknown. Absence of measurement is never emptiness.
     """
-    if scan.build is None or not scan.pose.valid:
+    if site is None or not scan.pose.valid or time.time() - scan.ts > settings.fresh_s:
         return tuple(CellObservation(tuple(c), "unknown", scan.ts) for c in cells), False
-    heights = perception.column_heights(list(cells), snapshot=scan, settings=settings)
-    tolerance = settings.box_size * HEIGHT_TOL_FRAC
-    marked = _markers_by_cell(scan, settings)
-    observations, complete = [], True
+    tolerance = voxel_size[1] * HEIGHT_TOL_FRAC
+    radius = voxel_size[0] * 0.35
+    marked = _markers_by_cell(scan, site, voxel_size)
+    observations_out, complete = [], True
     for cell in cells:
         key = tuple(cell)
-        height = heights.get(key)
-        bottom, top, _ = _cell_bounds(key, scan.build, settings)
+        bottom, top, centre = _cell_bounds(site, key, voxel_size, scan.pose)
+        height = perception._height_at(scan.points, centre, radius)
         if height is None:
-            observations.append(CellObservation(key, "unknown", scan.ts))
+            observations_out.append(CellObservation(key, "unknown", scan.ts))
             complete = False
         elif abs(height - top) <= tolerance:
-            observations.append(CellObservation(key, "occupied", scan.ts, marked.get(key)))
+            observations_out.append(CellObservation(key, "occupied", scan.ts, marked.get(key)))
         elif abs(height - bottom) <= tolerance:
-            observations.append(CellObservation(key, "empty", scan.ts))
+            observations_out.append(CellObservation(key, "empty", scan.ts))
         else:
-            # A height that matches neither face: a partial stack, a leaning box, or a bad return.
-            observations.append(CellObservation(key, "unknown", scan.ts))
+            # A height matching neither face: a partial stack, a leaning box, or a bad return.
+            observations_out.append(CellObservation(key, "unknown", scan.ts))
             complete = False
-    return tuple(observations), complete
+    return tuple(observations_out), complete
 
 
-def _markers_by_cell(scan, settings):
-    """Marker id per cell, for the boxes whose markers are actually visible.
+def _markers_by_cell(scan, site, voxel_size):
+    """Marker id per cell of the selected site, for boxes whose markers are actually visible.
 
-    An occluded marker leaves its cell attributed to nobody. That is honest, and it is also why
-    a stack can report occupied with no box_id.
+    An occluded marker leaves its cell attributed to nobody. That is honest, and it is why a
+    stack can report occupied with no box_id.
     """
     found = {}
-    if scan.build is None:
-        return found
     for detection in list(getattr(scan, "protected", ())) + list(getattr(scan, "boxes", ())):
-        try:
-            u, v = perception._grid_uv(detection.pos, scan.build, settings)
-        except Exception:
-            continue
-        origin_z = scan.build.origin[2]
-        layer = int(round((detection.pos[2] - origin_z - settings.box_size / 2.0) / settings.box_size))
-        if layer < 0:
-            continue
-        found[(int(round(u)), layer, int(round(v)))] = detection.id
+        for cell in found_cells_near(site, detection, voxel_size, scan.pose):
+            found[cell] = detection.id
     return found
+
+
+def found_cells_near(site, detection, voxel_size, pose, tolerance=0.5):
+    """Cells of the site whose centre this detection is sitting in, if any."""
+    world = site.cell_center((0, 0, 0), voxel_size)
+    base0 = world_to_base(world, pose)
+    offset = [detection.pos[i] - base0[i] for i in range(3)]
+    col = world_to_base((site.origin[0] + site.col[0], site.origin[1] + site.col[1],
+                         site.origin[2] + site.col[2]), pose)
+    origin = world_to_base(site.origin, pose)
+    axis = [col[i] - origin[i] for i in range(3)]
+    norm = math.sqrt(sum(a * a for a in axis)) or 1.0
+    along = sum(offset[i] * axis[i] / norm for i in range(3)) / voxel_size[0]
+    layer = offset[2] / voxel_size[1]
+    x, y = round(along), round(layer)
+    if abs(along - x) > tolerance or abs(layer - y) > tolerance or y < 0:
+        return ()
+    return ((x, y, 0),)
 
 
 def eligible_box(track, voxel_size):
@@ -189,14 +210,20 @@ def find_clear_site(scan, requirements, settings, base_position, base_yaw, clock
     c, s = math.cos(base_yaw), math.sin(base_yaw)
     col = (c, s, 0.0)                 # build +x runs along the robot's heading
     row = (-s, c, 0.0)                # build +z runs to its left; col x row is +z up
-    origin = (centre[0] - col[0] * width / 2.0 - row[0] * depth / 2.0,
-              centre[1] - col[1] * width / 2.0 - row[1] * depth / 2.0,
-              floor)
+    # Plain Python floats, deliberately: agent_types.vector_valid tests `type(v) in (float, int)`,
+    # so a numpy scalar arriving from the depth data would fail validation and the site would be
+    # discarded without explanation.
+    origin = (float(centre[0] - col[0] * width / 2.0 - row[0] * depth / 2.0),
+              float(centre[1] - col[1] * width / 2.0 - row[1] * depth / 2.0),
+              float(floor))
+    col = tuple(float(v) for v in col)
+    row = tuple(float(v) for v in row)
     return BuildSite(
         id=f"floor@{centre[0]:.2f},{centre[1]:.2f}", origin=origin, col=col, row=row,
-        dimensions=(width, height, depth), ts=scan.ts, epoch=scan.pose.epoch,
+        dimensions=(float(width), float(height), float(depth)),
+        ts=float(scan.ts), epoch=int(scan.pose.epoch),
         frame_id="session-world", valid=True, floor_valid=True, clearance_valid=True,
-        feasible=True, cost=distance)
+        feasible=True, cost=float(distance))
 
 
 class _Selection:
@@ -261,7 +288,7 @@ class _EnrichedSession:
         site = self.selection.get(site_id) if site_id else None
         if site is not None and requirements is not None:
             cells = _envelope(requirements)
-            occupancy, complete = classify_cells(scan, cells, self.settings)
+            occupancy, complete = classify_cells(scan, site, cells, self.voxel_size, self.settings)
             snapshot = replace(snapshot, site_id=site_id, occupancy=occupancy,
                                occupancy_complete=complete)
         return replace(snapshot, images=self._images(scan, snapshot))
@@ -326,9 +353,22 @@ class RobotObservations(ObservationWorker):
                                       monitoring=True, images=True)
 
     def observe(self, site_id=None):
-        if site_id is not None:
-            self.selection.select(site_id=site_id)
-        return super().observe(site_id)
+        """Snapshot scoped to the selected site, with occupancy measured for THAT site.
+
+        Selecting a site changes what the polling thread measures, so the cached snapshot from
+        before the selection has no occupancy in it. Returning that one would report occupancy
+        permanently unavailable. Wait, briefly and boundedly, for a snapshot that actually carries
+        the requested site -- still well inside the 250 ms this call is allowed.
+        """
+        if site_id is None:
+            return super().observe(None)
+        self.selection.select(site_id=site_id)
+        deadline = time.monotonic() + self.timeout
+        snapshot = super().observe(site_id)
+        while snapshot.site_id != site_id and time.monotonic() < deadline:
+            time.sleep(self.interval / 2 or 0.005)
+            snapshot = super().observe(site_id)
+        return snapshot
 
     def find_build_sites(self, requirements):
         self.selection.select(requirements=requirements)

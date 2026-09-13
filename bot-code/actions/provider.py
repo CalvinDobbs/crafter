@@ -39,6 +39,8 @@ RELEASE_TRAVEL = 0.12   # turns of J2 outward travel that clears the box
 RETREAT_SPEED = 0.6     # turns/s lifting J0 clear once the box is free
 RETREAT_TURNS = 1.0     # turns of J0 lift after release
 SETTLE_S = 0.5          # let each stage stop moving before the next one starts
+SETTLE_AFTER_EFFECT_S = 1.0  # > perception's 0.8 s freshness, so the new state is observed
+                             # before the action reports terminal
 
 # pickup: mirrors actions/pickup.py's stage order. That script stays the prototype and the place
 # these values get tuned; it cannot be imported (it installs a SIGINT handler at import time) and
@@ -252,6 +254,10 @@ def pickup(executor, request):
     executor.phase("lifting")
     armctl.ramp_joint(arms, armctl.J0, [a.top for a in arms], LIFT_SPEED, cancel=cancel)
     armctl.settle_joint(arms, armctl.J0, cancel=cancel, log=log)
+    # Let perception actually see the grasp before reporting terminal. Possession is measured from
+    # the latest scan, so returning the instant the lift finishes reports possession from a frame
+    # taken before the box was held, and that stale answer contradicts the next one.
+    armctl.dwell(SETTLE_AFTER_EFFECT_S, cancel)
     return "lifted"
 
 
@@ -305,6 +311,7 @@ def place(executor, request):
             for a, t in zip(arms, lift)]
     armctl.ramp_joint(arms, armctl.J0, lift, RETREAT_SPEED, cancel=cancel)
     armctl.settle_joint(arms, armctl.J0, cancel=cancel, log=executor.log)
+    armctl.dwell(SETTLE_AFTER_EFFECT_S, cancel)   # let perception see the release before reporting
     return "retreated"
 
 
@@ -327,6 +334,12 @@ def _wrap(executor, routine, resolve):
         except Cancelled:
             executor.end("cancelled")
             return FunctionResult(False, "cancelled", "blocked_motion", effects_started="unknown")
+        except armctl.Stuck:
+            # A known failure with a known end state: the drive gave up and zeroed the base in its
+            # own finally. Reporting it as blocked rather than letting it escape as an unknown
+            # outcome is what lets the agent retry instead of stopping for an operator.
+            executor.end("blocked")
+            return FunctionResult(False, "blocked", "blocked_motion", effects_started="unknown")
         executor.end(phase)
         return FunctionResult(True, phase, effects_started="yes")
     return call

@@ -21,6 +21,14 @@ def build_frame(origin=(1.0, 0.0, 0.0)):
                                  list(origin), time.time())
 
 
+def site(origin=(1.0, 0.0, 0.0)):
+    from agent_types import BuildSite
+    return BuildSite(id="s1", origin=tuple(float(v) for v in origin), col=(1.0, 0.0, 0.0),
+                     row=(0.0, 1.0, 0.0), dimensions=(0.2, 0.2, 0.2), ts=time.time(), epoch=3,
+                     frame_id="session-world", valid=True, floor_valid=True,
+                     clearance_valid=True, feasible=True)
+
+
 def pose(valid=True, epoch=3):
     return SimpleNamespace(x=0.0, y=0.0, yaw=0.0, ts=100.0, valid=valid, epoch=epoch, warning="")
 
@@ -35,16 +43,17 @@ def scan(points=None, build=None, surface=(), boxes=(), ts=None, valid=True):
 
 
 def column(x, y, z, n=40):
-    """A dense cluster of depth points at a single height."""
-    return [[x + 0.001 * i, y + 0.001 * i, z] for i in range(n)]
+    """A dense cluster of depth points at a single height, inside _height_at's sampling disk."""
+    return [[x + 0.001 * i, y + 0.001 * (i % 7), z] for i in range(n)]
 
 
 class OccupancyTests(unittest.TestCase):
-    def cells(self, s, cells=((0, 0, 0),)):
-        return observations.classify_cells(s, cells, SETTINGS)
+    def cells(self, s, cells=((0, 0, 0),), selected=None):
+        chosen = site() if selected is None else (selected or None)
+        return observations.classify_cells(s, chosen, cells, VOXEL, SETTINGS)
 
-    def test_no_build_frame_is_unknown_not_empty(self):
-        result, complete = self.cells(scan(build=None))
+    def test_no_selected_site_is_unknown_not_empty(self):
+        result, complete = self.cells(scan(build=None), selected=False)
         self.assertEqual([c.status for c in result], ["unknown"])
         self.assertFalse(complete)
 
@@ -55,7 +64,7 @@ class OccupancyTests(unittest.TestCase):
 
     def test_a_surface_at_the_cell_bottom_reads_empty(self):
         frame = build_frame()
-        bottom, top, centre = observations._cell_bounds((0, 0, 0), frame, SETTINGS)
+        bottom, top, centre = observations._cell_bounds(site(), (0, 0, 0), VOXEL, pose())
         s = scan(points=column(centre[0], centre[1], bottom), build=frame)
         result, complete = self.cells(s)
         self.assertEqual([c.status for c in result], ["empty"])
@@ -63,14 +72,14 @@ class OccupancyTests(unittest.TestCase):
 
     def test_a_surface_at_the_cell_top_reads_occupied(self):
         frame = build_frame()
-        bottom, top, centre = observations._cell_bounds((0, 0, 0), frame, SETTINGS)
+        bottom, top, centre = observations._cell_bounds(site(), (0, 0, 0), VOXEL, pose())
         s = scan(points=column(centre[0], centre[1], top), build=frame)
         result, _ = self.cells(s)
         self.assertEqual([c.status for c in result], ["occupied"])
 
     def test_a_height_matching_neither_face_is_unknown(self):
         frame = build_frame()
-        bottom, top, centre = observations._cell_bounds((0, 0, 0), frame, SETTINGS)
+        bottom, top, centre = observations._cell_bounds(site(), (0, 0, 0), VOXEL, pose())
         s = scan(points=column(centre[0], centre[1], (bottom + top) / 2.0), build=frame)
         result, complete = self.cells(s)
         self.assertEqual([c.status for c in result], ["unknown"])
@@ -78,14 +87,14 @@ class OccupancyTests(unittest.TestCase):
 
     def test_a_stale_scan_yields_unknown(self):
         frame = build_frame()
-        _, _, centre = observations._cell_bounds((0, 0, 0), frame, SETTINGS)
+        _, _, centre = observations._cell_bounds(site(), (0, 0, 0), VOXEL, pose())
         s = scan(points=column(centre[0], centre[1], 0.0), build=frame, ts=time.time() - 100.0)
-        result, _ = observations.classify_cells(s, [(0, 0, 0)], SETTINGS)
+        result, _ = observations.classify_cells(s, site(), [(0, 0, 0)], VOXEL, SETTINGS)
         self.assertEqual([c.status for c in result], ["unknown"])
 
     def test_an_occupied_cell_without_a_visible_marker_has_no_box_id(self):
         frame = build_frame()
-        _, top, centre = observations._cell_bounds((0, 0, 0), frame, SETTINGS)
+        _, top, centre = observations._cell_bounds(site(), (0, 0, 0), VOXEL, pose())
         result, _ = self.cells(scan(points=column(centre[0], centre[1], top), build=frame))
         self.assertIsNone(result[0].box_id, "an occluded marker attributes the cell to nobody")
 
