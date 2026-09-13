@@ -113,6 +113,8 @@ bot-code/
     assets/
       Crafter-transparent.svg  header logo
   actions/                   independently owned hardware action scripts
+    pickup.py                joint-space two-arm pickup prototype
+    motion_and_arms.md       source-checked base + arm control guide
   tests/                     offline component and UI regression tests
   voice/                     speech packs, playback and voice documentation
   fixtures/                  structure_house.json, world_state.json,
