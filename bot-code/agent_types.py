@@ -8,6 +8,7 @@ Unix seconds on a shared clock. Deadlines inside the agent use a monotonic clock
 from __future__ import annotations
 
 import base64
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Protocol
@@ -15,6 +16,7 @@ from typing import Callable, Literal, Protocol
 INTERFACE_VERSION = 2
 MAX_IMAGE_BYTES = 512 * 1024
 MAX_SCENE_IMAGES = 3
+MAX_WORLD_MODEL_BYTES = 32 * 1024
 Cell = tuple[int, int, int]
 Vector = tuple[float, float, float]
 Operation = Literal["observe", "look_around", "select_site", "approach_box", "pickup",
@@ -202,6 +204,20 @@ class ObservationSnapshot:
     base_position: Vector | None = None
     base_yaw: float | None = None
     images: tuple[SceneImage, ...] = ()
+    world_model_json: str = field(default="{}", repr=False)
+
+    def __post_init__(self):
+        if (not isinstance(self.world_model_json, str)
+                or len(self.world_model_json.encode("utf-8")) > MAX_WORLD_MODEL_BYTES):
+            raise ValueError("world model exceeds its bounded JSON budget")
+        world = self.world_model
+        if not isinstance(world, dict):
+            raise ValueError("world model must be a JSON object")
+        json.dumps(world, allow_nan=False)
+
+    @property
+    def world_model(self):
+        return json.loads(self.world_model_json)
 
 
 @dataclass(frozen=True)

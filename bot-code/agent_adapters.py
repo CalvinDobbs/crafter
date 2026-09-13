@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import base64
+import copy
 import importlib
+import json
 import math
 import threading
 import time
 from dataclasses import dataclass, replace
+from http.client import HTTPConnection, HTTPSConnection
+from types import SimpleNamespace
 from typing import Callable
+from urllib.parse import urlsplit
 
 from agent import CapabilityError
-from agent_types import (ActionOutcome, ActionProvider, ActionReceipt, BoxObservation,
-                         CancellationReceipt, Capabilities, ObservationProvider,
-                         ObservationSnapshot, PerceptionCapabilities, vector_valid)
+from agent_types import (MAX_IMAGE_BYTES, MAX_WORLD_MODEL_BYTES, ActionOutcome, ActionProvider,
+                         ActionReceipt, BoxObservation, CancellationReceipt, Capabilities,
+                         ObservationProvider, ObservationSnapshot, PerceptionCapabilities,
+                         SceneImage, vector_valid)
 
 
 @dataclass
@@ -200,13 +207,133 @@ def normalize_scan(scan, received_at, *, eligibility=None, revision=None):
                                base_position=(float(pose.x), float(pose.y), 0.0), base_yaw=float(pose.yaw))
 
 
+def normalize_perception(payload, received_at, *, fresh_s=2.0):
+    if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
+            or payload["schema_version"] != 2 or payload.get("mock") is not False
+            or payload.get("frame") != "base_at_capture" or type(payload.get("stale")) is not bool):
+        raise ValueError("expected a live perception /scan schema v2 in base_at_capture")
+    pose, ts = payload.get("pose"), payload.get("ts")
+    if (not isinstance(pose, dict) or type(pose.get("epoch")) is not int or pose["epoch"] < 0
+            or type(pose.get("valid")) is not bool
+            or not vector_valid((pose.get("x"), pose.get("y"), pose.get("yaw")))
+            or not vector_valid((ts, pose.get("ts"), received_at))):
+        raise ValueError("perception requires finite capture times and a versioned pose")
+    settings = payload.get("settings", {})
+    if not isinstance(settings, dict):
+        raise ValueError("perception settings must be an object")
+    sensor_fresh = settings.get("fresh_s", .8)
+    anchor_ttl = settings.get("anchor_ttl", 15.0)
+    if not vector_valid((fresh_s, sensor_fresh, anchor_ttl)) or min(fresh_s, sensor_fresh, anchor_ttl) <= 0:
+        raise ValueError("perception freshness limits must be finite and positive")
+    max_age = min(fresh_s, sensor_fresh)
+
+    def fresh(value, age=max_age):
+        return type(value) in (float, int) and math.isfinite(value) and -.05 <= received_at-value <= age
+
+    valid = (pose["valid"] and not payload["stale"] and fresh(ts) and fresh(pose["ts"])
+             and abs(pose["ts"]-ts) <= .06)
+    fields = ("schema_version", "frame", "pose", "build", "anchor_seen", "tracks", "objects",
+              "boxes", "protected", "unknown", "surface_cells", "settings", "diagnostics",
+              "streams", "telemetry", "detector", "detector_status", "warnings", "map_semantics")
+    world = copy.deepcopy({key: payload[key] for key in fields if key in payload})
+    world.update(captured_at=ts, received_at=received_at, frame_id="session-world", mock=False,
+                 stale=payload["stale"] or not fresh(ts), pose_valid=valid, site_feasibility="unknown")
+    world["map_semantics"] = "observed surfaces only; blank, omitted and unobserved cells UNKNOWN, not free; not a navigation map"
+    warnings = world.get("warnings", [])
+    if not isinstance(warnings, list) or any(not isinstance(w, str) for w in warnings):
+        raise ValueError("perception warnings must be strings")
+    warnings = [w[:512] for w in warnings[:16]]
+    if not valid:
+        warnings.append("perception pose or scan is invalid/stale; geometry cannot authorize motion")
+    world["warnings"] = warnings
+    collections = ("tracks", "objects", "surface_cells", "boxes", "protected", "unknown")
+    for name in collections:
+        rows = world.setdefault(name, [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError(f"perception {name} must contain objects")
+    for name in ("tracks", "objects"):
+        for item in world[name]:
+            seen = item.get("last_seen")
+            item["observed_current"] = not world["stale"] and item.get("current") is True and fresh(seen)
+            item["current"] = valid and item["observed_current"]
+            item["age_s" if name == "objects" else "age"] = (
+                max(0.0, received_at-seen) if type(seen) in (int, float) and math.isfinite(seen) else None)
+            item["pick_candidate"] = item.get("pick_candidate") is True and item["current"]
+            if name == "objects":
+                item["pick_candidate"] = False
+                if item.get("pose_epoch") != pose["epoch"]:
+                    item.update(current=False, world_position_m=None, position_base_m=None,
+                                identity_status="pose_epoch_changed")
+    build = world.get("build")
+    if build is not None:
+        if not isinstance(build, dict):
+            raise ValueError("perception build registration must be an object")
+        cells = build.pop("cells", [])
+        build["cell_count"] = len(cells)
+        build["valid"] = valid and build.get("valid") is True and fresh(build.get("ts"), anchor_ttl)
+        if type(build.get("ts")) in (int, float):
+            build["age"] = max(0.0, received_at-build["ts"])
+        if all(vector_valid(build.get(key)) for key in ("origin", "col", "row", "marker")):
+            c, s = math.cos(pose["yaw"]), math.sin(pose["yaw"])
+            registered = dict(build, frame_id="session-world")
+            for key in ("origin", "col", "row", "marker"):
+                x, y, z = build[key]
+                dx, dy = (pose["x"], pose["y"]) if key in {"origin", "marker"} else (0.0, 0.0)
+                registered[key] = [dx+c*x-s*y, dy+s*x+c*y, z]
+            world["build_world"] = registered
+    for item in world["surface_cells"]:
+        age = item.get("age")
+        seen = ts-age if type(age) in (int, float) and math.isfinite(age) and age >= 0 else None
+        item.update(last_seen=seen, age=None if seen is None else max(0.0, received_at-seen),
+                    current=valid and fresh(seen))
+    surfaces = world["surface_cells"]
+    heights = [s["z_max"] for s in surfaces if type(s.get("z_max")) in (int, float) and math.isfinite(s["z_max"])]
+    positions = [s["world"] for s in surfaces if vector_valid(s.get("world"))]
+    world["surface_summary"] = {
+        "count": len(surfaces), "current": sum(s["current"] for s in surfaces),
+        "max_height": max(heights) if heights else None,
+        "bounds_world": [[min(p[i] for p in positions) for i in range(3)],
+                         [max(p[i] for p in positions) for i in range(3)]] if positions else None}
+    source = SimpleNamespace(ts=ts, pose=SimpleNamespace(**pose), warnings=warnings,
+                             tracks=[t for t in world["tracks"] if not t.get("position_kind")])
+    snapshot = normalize_scan(source, received_at)
+    boxes = tuple(replace(box, valid=valid, current=valid and box.current and fresh(box.last_seen))
+                  for box in snapshot.boxes)
+
+    def priority(item):
+        position = item.get("world", item.get("world_position_m"))
+        distance = math.hypot(position[0]-pose["x"], position[1]-pose["y"]) if vector_valid(position) else math.inf
+        if vector_valid(position) and world.get("build_world"):
+            origin = world["build_world"]["origin"]
+            distance = min(distance, math.hypot(position[0]-origin[0], position[1]-origin[1]))
+        return not item.get("current", False), distance
+
+    totals = {name: len(world[name]) for name in collections}
+    for name in collections:
+        if len(world[name]) > 128:
+            world[name] = sorted(world[name], key=priority)[:128]
+    while True:
+        world["coverage"] = {name: {"total": totals[name], "included": len(world[name]),
+                                    "omitted": totals[name]-len(world[name])} for name in collections}
+        encoded = json.dumps(world, allow_nan=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) <= MAX_WORLD_MODEL_BYTES:
+            break
+        largest = max(collections, key=lambda name: len(json.dumps(world[name], separators=(",", ":"))))
+        if not world[largest]:
+            raise ValueError("perception metadata exceeds the world-model budget")
+        world[largest] = sorted(world[largest], key=priority)[:len(world[largest])//2]
+    return replace(snapshot, valid=valid, pose_valid=valid, boxes=boxes, world_model_json=encoded)
+
+
 class ObservationWorker:
     def __init__(self, session_factory, *, eligibility=None, interval=.005,
-                 timeout=4.0, clock=time.time):
-        if not all(math.isfinite(v) and v > 0 for v in (interval, timeout)):
+                 timeout=4.0, clock=time.time, retry_errors=False, close_timeout=None):
+        close_timeout = timeout if close_timeout is None else close_timeout
+        if not all(math.isfinite(v) and v > 0 for v in (interval, timeout, close_timeout)):
             raise ValueError("observation intervals must be finite and positive")
         self.factory, self.eligibility = session_factory, eligibility
         self.interval, self.timeout, self.clock = interval, timeout, clock
+        self.retry_errors, self.close_timeout = retry_errors, close_timeout
         self._condition = threading.Condition()
         self._stop = threading.Event()
         self._thread = None
@@ -231,13 +358,21 @@ class ObservationWorker:
         try:
             session = self.factory()
             while not self._stop.is_set():
-                scan = session.poll()
-                if scan is not None:
-                    self._revision += 1
-                    latest = normalize_scan(scan, self.clock(), eligibility=self.eligibility,
-                                            revision=str(self._revision))
+                try:
+                    scan = session.poll()
+                    if scan is not None:
+                        self._revision += 1
+                        latest = (replace(scan, revision=str(self._revision)) if isinstance(scan, ObservationSnapshot)
+                                  else normalize_scan(scan, self.clock(), eligibility=self.eligibility,
+                                                      revision=str(self._revision)))
+                        with self._condition:
+                            self._latest, self._error = latest, None
+                            self._condition.notify_all()
+                except Exception as exc:
+                    if not self.retry_errors:
+                        raise
                     with self._condition:
-                        self._latest = latest
+                        self._error = type(exc).__name__
                         self._condition.notify_all()
                 self._stop.wait(self.interval)
         except Exception as exc:
@@ -281,7 +416,7 @@ class ObservationWorker:
         with self._condition:
             self._condition.notify_all()
         if self._thread is not None:
-            self._thread.join(timeout=self.timeout)
+            self._thread.join(timeout=self.close_timeout)
             if self._thread.is_alive():
                 raise TimeoutError("sensor provider did not return from poll; worker could not close")
 
@@ -290,3 +425,72 @@ class ObservationWorker:
 
     def __exit__(self, *_):
         self.close()
+
+
+class _PerceptionHTTPSource:
+    def __init__(self, address, timeout, fresh_s, clock):
+        self.address, self.timeout, self.fresh_s, self.clock = address, timeout, fresh_s, clock
+
+    def _get(self, path, limit):
+        connection_type = HTTPSConnection if self.address.scheme == "https" else HTTPConnection
+        connection = connection_type(self.address.hostname, self.address.port, timeout=self.timeout)
+        try:
+            connection.request("GET", path)
+            response = connection.getresponse()
+            if path == "/frame?view=rect" and response.status in {204, 503}:
+                return None, response.headers
+            if response.status != 200:
+                raise ConnectionError(f"perception returned HTTP {response.status}")
+            if int(response.getheader("Content-Length", "0")) > limit:
+                raise ValueError("perception response exceeds its byte budget")
+            data = response.read(limit+1)
+            if len(data) > limit:
+                raise ValueError("perception response exceeds its byte budget")
+            return data, response.headers
+        finally:
+            connection.close()
+
+    def _scan(self):
+        data, headers = self._get("/scan", 2*1024*1024)
+        if headers.get_content_type() != "application/json":
+            raise ValueError("perception scan must be JSON")
+        payload = json.loads(data)
+        return payload, normalize_perception(payload, self.clock(), fresh_s=self.fresh_s)
+
+    def poll(self):
+        before, snapshot = self._scan()
+        data, headers = self._get("/frame?view=rect", MAX_IMAGE_BYTES)
+        if data is not None:
+            after, snapshot = self._scan()
+            ts = float(headers.get("X-Frame-Timestamp", "nan"))
+            aligned = (before["pose"]["epoch"] == snapshot.epoch
+                       and before["ts"]-.001 <= ts <= after["ts"]+.001
+                       and -.05 <= self.clock()-ts <= min(self.fresh_s, after.get("settings", {}).get("fresh_s", .8)))
+            if aligned and headers.get_content_type() == "image/jpeg":
+                image = SceneImage("rect", "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"),
+                                   ts, snapshot.epoch, frame_id=snapshot.frame_id,
+                                   description="Live rectified head camera with marker overlays; not motion authority.")
+                return replace(snapshot, images=(image,))
+        return replace(snapshot, warnings=snapshot.warnings + ("live image unavailable, stale or not aligned to the map epoch",))
+
+    def close(self):
+        pass
+
+
+class PerceptionObservations(ObservationWorker):
+    def __init__(self, url="http://127.0.0.1:8007", *, interval=.1, timeout=.2, fresh_s=2.0, clock=time.time):
+        if not isinstance(url, str) or any(ord(c) <= 32 for c in url):
+            raise ValueError("perception URL must be an HTTP(S) origin")
+        address = urlsplit(url)
+        if (address.scheme not in {"http", "https"} or not address.hostname
+                or address.username is not None or address.password is not None
+                or address.path not in {"", "/"} or address.query or address.fragment):
+            raise ValueError("perception URL must be an HTTP(S) origin without credentials, path, query or fragment")
+        if address.port == 0 or not math.isfinite(fresh_s) or fresh_s <= 0:
+            raise ValueError("perception port and freshness must be positive")
+        super().__init__(lambda: _PerceptionHTTPSource(address, timeout, fresh_s, clock),
+                         interval=interval, timeout=min(timeout, .2), clock=clock, retry_errors=True,
+                         close_timeout=3*timeout+.5)
+
+    def capabilities(self):
+        return PerceptionCapabilities(inventory=True, images=True)

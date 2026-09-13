@@ -354,6 +354,7 @@ class Agent:
                 "frame_id": s.snapshot.frame_id, "epoch": s.snapshot.epoch,
                 "base_position": s.snapshot.base_position, "base_yaw": s.snapshot.base_yaw,
                 "images": [asdict(image) for image in s.snapshot.images],
+                "world_model": s.snapshot.world_model,
                 "occupancy": [asdict(item) for item in s.snapshot.occupancy
                               if item.cell in s.job.requirements.cells or item.status != "empty"],
                 "warnings": list(s.snapshot.warnings),

@@ -51,6 +51,8 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["agent", "oneshot"], default="agent",
                     help="agent is default; oneshot is the legacy fixed-grid path, not mobile execution")
     ap.add_argument("--provider", help="explicit live adapter factory: module:function returning AgentProviders")
+    ap.add_argument("--observe-perception", metavar="URL",
+                    help="inspect a live perception server without actions; --planner llm adds one read-only model decision")
     ap.add_argument("--box-size", type=float, help="uniform box edge in meters; required for live agent")
     ap.add_argument("--max-steps", type=int, default=512)
     ap.add_argument("--max-actions", type=int, default=512)
@@ -73,6 +75,10 @@ def main(argv=None):
     ap.add_argument("--sweeps", type=int, default=1,
                     help=">1 rotates the base between scans to find more boxes")
     a = ap.parse_args(argv)
+    if a.observe_perception:
+        if a.mock or a.ui or a.provider or a.grid_ui or a.mode != "agent" or a.save_api_key or a.sweeps != 1:
+            ap.error("--observe-perception is read-only and cannot select mock, UI, actions or legacy execution")
+        return observe_perception(a)
     if a.save_api_key:
         from agent_backend import save_api_key_from_env
         try:
@@ -210,6 +216,55 @@ def run_agent(args, structure):
     finally:
         if providers is not None:
             providers.close()
+
+
+def observe_perception(args):
+    from agent_adapters import PerceptionObservations
+    from agent_types import AgentConfig, Step
+    try:
+        with PerceptionObservations(args.observe_perception) as provider:
+            deadline = time.monotonic()+4.0
+            while True:
+                try:
+                    snapshot = provider.observe()
+                    break
+                except (TimeoutError, RuntimeError):
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            capabilities = asdict(provider.capabilities())
+        observation = asdict(snapshot)
+        observation.pop("world_model_json")
+        observation["world_model"] = snapshot.world_model
+        context = dict(observation, phase="PERCEPTION", execution_enabled=False,
+                       inventory=observation["boxes"], confirmed=[], enabled_operations=["observe", "stop"],
+                       perception_capabilities=capabilities)
+        if args.structure:
+            from agent import validate_job
+            size = args.box_size if args.box_size is not None else .3
+            job = validate_job(load_structure(args.structure), "perception-only",
+                               AgentConfig(voxel_size=(size, size, size)))
+            context["goal"] = asdict(job.requirements)
+        decision = None
+        if args.planner == "llm":
+            from agent_backend import OpenAIReasoner, load_api_key
+            key = load_api_key()
+            if not key and not args.base_url:
+                raise ValueError("LLM requires OPENAI_API_KEY or an explicitly configured compatible endpoint")
+            reasoner = OpenAIReasoner(model=args.model, base_url=args.base_url, api_key=key or "unused",
+                                     timeout=args.llm_timeout, json_only=args.json_only)
+            choices = (Step("observe", "Inspect another live scene"), Step("stop", "Actions are not connected"))
+            decision = reasoner.decide(context, choices)
+        observation["images"] = [{k: v for k, v in asdict(image).items() if k != "data_url"}
+                                 for image in snapshot.images]
+        print(json.dumps({"execution_enabled": False, "observation": observation,
+                          "perception_capabilities": capabilities,
+                          "decision": asdict(decision) if decision else None}, allow_nan=False), flush=True)
+        return 0
+    except Exception as exc:
+        print(f"[perception] {type(exc).__name__}: inspection failed; check the perception server and model configuration",
+              file=sys.stderr, flush=True)
+        return 2
 
 
 if __name__ == "__main__":

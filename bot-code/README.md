@@ -139,6 +139,96 @@ Receiver: accept → **read to EOF** (half-close framing) → parse →
 - ⚠️ FIRST LIVE CHECK: confirm `camera.points` is pixel-aligned to the left
   half of head rgb (compare shapes) before trusting positions.
 
+### Connect live perception to reasoning
+
+`agent_adapters.PerceptionObservations` connects to the **existing** perception
+visualizer's `/scan` and `/frame?view=rect` endpoints (default port 8007). It does
+not import `perception.py`, start another detector, own hardware readers/writers,
+or call action scripts. Reuse the running perception process; inspect bot
+services before starting anything. From Windows, use SSH for bot-side commands,
+or forward port 8007 to read the bot's loopback-only service locally.
+
+Inspect a live snapshot from the repository root without an action provider,
+robot packages, or a model call:
+
+```bash
+python -B -S bot-code/main.py --observe-perception http://127.0.0.1:8007
+```
+
+The URL is relative to the machine running this command: on the bot it reaches
+the bot's perception process; on a developer PC it needs the corresponding SSH
+forward. This mode rejects `--mock`, `--ui`, `--provider`, and legacy execution.
+It never moves the robot or reports a completed build. Output includes structured
+observations and image metadata, **not image bytes**. Even with a saved API key,
+the default `auto` planner does not contact a model in this inspection mode.
+
+To request one real, read-only model decision on the bot, explicitly opt in:
+
+```bash
+uv run --offline bot-code/main.py --observe-perception http://127.0.0.1:8007 --planner llm
+```
+
+This sends the live image and structured world model to the configured model and
+can incur API charges. Only `observe` and `stop` are allowed; neither invokes an
+action provider. Optional `--structure PATH --box-size METERS` supplies the target
+build as context without attempting execution.
+
+The adapter preserves the useful world-model information rather than reducing
+perception to box centers:
+
+- Persistent tracks, original measurement times, current/remembered status and
+  loose/protected/unknown classifications. Markerless surface estimates remain
+  separate from actionable box geometry; unknown depth and ambiguous identities
+  are not repaired or promoted to grasp poses. `observed_current` retains recent
+  visual detections even when localization is invalid and metric `current` is false.
+- The oriented anchor/build registration in its original base-at-capture frame,
+  plus `build_world` transformed into the same session-world frame as box tracks.
+  Box size, cell pitch, footprint dimensions, anchor validity and age are retained.
+  A registered anchor is **not** a feasibility or clearance certificate.
+- Observed surface cells, independent measurement times, height bounds, and a
+  whole-map summary. Large maps are bounded to 32 KiB of world-model JSON, favoring
+  fresh samples near the robot/build. `coverage` reports included and omitted
+  records; omitted or blank cells remain unknown, never free space. Redundant
+  precomputed build-cell centers are replaced by their count; axes/pitch remain.
+- Detector labels, scores, bounding boxes, session IDs, identity/depth status,
+  visible-surface estimates, pose/epoch, calibration diagnostics, stream freshness,
+  wheel/IMU telemetry, detector health and warnings.
+- A real rectified camera image whose own capture time is bracketed by scans in
+  the same map epoch. Unavailable, stale or mismatched images are not substituted
+  with simulated frames. Transport failures make observations unavailable and
+  retry in the background; they never refresh cached evidence timestamps.
+
+`ObservationSnapshot.world_model_json` is immutable, bounded JSON;
+`snapshot.world_model` returns a detached dictionary for inspection. The agent
+passes it to the reasoner as `world_model`, alongside the existing inventory and
+vision inputs. Empty `{}` remains backward-compatible with other v2 providers.
+
+When the independently developed actions are ready, use this observation provider
+in their existing `--provider module:factory` handoff:
+
+```python
+from agent_adapters import AgentProviders, PerceptionObservations
+
+observations = PerceptionObservations("http://127.0.0.1:8007")
+providers = AgentProviders(actions=your_action_provider, observations=observations,
+                           close=observations.close)
+```
+
+The factory should return `providers` and also close any action **transport**
+resources it owns, without moving or releasing a load. Perception calls read a
+background cache (at most 200 ms initial wait); no camera or model startup runs
+inside an observation call. This adapter advertises only inventory and images.
+Site feasibility, complete cell occupancy, phase-aware safety monitoring and
+possession remain unavailable, so the normal build agent still refuses execution
+at preflight. Its safety checks and the frozen Minecraft contracts are unchanged.
+
+Focused offline integration checks use a local fake HTTP perception server and
+fake model clients; they never contact the bot or a paid API:
+
+```bash
+python -B -S -m unittest discover -s bot-code/tests -p test_agent_adapters.py -v
+```
+
 ## Agent component interface v2
 
 This section and the pure-stdlib types in **`agent_types.py`** are the handoff
