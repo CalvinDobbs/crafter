@@ -1,11 +1,16 @@
 import asyncio
 import importlib.util
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 import unittest
+from functools import partial
 from html.parser import HTMLParser
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -321,6 +326,105 @@ class PanelAssetsTests(unittest.TestCase):
         main = html.split('<section id="main-screen"', 1)[1].split("</section>", 1)[0]
         self.assertRegex(main, r'<button\b[^>]*\bid="clear-blueprint"[^>]*\bdisabled')
         self.assertIn("Clear blueprint", main)
+
+    @unittest.skipUnless(os.environ.get("CRAFTER_LAYOUT_CDP") and shutil.which("node"),
+                         "optional layout check requires Node 22+ and an isolated Chromium CDP endpoint")
+    def test_screens_fit_the_browser_viewport(self):
+        class Assets(SimpleHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+        root = Path(__file__).resolve().parents[1]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Assets, directory=str(root)))
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        script = r"""
+            const cdp = process.env.CRAFTER_LAYOUT_CDP;
+            const target = await fetch(cdp+'/json/new?about:blank', {method:'PUT'}).then(r=>r.json());
+            const ws = new WebSocket(target.webSocketDebuggerUrl);
+            await new Promise((resolve,reject)=>{ws.addEventListener('open',resolve,{once:true});ws.addEventListener('error',reject,{once:true});});
+            let sequence=0;
+            const pending=new Map();
+            ws.addEventListener('message', event=>{
+                const message=JSON.parse(event.data), call=pending.get(message.id);
+                if(!call)return;
+                pending.delete(message.id);clearTimeout(call.timer);
+                message.error?call.reject(new Error(JSON.stringify(message.error))):call.resolve(message.result);
+            });
+            const send=(method,params={})=>new Promise((resolve,reject)=>{
+                const id=++sequence,timer=setTimeout(()=>{pending.delete(id);reject(new Error('CDP timeout: '+method));},5000);
+                pending.set(id,{resolve,reject,timer});ws.send(JSON.stringify({id,method,params}));
+            });
+            const evaluate=async expression=>{
+                const r=await send('Runtime.evaluate',{expression,returnByValue:true,awaitPromise:true});
+                if(r.exceptionDetails)throw new Error(JSON.stringify(r.exceptionDetails));
+                return r.result.value;
+            };
+            const now=Date.now()/1000;
+            const design={id:'1',received_at:now,count:4,blocks:[{x:0,y:0,z:0},{x:1,y:0,z:0},{x:0,y:0,z:1},{x:0,y:1,z:0}],size:[2,2,2],source:'Example',buildable:true};
+            const base={revision:1,view:'main',design,job:null,notice:'',receiver:{listening:true,port:5005},worker_busy:false,llm_ready:true,model:'offline-layout-test',csrf:'layout-only',simulation:true};
+            const job={id:'layout-job',design,status:'running',phase:'BUILD',reasoning:'Inspect the supported target before placing the next box. '.repeat(9),placed:[],started_at:now,finished_at:null,llm_calls:20,tool_calls:30,current_tool:'place',current_cell:[0,0,0],error:null,events:Array.from({length:40},(_,i)=>({id:i+1,type:'placement_confirmed',at:now+i,data:{box_id:i,cell:[0,0,0]}}))};
+            const failures=[];
+            const viewports=[[1600,900],[1280,720],[1280,600],[1024,640],[1024,576],[800,600],[640,480],[390,844],[320,568],[844,390]];
+            const modes=['waiting','main','configuration','notice','unsupported','build','failure','complete'];
+            try {
+                await send('Page.enable');
+                await send('Network.enable');
+                await send('Network.setCacheDisabled',{cacheDisabled:true});
+                await send('Page.addScriptToEvaluateOnNewDocument',{source:`window.__layoutState=${JSON.stringify(base)};window.fetch=async()=>new Response(JSON.stringify(window.__layoutState),{headers:{'Content-Type':'application/json'}});`});
+                await send('Page.navigate',{url:process.env.CRAFTER_LAYOUT_URL+'/panel.html'});
+                for(let i=0;i<60;i++){
+                    if(await evaluate("document.readyState==='complete' && typeof render==='function'"))break;
+                    await new Promise(r=>setTimeout(r,25));
+                }
+                for(const [width,height] of viewports) {
+                    await send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});
+                    for(const mode of modes) {
+                        const screen=['waiting','configuration','notice','unsupported'].includes(mode)?'main':mode==='failure'?'build':mode;
+                        const s={...base,revision:++sequence,view:screen,llm_ready:mode!=='configuration',
+                            design:mode==='waiting'?null:mode==='unsupported'?{...design,buildable:false,error:'Target contains an unsupported block at (0, 1, 0).'}:design,
+                            notice:mode==='notice'?'Minecraft design rejected: invalid, incomplete, or timed-out message. Please scan the structure again.':'',
+                            job:screen==='main'?null:{...job,status:mode==='complete'?'completed':mode==='failure'?'failed':'running',error:mode==='failure'?'Verification unavailable. '.repeat(20):null,finished_at:mode==='complete'?now+20:null}};
+                        await evaluate(`window.__layoutState=${JSON.stringify(s)};state=window.__layoutState;render(state);new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);
+                        const result=await evaluate(`(()=>{
+                            const problems=[],root=document.documentElement;
+                            if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
+                            const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#load-example','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
+                            for(const selector of controls){
+                                const element=document.querySelector(selector),r=element.getBoundingClientRect();
+                                if(!r.width||!r.height||r.top<-.5||r.left<-.5||r.bottom>innerHeight+.5||r.right>innerWidth+.5)problems.push(selector+' outside viewport');
+                                for(let parent=element.parentElement;parent;parent=parent.parentElement){
+                                    const style=getComputedStyle(parent),p=parent.getBoundingClientRect();
+                                    if(/auto|scroll|hidden|clip/.test(style.overflowY)&&(r.top<p.top-1||r.bottom>p.bottom+1))problems.push(selector+' clipped by '+parent.className);
+                                }
+                            }
+                            const canvas=document.querySelector('[data-screen]:not([hidden]) canvas'),r=canvas.getBoundingClientRect();
+                            if(r.width<1||r.height<1)problems.push('preview collapsed');
+                            if(${JSON.stringify(screen)}==='build'){
+                                const feed=document.querySelector('#activity-feed'),r=feed.getBoundingClientRect();
+                                if(r.bottom>innerHeight+1||r.height<1||getComputedStyle(feed).overflowY!=='auto')problems.push('activity feed is not contained');
+                            }
+                            return problems;
+                        })()`);
+                        if(result.length)failures.push({viewport:[width,height],mode,problems:result});
+                    }
+                }
+                console.log(JSON.stringify({cases:viewports.length*modes.length,failures},null,2));
+                if(failures.length)process.exitCode=1;
+            } finally {
+                for(const call of pending.values())clearTimeout(call.timer);
+                ws.close();
+                await fetch(cdp+'/json/close/'+target.id);
+            }
+        """
+        try:
+            result = subprocess.run([shutil.which("node"), "--input-type=module", "-"], input=script,
+                                    capture_output=True, text=True, timeout=60,
+                                    env=dict(os.environ, CRAFTER_LAYOUT_URL=f"http://127.0.0.1:{server.server_port}"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
 
     @unittest.skipUnless(importlib.util.find_spec("quickjs"), "optional JavaScript engine not installed")
     def test_javascript_syntax(self):
