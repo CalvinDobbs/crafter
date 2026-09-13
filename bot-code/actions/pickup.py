@@ -27,8 +27,9 @@ Joint-space, no IK. Stages:
   3. prepare wrists: rotate J6 inward toward the box while J0 stays at the top, preserving
      the initialized J4 roll, J5 and open J7 claw setpoints; --hook caps J6 travel and 0 skips this stage
   4. extend elbows (J3) by --elbow-extension turns from home while raised (default: 30 deg);
-     wait for both arms to arrive, then lift (J0) -> bottom minus --bottom-margin turns
-     toward the top; --lower-only holds this extended reach pose
+     wait for both arms to arrive, then lower (J0) -> bottom minus --bottom-margin turns
+     toward the top, stopping and settling at each hard-coded J0_WAYPOINT_FRACS stop on the way
+     down instead of running the whole height in one sweep; --lower-only holds this reach pose
   5. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
           (tracking error rises), then holds --squeeze turns past contact through the lift
@@ -36,7 +37,8 @@ Joint-space, no IK. Stages:
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
        c. with --pickup, cradle: the elbows flex a little from the reach pose, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
-  6. lift J0 back up to the top (shoulder level), preserving the grasp, and hold until termination
+  6. lift J0 back up to the top (shoulder level) through the same hard-coded stops, settling at
+     each one, preserving the grasp, and hold until termination
 All other joints hold their initialized pose. Range edges come from the per-robot
 ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outward" and
 "inward" signs are per-arm (the arms are mirror images in motor-turn space) and are derived
@@ -57,6 +59,7 @@ import numpy as np
 from bbos import Reader, Writer, Type, Config
 
 J0 = 0
+SHOULDER = 1            # shoulder pitch: raises / lowers the whole arm, elbow tip included
 SWING = 2               # shoulder swing: moves the EE along base y (toward / away from the other arm)
 ELBOW = 3               # q2urdf(cfg.home)[3] is +1.571 rad on both arms: home[3] IS the 90 deg elbow
 WRIST_YAW = 5           # turns the hand about base z: +-0.25 turns = +-90 deg, sweeps the EE along base y
@@ -67,7 +70,19 @@ WRIST_ROLL_TURNS = 0.25
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
 J0_BOTTOM_MARGIN = 1.0
-ELBOW_EXTENSION = 30.0 / 360.0
+# Hard-coded intermediate J0 stops for both vertical moves (descent to the low pose and the loaded
+# ascent), as fractions of the travel from the start pose to that move's target. The lift stops and
+# settles at each one instead of running the whole height in a single sweep, so a motor that trips
+# its current protection is waited for at the next stop rather than falling a whole lift behind.
+# Fractions, not absolute turns: mirrored arms with unequal travel still cross every stop together.
+J0_WAYPOINT_FRACS = (0.25, 0.5, 0.75, 1.0)
+J0_WAYPOINT_SETTLE_S = 0.3  # dwell at each intermediate stop before the next segment starts
+ELBOW_EXTENSION = 45.0 / 360.0  # straighter elbows reach farther forward, but on their own they only
+                                # move the low elbow tip forward -- SHOULDER_LIFT is what raises it
+SHOULDER_LIFT = 15.0 / 360.0    # turns J1 lifts with the extended reach so the elbow tip clears the
+                                # chassis; paired with the extension, not a substitute for it
+SHOULDER_SPEED = 0.05           # turns/s; J1 carries the whole arm, so ease it like the elbow
+ELBOW_CLEARANCE = 2.5 / 360.0  # extra right-arm J3 reach: its forearm rides a lower chassis member
 ELBOW_EXTENSION_SPEED = 0.05
 INITIALIZE_SPEED = 0.08
 LIFT_SPEED = 0.4        # turns/s for the loaded ascent
@@ -87,15 +102,27 @@ RANGE_MARGIN = 0.02     # turns; stay this far inside every calibrated joint ran
 SPREAD_SPEED = 0.15     # turns/s swinging the whole arm out (J2 carries the arm, so ease it)
 SPREAD_SETTLE_S = 0.5   # let the arms stop swinging before the lift moves
 PINCH_SPEED = 0.05      # turns/s J2 creep toward the box
-PINCH_CONTACT_ERR = 0.015   # turns of J2 tracking error that counts as touching the box (no-load ~0.002)
-PINCH_SQUEEZE = 0.03    # turns commanded past the contact point: a steady spring squeeze. TUNE on box
+PINCH_CONTACT_ERR = 0.010   # turns of J2 tracking error that counts as touching the box (no-load ~0.002);
+                            # detecting earlier stops the swing on less deflection, so less force
+PINCH_SQUEEZE = 0.01   # turns commanded past the contact point: a steady spring squeeze. TUNE on box
 PINCH_SETTLE_S = 0.5    # let the squeeze load up before hooking
+PINCH_CENTER_MARGIN = 0.03  # turns of J2 kept outboard of home: the travel backstop, not a force
+# J2 force-regulated pinch. J2 cannot run in tau mode (arm_left.tau_mode_allowed is False for the
+# ST-3120 joints), so the grip stays in position mode and the measured motor current is the force
+# signal. Current at a stalled J2 also carries gravity and arm geometry, so CALIBRATE these at the
+# actual grasp pose: log current[SWING] on a free-air pinch first for the no-load baseline.
+PINCH_CURRENT_A = 0.3   # A of J2 current that counts as pressing the box (clamp is ~1.96 A). TUNE
+PINCH_CURRENT_DB = 0  # A deadband around the hold current, so the regulator does not chatter
+PINCH_RELIEF_STEP = 5e-4    # turns/tick the J2 goal walks to shed or restore grip (as j7_relief_step)
+PINCH_RELIEF_MAX = 0.05     # turns; cap on the accumulated backoff from the contact command
 HOOK_SPEED = 0.08       # turns/s wrist creep, hand turning in across the front of the box
 HOOK_MAX_TRAVEL = 0.22  # turns (~80 deg) of wrist travel when nothing stops the hand earlier
 HOOK_CONTACT_ERR = 0.015    # turns of wrist tracking error that counts as the hand touching the box
 HOOK_SQUEEZE = 0.01     # turns past the hook contact point. TUNE on box
 GRIP_SPEED = 0.4        # turns/s closing / opening the gripper (~0.33 turns in <1 s)
-GRIP_OPEN_FRAC = 0.6    # how far toward the calibrated open stop the jaws open (~quest_teleop's wide-open)
+GRIP_OPEN_FRAC = 0.67    # how far toward the calibrated open stop the jaws open: fully wide, so the
+                        # open hands can palm a box from both sides (clamped RANGE_MARGIN inside the
+                        # stop, since initialization requires the jaws to actually reach the command)
 GRIP_SETTLE_S = 0.5     # let the jaws seat before tilting
 CRADLE_TILT = 0.03      # turns (~11 deg) of extra elbow flex from the reach pose to lift the box's front edge. TUNE
 CRADLE_SPEED = 0.05     # turns/s; slow so the box rolls back onto the forearms, not out of them
@@ -142,6 +169,27 @@ def j0_low_target(top, bottom, margin):
     return float(bottom + np.sign(top - bottom) * min(margin, abs(top - bottom)))
 
 
+def j0_waypoint(start, target, frac):
+    """The intermediate J0 stop ``frac`` of the way from ``start`` to ``target``. A full fraction
+    returns ``target`` itself, so the last stop is the calibrated end and not float arithmetic."""
+    return float(target if frac >= 1.0 else start + frac * (target - start))
+
+
+def elbow_extension_for(side, extension, clearance=ELBOW_CLEARANCE):
+    """Per-arm J3 extension. The right forearm has to clear a lower chassis member, so it
+    reaches farther than the left; ``reach_elbow`` still keeps it short of straight."""
+    return extension + (clearance if side == "right" else 0.0)
+
+
+def up_sign(cfg, turns, joint):
+    """Sign of a step on ``joint`` that raises this arm's EE (base z up)."""
+    q = np.asarray(turns, dtype=np.float64).copy()
+    p0, _ = cfg.ik.fk(list(cfg.q2urdf(q.copy())[:7]))
+    q[joint] += 0.05
+    p1, _ = cfg.ik.fk(list(cfg.q2urdf(q.copy())[:7]))
+    return float(np.sign(p1[2] - p0[2])) or 1.0
+
+
 def inward_sign(cfg, turns, joint):
     """Sign of a step on ``joint`` that moves this arm's EE toward the robot centreline (base y -> 0)."""
     q = np.asarray(turns, dtype=np.float64).copy()
@@ -167,7 +215,9 @@ class Arm:
         # (quest_teleop's GRIPPER_OPEN_POS lands ~1/3 of the way toward it).
         ends = np.array([self.cal_min[GRIPPER], self.cal_max[GRIPPER]])
         self.grip_closed = float(ends[np.argmin(np.abs(ends))])
-        self.grip_open = self.grip_closed + GRIP_OPEN_FRAC * (float(ends[np.argmax(np.abs(ends))]) - self.grip_closed)
+        open_stop = float(ends[np.argmax(np.abs(ends))])
+        self.grip_open = float(np.clip(self.grip_closed + GRIP_OPEN_FRAC * (open_stop - self.grip_closed),
+                                       self.edge(GRIPPER, -1), self.edge(GRIPPER, 1)))
         self.cmd = None
 
     def edge(self, joint, sign, margin=RANGE_MARGIN):
@@ -312,35 +362,61 @@ def settle_lift(arms, timeout=ARRIVE_TIMEOUT_S, *, phase="settling"):
     return False
 
 
-def lift_to_shoulder(arms, speed=LIFT_SPEED, accel=LIFT_ACCEL):
-    if _stop:
-        return False
-    if not settle_lift(arms, timeout=LIFT_FEEDBACK_MAX_AGE, phase="start check"):
-        if not _stop:
-            print("[pickup] lift not started: J0 feedback is missing, invalid, stale, or differs from the held pose", flush=True)
-        return False
+def lift_segment(arms, targets, speed, accel, label):
+    """Timed quintic on J0 to ``targets``, one segment of the ascent. Publishing never waits on
+    feedback; the caller settles at the waypoint afterwards."""
     froms = [a.cmd.copy() for a in arms]
-    dist = max(abs(a.top - p0[J0]) for a, p0 in zip(arms, froms))
+    dist = max(abs(t - p0[J0]) for p0, t in zip(froms, targets))
+    # 1.875 = 15/8, smootherstep's peak derivative: anything smaller undersizes the ramp and the
+    # real peak speed overshoots `speed`. Use --lift-speed to go faster, not this factor.
     duration = max(1.875 * dist / speed, np.sqrt((10 / np.sqrt(3)) * dist / accel))
-    print(f"[pickup] lift start wall={time.time():.3f} duration={duration:.3f}s "
+    print(f"[pickup] lift {label} start wall={time.time():.3f} duration={duration:.3f}s "
           f"peak_speed<={speed:.3f} turns/s acceleration<={accel:.3f} turns/s^2", flush=True)
     t0 = next_log = time.monotonic()
     while not _stop:
         now = time.monotonic()
         elapsed = now - t0
         f = smootherstep(elapsed / duration) if duration > 0 else 1.0
-        for a, p0 in zip(arms, froms):
+        for a, p0, target in zip(arms, froms, targets):
             pos = p0.copy()
-            pos[J0] = a.top if elapsed >= duration else p0[J0] + f * (a.top - p0[J0])
+            pos[J0] = target if elapsed >= duration else p0[J0] + f * (target - p0[J0])
             a.write_cmd(pos)
         if now >= next_log or elapsed >= duration:
             states, ages = sample_lifts(arms)
             log_lifts(arms, states, ages, "ramp end" if elapsed >= duration else "ramping", elapsed)
             next_log = now + LIFT_LOG_INTERVAL_S
         if elapsed >= duration:
-            return settle_lift(arms)
+            return True
         time.sleep(1.0 / RATE_HZ)
     return False
+
+
+def lift_to_shoulder(arms, speed=LIFT_SPEED, accel=LIFT_ACCEL):
+    """Climb to shoulder level through the hard-coded J0_WAYPOINT_FRACS stops, settling at each one.
+    A waypoint that cannot be verified is reported and does not stop the climb (no retries), so an
+    incomplete arrival still ends with the shoulder-level command published and held."""
+    if _stop:
+        return False
+    if not settle_lift(arms, timeout=LIFT_FEEDBACK_MAX_AGE, phase="start check"):
+        if not _stop:
+            print("[pickup] lift not started: J0 feedback is missing, invalid, stale, or differs from the held pose", flush=True)
+        return False
+    starts = [a.cmd[J0] for a in arms]
+    stops = len(J0_WAYPOINT_FRACS)
+    settled = True
+    for i, frac in enumerate(J0_WAYPOINT_FRACS, 1):
+        targets = [j0_waypoint(start, a.top, frac) for a, start in zip(arms, starts)]
+        label = f"segment {i}/{stops} ({frac:.2f} of the climb)"
+        if not lift_segment(arms, targets, speed, accel, label):
+            return False
+        # The last stop is shoulder level, so it keeps the plain "settling" phase name.
+        if not settle_lift(arms, phase="settling" if i == stops else f"waypoint {i}/{stops}"):
+            settled = False
+        if _stop:
+            return False
+        if i < stops:
+            hold(arms, J0_WAYPOINT_SETTLE_S)
+    return settled
 
 
 def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False):
@@ -377,7 +453,7 @@ def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False
 def initialize_pose(arms, targets, lift_speed):
     stages = [(ELBOW, ELBOW_SPEED, ELBOW_SETTLE_S),
               (GRIPPER, GRIP_SPEED, GRIP_SETTLE_S), (J0, lift_speed, TOP_SETTLE_S)]
-    stages.extend((joint, INITIALIZE_SPEED, 0.0) for joint in (1, SWING, WRIST_ROLL, WRIST_YAW, WRIST_PITCH))
+    stages.extend((joint, INITIALIZE_SPEED, 0.0) for joint in (SHOULDER, SWING, WRIST_ROLL, WRIST_YAW, WRIST_PITCH))
     print("[pickup] initialization: calibrated home, raised lift, open claws, 90 deg wrist roll", flush=True)
     for joint, speed, pause in stages:
         if _stop:
@@ -433,20 +509,23 @@ def hook_direction(arm, keep_height=False, *, joint=WRIST_YAW):
     return d
 
 
-def creep_to_contact(arms, direction, speed, contact_err, squeeze, max_travel, label):
+def creep_to_contact(arms, direction, speed, contact_err, squeeze, max_travel, label, current_a=None):
     """Creep every arm along its joint-space ``direction`` (largest component 1 turn) until it
     meets the box, then hold a fixed squeeze past the contact point. Contact is the tracking
-    error along the direction rising above ``contact_err``; each arm detects it on its own, so an
-    off-centre box is still held from both sides. Travel is capped by ``max_travel`` and by the
-    calibrated range of every moving joint."""
+    error along the direction rising above ``contact_err``, or -- with ``current_a`` -- the
+    measured current on the moving joint reaching that many amps, which stops on force instead of
+    a position proxy and adds no positional squeeze past it. Each arm detects it on its own, so an
+    off-centre box is still held from both sides. Travel is capped by ``max_travel`` (a scalar or
+    one value per arm) and by the calibrated range of every moving joint."""
     dt = 1.0 / RATE_HZ
     starts = [a.cmd.copy() for a in arms]
     dirs = [direction(a) for a in arms]
+    caps = max_travel if np.ndim(max_travel) else [max_travel] * len(arms)
     limits = []
-    for a, d in zip(arms, dirs):
+    for a, d, cap in zip(arms, dirs, caps):
         moving = np.nonzero(d)[0]
         room = [(a.edge(j, d[j]) - a.cmd[j]) / d[j] for j in moving]
-        limits.append(max(min(min(room), max_travel), 0.0))
+        limits.append(max(min(min(room), cap), 0.0))
         joints = " ".join(f"J{j}{d[j]:+.2f}" for j in moving)
         print(f"[pickup] {a.side}: {label} along {joints} from {a.cmd[moving]}, max travel {limits[-1]:.3f}", flush=True)
     contact = [None] * len(arms)
@@ -459,6 +538,15 @@ def creep_to_contact(arms, direction, speed, contact_err, squeeze, max_travel, l
                 pos = p0 + d * min(travel, limits[i])
                 live = a.live()
                 err = float(d @ (pos - live)) / float(d @ d)
+                if current_a is not None:
+                    state = a.latest_state()
+                    joint = int(np.argmax(np.abs(d)))
+                    if state is not None and abs(float(state["current"][joint])) > current_a:
+                        contact[i] = live
+                        print(f"[pickup] {a.side}: {label} contact at {abs(float(state['current'][joint])):.2f}A "
+                              f"after {min(travel, limits[i]):.3f}, holding without extra squeeze", flush=True)
+                        a.write_cmd(pos)
+                        continue
                 if err > contact_err:
                     contact[i] = live
                     pos = p0 + d * np.clip(min(travel, limits[i]) - err + squeeze, 0.0, limits[i])
@@ -470,6 +558,34 @@ def creep_to_contact(arms, direction, speed, contact_err, squeeze, max_travel, l
         if all(c is not None for c in contact):
             break
         time.sleep(dt)
+
+
+def regulate_pinch(arms, secs, target_a=PINCH_CURRENT_A, deadband=PINCH_CURRENT_DB):
+    """Hold the grasp at a current, not a fixed position preload. While J2 presses harder than
+    ``target_a`` the goal walks back toward the measured position (shedding current, so heat, the
+    way the daemon's J7 relief loop does); below the band the backoff relaxes to re-grip. The
+    backoff is capped by PINCH_RELIEF_MAX and never pushes past the original contact command."""
+    dt = 1.0 / RATE_HZ
+    holds = [a.cmd.copy() for a in arms]
+    signs = [inward_sign(a.cfg, a.cmd, SWING) for a in arms]
+    bias = [0.0] * len(arms)
+    t0 = time.monotonic()
+    while not _stop and (secs is None or time.monotonic() - t0 < secs):
+        for i, (a, held, inward) in enumerate(zip(arms, holds, signs)):
+            state = a.latest_state()
+            if state is not None and np.isfinite(state["current"][SWING]):
+                current = abs(float(state["current"][SWING]))
+                if current > target_a + deadband:
+                    bias[i] = min(bias[i] + PINCH_RELIEF_STEP, PINCH_RELIEF_MAX)
+                elif current < target_a - deadband:
+                    bias[i] = max(bias[i] - PINCH_RELIEF_STEP, 0.0)
+            pos = held.copy()
+            pos[SWING] = held[SWING] - inward * bias[i]
+            a.write_cmd(pos)
+        time.sleep(dt)
+    for a, held, inward, backoff in zip(arms, holds, signs, bias):
+        print(f"[pickup] {a.side}: pinch holding J2 {a.cmd[SWING]:+.3f} "
+              f"(contact {held[SWING]:+.3f}, backoff {backoff:.4f} turns) at ~{target_a:.2f}A", flush=True)
 
 
 def main():
@@ -495,13 +611,23 @@ def main():
                     help="extra inward J2 turns past detected contact, capped by calibration (default: %(default)s)")
     ap.add_argument("--elbow-extension", type=float, default=ELBOW_EXTENSION,
                     help="J3 extension from the 90-degree home bend in turns before descent; 0 disables (default: %(default)s)")
+    ap.add_argument("--shoulder-lift", type=float, default=SHOULDER_LIFT,
+                    help="J1 raise in turns held with the extended reach so the elbow tip clears the chassis; 0 disables (default: %(default)s)")
+    ap.add_argument("--pinch-current", type=float, default=PINCH_CURRENT_A,
+                    help="J2 current in amps that stops the pinch and is then held; needs calibration at the grasp pose (default: %(default)s)")
+    ap.add_argument("--pinch-margin", type=float, default=PINCH_CENTER_MARGIN,
+                    help="turns of J2 travel backstop kept outboard of home (default: %(default)s)")
+    ap.add_argument("--elbow-clearance", type=float, default=ELBOW_CLEARANCE,
+                    help="extra right-arm J3 extension in turns so its forearm clears the lower chassis (default: %(default)s)")
     ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex from the reach pose in turns after gripping; 0 disables")
     args = ap.parse_args()
     for name in ("speed", "bottom_margin", "lift_speed", "lift_accel"):
         value = getattr(args, name)
         if not np.isfinite(value) or value <= 0:
             ap.error(f"--{name.replace('_', '-')} must be finite and greater than zero")
-    for name in ("hook", "squeeze", "elbow_extension"):
+    if not np.isfinite(args.pinch_current) or args.pinch_current <= 0:
+        ap.error("--pinch-current must be finite and greater than zero")
+    for name in ("hook", "squeeze", "elbow_extension", "elbow_clearance", "pinch_margin", "shoulder_lift"):
         value = getattr(args, name)
         if not np.isfinite(value) or value < 0:
             ap.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
@@ -513,7 +639,8 @@ def main():
     arms = [Arm(s) for s in sides]
     try:
         initial_targets = [a.initial_pose() for a in arms]
-        elbow_targets = [a.reach_elbow(args.elbow_extension) for a in arms]
+        elbow_targets = [a.reach_elbow(elbow_extension_for(a.side, args.elbow_extension, args.elbow_clearance))
+                         for a in arms]
         cradle_targets = ([a.cradle(args.cradle, start=target) for a, target in zip(arms, elbow_targets)]
                           if args.pickup and args.cradle > 0 else [])
         # Only an OFF->ON transition reseeds the daemon's command filter, so disable first
@@ -561,6 +688,26 @@ def main():
         if _stop:
             return
 
+        # Raise the shoulders before straightening the elbows. The extension alone only swings the
+        # low elbow tip forward; lifting J1 is what gets it above the chassis it was catching on.
+        if args.shoulder_lift > 0:
+            print(f"[pickup] reach: raise shoulders (J1) {args.shoulder_lift * 360:.1f} deg while raised", flush=True)
+            shoulder_targets = []
+            for a in arms:
+                up = up_sign(a.cfg, a.cmd, SHOULDER)
+                target = float(np.clip(a.cmd[SHOULDER] + up * args.shoulder_lift,
+                                       a.edge(SHOULDER, -1), a.edge(SHOULDER, 1)))
+                shoulder_targets.append(target)
+                print(f"[pickup] {a.side}: raise J1 {a.cmd[SHOULDER]:+.3f} -> {target:+.3f} "
+                      f"(up is J1{up:+.0f})", flush=True)
+            ramp_joint(arms, SHOULDER, shoulder_targets, SHOULDER_SPEED, ease=smootherstep)
+            if _stop:
+                return
+            settle_joint(arms, SHOULDER, require_arrival=True)
+            hold(arms, ELBOW_SETTLE_S)
+        if _stop:
+            return
+
         if args.elbow_extension > 0:
             print(f"[pickup] reach: extend elbows {args.elbow_extension * 360:.1f} deg while raised", flush=True)
             for a, target in zip(arms, elbow_targets):
@@ -576,9 +723,20 @@ def main():
         low_targets = [j0_low_target(a.top, a.bottom, args.bottom_margin) for a in arms]
         for a, target in zip(arms, low_targets):
             print(f"[pickup] {a.side}: low J0 target {target:+.3f} (bottom {a.bottom:+.3f}, margin {args.bottom_margin:.3f})", flush=True)
-        print("[pickup] J0 -> low pose", flush=True)
-        ramp_joint(arms, J0, low_targets, args.speed)
-        settle_joint(arms, J0)
+        print(f"[pickup] J0 -> low pose through {len(J0_WAYPOINT_FRACS)} stops", flush=True)
+        descent_starts = [a.cmd[J0] for a in arms]
+        for i, frac in enumerate(J0_WAYPOINT_FRACS, 1):
+            stops = [j0_waypoint(start, target, frac)
+                     for start, target in zip(descent_starts, low_targets)]
+            print(f"[pickup] descent stop {i}/{len(J0_WAYPOINT_FRACS)} ({frac:.2f}): "
+                  + "  ".join(f"{a.side} J0 {a.cmd[J0]:+.3f} -> {stop:+.3f}"
+                              for a, stop in zip(arms, stops)), flush=True)
+            ramp_joint(arms, J0, stops, args.speed)
+            settle_joint(arms, J0)
+            if _stop:
+                return
+            if i < len(J0_WAYPOINT_FRACS):
+                hold(arms, J0_WAYPOINT_SETTLE_S)
         for a in arms:
             print(f"[pickup] {a.side}: J0 at {a.live()[J0]:+.3f}", flush=True)
 
@@ -588,9 +746,19 @@ def main():
             return
 
         print("[pickup] grasp: swing elbows inward (J2), keeping the extended elbow reach pose (J3)", flush=True)
+        # The forearm hits the chassis once J2 swings inward past its calibrated home, so the
+        # pinch stops there: a box that never triggered contact detection would otherwise keep
+        # squeezing into the robot and jam the lift.
+        pinch_limits = []
+        for a in arms:
+            inward = inward_sign(a.cfg, a.cmd, SWING)
+            pinch_limits.append(max(inward * (float(a.cfg.home[SWING]) - a.cmd[SWING])
+                                    - args.pinch_margin, 0.0))
+            print(f"[pickup] {a.side}: pinch stops {args.pinch_margin:.3f} turns outboard of J2 "
+                  f"{a.cfg.home[SWING]:+.3f} (home), {pinch_limits[-1]:.3f} turns inward", flush=True)
         creep_to_contact(arms, pinch_direction, PINCH_SPEED, PINCH_CONTACT_ERR, args.squeeze,
-                         max_travel=np.inf, label="pinch")
-        hold(arms, PINCH_SETTLE_S)
+                         max_travel=pinch_limits, label="pinch", current_a=args.pinch_current)
+        regulate_pinch(arms, PINCH_SETTLE_S, args.pinch_current)
 
         if _stop:
             return
