@@ -1,15 +1,16 @@
 # Crafter — project plan
 
-This is the overall plan. READMEs are not.
+This is the overall plan: goals and sequencing. It is **not** a status page — for what the code does today, read the sources below.
 
 | Document | Role |
 |---|---|
-| **[PLAN.md](PLAN.md)** (this file) | Goals, sequencing, gaps, voice, what “done” means |
+| **[PLAN.md](PLAN.md)** (this file) | Goals, sequencing, voice design, what “done” means |
+| [bot-code/README.md](bot-code/README.md) | **Current** robot architecture, interface v2, module owners, runbook |
+| [AGENTS.md](AGENTS.md) | Current operational rules and verified commands |
 | [README.md](README.md) | Mod: how to build, run, and scan a world |
 | [WIRE_FORMAT.md](WIRE_FORMAT.md) | Frozen TCP/JSON contract, game → bot |
-| [bot-code/README.md](bot-code/README.md) | Robot app architecture, module owners, demo runbook |
 
-If those disagree, this file wins on *what we are building and in what order*. Wire format wins on the scanner payload. `bot-code/contracts.py` wins on in-process types.
+This file wins on *what we are building and in what order*. It does not win on current state: where this file and `bot-code/README.md` disagree about what exists, the README and the code win. Wire format wins on the scanner payload. `bot-code/contracts.py` wins on in-process types.
 
 ---
 
@@ -25,25 +26,27 @@ One-line pitch: **You build it in Minecraft. It builds it in real life. It talks
 
 ## 2. What is true today (GitHub `main`)
 
-**Working / sketched**
+This section goes stale quickly. It was last checked against the code on 2026-09-12; [bot-code/README.md](bot-code/README.md) is the authority.
+
+**Built**
 
 - Fabric 1.21.11 mod (`minecraft-mod/`, id still `posstream`) scans ±64 blocks around world origin and sends one JSON object over TCP to `100.66.148.86:5005`.
-- Wire format is specified and has been captured against a real send.
-- `bot-code/` has the robot pipeline on paper and in Python: contracts, grid UI / json / nbt ingest, ArUco perception, planner (deterministic + LLM), orchestrator, HTTP skills client.
-- Hardware is meant to live in **one** process, `mc_skills` (port 8006), so only one writer owns arms / base / speaker / LED.
+- Wire format is specified, frozen, and captured against a real send.
+- `bot-code/panel.py` listens on `0.0.0.0:5005`, reads to EOF, and parses and validates the wire payload directly. `structure_src.py` still offers `.json` / `.nbt` / click-grid ingest as an offline alternative, not as the live path.
+- The panel serves a browser UI on `127.0.0.1:8005`: preview, Start, Clear blueprint, masked model-key entry. It makes **real model calls with simulated tools**, and starts nothing until Start is clicked.
+- A stateful reasoning agent (`agent.py`) is the default CLI mode, with typed interface-v2 contracts (`agent_types.py`), provider loading and a live read-only perception adapter (`agent_adapters.py`), a strict model backend (`agent_backend.py`), and an offline mock world (`mock_agent_world.py`). `--mode oneshot` is the separate legacy pipeline.
+- `perception.py` runs live sensing and a persistent world model on the robot, verified with live cameras and a TensorRT box detector. It went beyond the ArUco plan below: detection is markerless, with identity, confidence, depth and position uncertainty.
+- Voice exists and is non-blocking: `SpeechQueue` on a background thread, phase-level events (`pick.approach` / `grasp` / `lift`, `place.approach` / `release` / `retreat`), voice packs with one selected, and OpenAI TTS with a WAV cache.
+- Speaker playback is documented from source in [bot-code/voice/speaker_playback.md](bot-code/voice/speaker_playback.md); base and arm control in [bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md).
 
 **Not true yet**
 
-- Root README still says the bot is “not in this repo.” Ignore that; `bot-code/` is here. The README was not updated after bot code landed.
-- **No process listens on tcp/5005.** A scan from the game currently has nowhere to go in this repo.
-- `structure_src` still loads `.json` / `.nbt` / a click-grid. It does not speak `WIRE_FORMAT.md`.
-- `mc_skills` is **not in this repo**. It lives on the robot at `~/bbapps/mc_skills`. `POST /say` is a print stub (“TTS stub (wav playback hook)”).
-- Orchestrator calls `say(line)` **then** `pick` **then** `place`, all blocking. Even with TTS, speech would finish *before* motion, not during it.
-- Planner narration is one punchy line per *pair* of pick+place (`"{kind} block, layer {y}, going in"`). No phase-level lines (approaching, grasping, carrying).
-- Live perception, gripper direction, `DOWN_QUAT`, `GRID_ORIGIN`, and `BOX_SIZE` are untuned. Demo checklist in `bot-code/README.md` is all unchecked.
-- Personality of the voice is **not chosen**. Do not block motion or TTS on that decision.
+- **No action provider.** There is no interface-v2 implementation that moves the real robot, so a live build still fails preflight. `actions/pickup.py` is a joint-space prototype, not a provider.
+- Possession, occupancy and build-site safety are **unknown** to the agent, by design — the perception adapter advertises only what it can actually evidence.
+- `GRID_ORIGIN` and `BOX_SIZE` are untuned at the table; no physical pick, place, base move or speaker check has been run.
+- `mc_skills` is **not fully in this repo**. The voice-side copy lives at `bot-code/voice/mc_skills_main.py`; the deployed body server is on the robot at `~/bbapps/mc_skills`. Treat them as separate and diff before assuming they match.
 
-Hardware daemons on the robot (arms, camera, base, speaker, …) are a platform given; they are not this project’s implementation work except as we call them through `mc_skills`.
+Hardware daemons on the robot (arms, camera, base, speaker, …) are a platform given; they are not this project’s implementation work except as we call them.
 
 ---
 
@@ -83,7 +86,7 @@ Rules that do not change:
 
 Do these in order. A later phase may start on a laptop while an earlier one is tuned on the robot, but a live demo requires 0–3.
 
-### Phase 0 — Single source of truth (this week, cheap)
+### Phase 0 — Single source of truth — **done**
 
 - Treat this file as the plan.
 - Fix the stale sentence in root README (“bot side not in this repo”).
@@ -91,7 +94,7 @@ Do these in order. A later phase may start on a laptop while an earlier one is t
 
 **Done when:** a new teammate can clone `crafter` and know where every process lives.
 
-### Phase 1 — Game → robot structure (blocks the live hook)
+### Phase 1 — Game → robot structure — **done**
 
 - Add `bot-code/receiver.py`: listen `0.0.0.0:5005`, read to EOF, parse, sanity-check `count`, map palette ids → `Block.kind`, write `fixtures/structure.json` (and/or push to a queue the orchestrator already waits on).
 - Convert Minecraft Y-up cells into the existing `Block(x, y, z, kind)` model (Y stays layer height).
@@ -102,7 +105,9 @@ Do these in order. A later phase may start on a laptop while an earlier one is t
 
 **Fallback if this slips:** grid UI or `structure_house.json`. Demo still works; the magic sentence does not.
 
-### Phase 2 — See boxes
+### Phase 2 — See boxes — **done, and superseded**
+
+`perception.py` went further than this phase asked: detection is markerless rather than ArUco-tagged, and the world model persists box tracks across observations. The original steps are kept for context.
 
 - Print ArUco 4×4 ids 0..N, tape one face per cube.
 - Run `perception.py` live; confirm `camera.points` is pixel-aligned with the **left** half of `camera.head.rgb`.
@@ -110,9 +115,9 @@ Do these in order. A later phase may start on a laptop while an earlier one is t
 
 **Done when:** three marked cubes on the table yield three stable `Detection`s in base frame, within a couple of centimeters, repeatedly.
 
-### Phase 3 — Move boxes
+### Phase 3 — Move boxes — **not started; this is the critical path**
 
-On-robot, serialized, with `mc_skills` already running:
+This phase now means **implementing an interface-v2 `ActionProvider`**, not driving the legacy `mc_skills` HTTP endpoints. Read [bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md) for how the base and arms actually work, and the interface-v2 section of [bot-code/README.md](bot-code/README.md) for what the provider must guarantee. The original endpoint-level steps below remain a reasonable order for the first physical checks:
 
 1. `POST /gripper` actually opens/closes (flip calibration constants if backwards).
 2. `POST /goto` with a tuned `DOWN_QUAT` (top-down EE).
@@ -122,15 +127,15 @@ On-robot, serialized, with `mc_skills` already running:
 
 **Done when:** a 3-block, 2-layer structure from a fixture is stacked without a human touching the arms.
 
-### Phase 4 — Closed loop
+### Phase 4 — Closed loop — **blocked on Phase 3**
 
 Phase 1 + 2 + 3 in one run: scan in Minecraft → listen → detect → plan → execute.
 
 **Done when:** a teammate who is not the implementer can build a small shape in-game and get a matching stack on the table.
 
-### Phase 5 — Voice during motion (specified below)
+### Phase 5 — Voice during motion — **done** (design retained below)
 
-### Phase 6 — Personality (explicitly later)
+### Phase 6 — Personality — **done**
 
 Voice pack, catchphrases, TTS voice, maybe LLM flavor. Does not gate Phases 0–5.
 
@@ -142,18 +147,20 @@ Voice pack, catchphrases, TTS voice, maybe LLM flavor. Does not gate Phases 0–
 
 While the robot is **actually moving**, it says what it is doing in plain language. Speech overlaps motion. Silence is worse than a slightly late line; a line that **blocks** a pick is a bug.
 
-Personality (witty pit crew, calm museum guide, etc.) is a skin. **Do not pick it in this phase.**
+Personality (witty pit crew, calm museum guide, etc.) is a skin. It was deliberately not picked during this phase; it was chosen afterwards, in Phase 6.
 
 ### What exists
 
-| Layer | Today |
+**This phase is built.** The table below is what it looked like beforehand, kept because the design that follows was written against it.
+
+| Layer | Before Phase 5 |
 |---|---|
 | Planner | Optional one-liner per pick/place *pair* |
 | Orchestrator | `skills.say(line)` then blocking `pick`/`place` |
 | `mc_skills` `/say` | Prints text; does not write `speaker.audio` |
 | Speaker daemon | Real: int16 16 kHz chunks, 100 ms, one `Writer` |
 
-So we have a *slot* for talking and no overlapping audio path.
+The gap was a *slot* for talking and no overlapping audio path. Today `SpeechQueue` runs speech on a background thread, `phases.py` emits the phase events below, and `tts.py` synthesizes through OpenAI with a WAV cache. The remaining unknown is physical audibility, which has never been checked — see [bot-code/voice/speaker_playback.md](bot-code/voice/speaker_playback.md).
 
 ### Design: events, not paragraphs
 
@@ -192,7 +199,7 @@ TTS lives behind `/say` so laptop mock mode still prints the same strings.
 1. **Overlap:** start TTS (or start playing a cached wav) at phase start; do not `join()` before the next IK segment.
 2. **Queue policy:** at most one line playing + one pending. A new phase **preempts** the pending line; if the current wav has > ~400 ms left, cut it at a chunk boundary and play the new line. Prefer being slightly terse over talking over yourself.
 3. **Length:** ≤ 8 words, ≤ ~2 s of audio. Pick/place segments are a few seconds; a paragraph will spill into the next phase.
-4. **Offline-first TTS:** Jetson-local (e.g. Piper or espeak-ng → wav → `speaker.audio` in 1600-sample frames, matching `play_sound`). Cloud TTS is optional later; it adds latency and a demo failure mode.
+4. **Offline-first TTS:** Jetson-local (e.g. Piper or espeak-ng → wav → `speaker.audio` in 1600-sample frames, matching `play_sound`). Cloud TTS is optional later; it adds latency and a demo failure mode. **This is the one item that shipped differently:** `tts.py` synthesizes through OpenAI, backed by the pre-rendered WAV cache in `voice/wavs/` so the demo lines do not depend on a live network call. The latency and failure-mode concerns above are the reason the cache exists.
 5. **Cache** by (voice_id, text) so repeated “Picking it up.” is instant.
 6. **Failure:** if TTS throws, log and keep moving. Mute is acceptable; a frozen arm is not.
 7. **Mock:** `MockSkills.say` already logs; add phase logs in mock `mc_skills` the same way.
@@ -243,13 +250,15 @@ Hardware time is a lock. Coordinate it; use one running `mc_skills`.
 |---|---|
 | Scanner item + TCP send | `minecraft-mod/` |
 | Wire contract | `WIRE_FORMAT.md` |
-| TCP receive + structure ingest | `bot-code/receiver.py` (new), `structure_src.py` |
+| TCP receive + structure ingest | `bot-code/panel.py` (live path), `structure_src.py` (offline) |
 | Types / grid math | `bot-code/contracts.py` |
 | See boxes | `bot-code/perception.py` |
-| Assign boxes | `bot-code/planner.py` |
-| Event → text | `bot-code/narrator.py` (new) |
-| Sequence the demo | `bot-code/main.py` |
-| Move + speak | `~/bbapps/mc_skills` until it lives in this repo |
+| Reason and sequence | `bot-code/agent.py`, `agent_types.py`, `agent_adapters.py` |
+| Assign boxes (legacy one-shot) | `bot-code/planner.py` |
+| Event → text | `bot-code/voice/narrator.py`, `voice/packs.py` |
+| Speech and TTS | `bot-code/voice/speech_queue.py`, `voice/tts.py` |
+| Move the robot | unowned — the interface-v2 action provider (Phase 3) |
+| Move + speak (deployed) | `~/bbapps/mc_skills` on the robot |
 
 Cross-file edits go through the file owner, especially `contracts.py` and `main.py`.
 

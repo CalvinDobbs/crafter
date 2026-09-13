@@ -1,8 +1,31 @@
-# Crafter LLM reasoning framework — reboot checkpoint
+# Crafter LLM reasoning framework — reboot checkpoint (superseded)
+
+> **Historical document. Do not plan from it.**
+>
+> This was a pre-implementation design checkpoint. The framework it proposes has since been built.
+> For what exists today, read [bot-code/README.md](bot-code/README.md) — in particular the
+> "Agent component interface v2" section — and the code itself. This file is kept only for the
+> design rationale behind decisions that are now settled.
+>
+> Where each proposal landed:
+>
+> | Proposed here | Implemented in |
+> |---|---|
+> | 1. Typed state and interfaces | `bot-code/agent_types.py` |
+> | 2. Structured reasoning | `bot-code/agent_backend.py` |
+> | 3. Validation and preflight | `agent.validate_job`, `agent.preflight` |
+> | 4. Execution state machine | `bot-code/agent.py` (`class Agent`) |
+> | 5. Bounded automatic recovery | `bot-code/agent.py` (recovery budget, `max_no_progress`) |
+> | 6. Movement capability | `move_to_build` in `MOTION_OPS` |
+> | 7. Mock world and tests | `bot-code/mock_agent_world.py`, `bot-code/tests/` |
+>
+> The agent is now the default CLI mode; `--mode oneshot` is the explicit legacy path.
+> What remains unbuilt is the **action provider** that makes any of it move a real robot — see
+> Phase 3 in [PLAN.md](PLAN.md) and [bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md).
 
 Make a stateful, verified agent loop the default, with an OpenAI-compatible LLM, bounded automatic recovery, and validated movement capabilities.
 
-## Status
+## Status at the time of writing
 
 Planning is incomplete. The user requested extensive planning and then paused for a reboot. Approval to commit/push this checkpoint is NOT approval to implement the framework. Resume only when asked; resolve the open scope questions before implementation.
 

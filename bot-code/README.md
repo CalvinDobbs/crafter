@@ -23,9 +23,14 @@ head stereo camera, 2 wrist cameras, mic/speaker, LED. All I/O is **bbos IPC**
 — shared-memory topics via `Reader`/`Writer`/`Type`/`Config`.
 
 - **ONE writer per topic.** A second `Writer("arm_right.ctrl")` anywhere else
-  raises `RuntimeError`. Exactly ONE process owns hardware: `mc_skills`.
-  Everyone else calls its HTTP API. Never open Writers on `arm_*.ctrl`,
-  `*.torque`, `drive.ctrl`, `led.ctrl`, `speaker.audio` outside it.
+  raises `RuntimeError` naming the owning PID. Exactly ONE process at a time may
+  own `arm_*.ctrl`, `*.torque`, `drive.ctrl`, `led.ctrl`, `speaker.audio`.
+  Today that owner is `mc_skills` when it is running; `actions/pickup.py` opens
+  arm writers directly and must never run alongside it. Going forward the
+  interface-v2 action provider is the designated owner. Do not open these
+  Writers from reasoning, perception, panel or test code, and never resolve a
+  conflict by killing the owner or restarting a BBOS daemon.
+  Details and the per-topic contracts: [actions/motion_and_arms.md](actions/motion_and_arms.md).
 - **Readers are unlimited.** Perception can run live on the robot at any time
   without conflicting with anything.
 - Arm control = position in motor turns. Cartesian via IK:
@@ -35,6 +40,8 @@ head stereo camera, 2 wrist cameras, mic/speaker, LED. All I/O is **bbos IPC**
   in robot coordinates. Base frame: +x forward, +y left, +z up, meters.
 - Homing: use `staged_home_arms`/`park_arms` from
   `bbapps/quest_teleop/scripts/homing.py` (mc_skills does). Leave arms limp.
+  Note the converse: the arm daemon cuts torque as soon as its control writer
+  disappears, so closing writers drops whatever the arm is holding.
 - VLM plumbing exists in `~/bbapps/inference/vlm.py` (multi-provider clients,
   `grab_right_eye`, strict JSON schema) — reuse it, don't rebuild it.
 - Full platform doc: `~/bbapps/AGENTS.md`.
@@ -88,7 +95,9 @@ create another writer. The mock providers have no hardware or network access.
 bot-code/
   contracts.py               shared types (pure python, no bbos) — FROZEN
   skills_client.py           SkillsClient (HTTP) + MockSkills
-  structure_src.py           .nbt import, structure.json, grid web UI :8005
+  structure_src.py           .nbt import, structure.json, legacy grid web UI
+                             (serve_grid_ui defaults to :8005 — the panel's port;
+                              pass another port, or the two collide)
   panel.py                   control panel and EOF-framed TCP :5005 receiver
   perception.py              independently owned sensing/world model
   planner.py                 legacy one-shot plan_build()
@@ -104,6 +113,8 @@ bot-code/
     assets/
       Crafter-transparent.svg  header logo
   actions/                   independently owned hardware action scripts
+    pickup.py                joint-space two-arm pickup prototype
+    motion_and_arms.md       source-checked base + arm control guide
   tests/                     offline component and UI regression tests
   voice/                     speech packs, playback and voice documentation
   fixtures/                  structure_house.json, world_state.json,
@@ -141,8 +152,16 @@ Receiver: accept → **read to EOF** (half-close framing) → parse →
   `verify_place` checks geometric height consistency, not action success or identity.
 - `scan_all` is legacy compatibility and rejects physical sweeps. The action
   provider owns movement; perception never commands a sweep.
+- **Markerless detection** is available alongside ArUco: `--prepare-detector`
+  fetches pinned YOLO-World + CLIP ONNX weights, then `--viz --detector boxes`
+  runs local proposals. `GET /objects` exposes session-local track IDs, original
+  bboxes, raw detector scores, depth and position uncertainty.
 - **Debug viz:** `uv run perception.py --viz [--mock]` → :8007 top-down map
   (robot, grid, loose/stacked markers, anchor) + live head-cam feed.
+- **Verified live** on bracketbot-184 with cameras and the box detector: valid
+  observations at ~9 FPS capture / ~8 FPS detection, sub-millisecond read
+  latency, image ages around 0.4–1.0 s. Possession, occupancy and site safety
+  stayed **unknown** — that is correct, not a gap to paper over.
 - Prep: print box markers 0..N-1 and anchor 49. Hardcoded positions are mock
   fixtures only, never a substitute for missing live evidence.
 - ⚠️ FIRST LIVE CHECK: confirm `camera.points` is pixel-aligned to the left
@@ -473,9 +492,13 @@ MOCK=1 uv run ~/bbapps/mc_skills/main.py   # same API, no bbos — laptops
 
 Endpoints: `GET /health` `/state`, POST `/home` `/park`
 `/goto{pos,quat?,duration}` `/pick{pos}` `/place{pos}` `/gripper{open}`
-`/rotate{rad}` `/say{text}` `/celebrate`; **`/drive{v,w,secs}` staged** for
-approach moves. Responses `{ok, result|error}`; serialized by a lock —
-concurrent calls get `busy`.
+`/rotate{rad}` `/say{text}` `/celebrate`. The deployed copy also has
+`/voice_script{lines}`. There is **no `/drive` endpoint** — it was only ever
+proposed; base motion goes through `/rotate` or a `drive.ctrl` writer.
+Responses `{ok, result|error}`; serialized by a lock — concurrent calls get
+`busy`, except `/say` and `/voice_script`, which do not take the motion lock.
+The repo copy at `voice/mc_skills_main.py` and the deployed
+`~/bbapps/mc_skills/main.py` differ; diff them before assuming a change is live.
 
 pick = approach +APPROACH_H → descend → grip → lift; place = mirror. TUNE on
 robot: `grip_open`/`grip_closed` direction (test `POST /gripper`), `DOWN_QUAT`
@@ -512,7 +535,10 @@ python -B -S bot-code/main.py --mock --planner deterministic
 
 ## Parallel-dev rules (the point of this layout)
 
-1. **Only mc_skills opens hardware Writers.** Everything else → SkillsClient.
+1. **One owner per hardware topic, and it is never the reasoning layer.** For the
+   legacy path that owner is `mc_skills`; `actions/pickup.py` and any future
+   interface-v2 action provider claim `arm_*.ctrl` / `arm_*.torque` directly, so
+   only one of them may run at a time. Reasoning code never opens a Writer.
 2. Readers are fair game — any process, any time.
 3. `contracts.py` frozen; `main.py` is the merge point — both need owner
    sign-off for edits. New functionality = new file or your own file.
@@ -525,13 +551,18 @@ python -B -S bot-code/main.py --mock --planner deterministic
 ## Runbook
 
 ```bash
-# body — leave running
-uv run ~/bbapps/mc_skills/main.py && curl -XPOST localhost:8006/home
+# body — leave running. Claims the hardware writers at boot; check first that
+# nothing else owns them, and see "Parallel-dev rules" below.
+uv run ~/bbapps/mc_skills/main.py
 # perception debug (safe alongside body)
 uv run ~/crafter/bot-code/perception.py --viz        # :8007
 # pipeline
 cd ~/crafter/bot-code && uv run main.py --mock       # then real args
 ```
+
+`POST /home` is **not** part of that starter block on purpose: it torques the arms
+and runs a staged homing trajectory, so it is real motion. Run it deliberately,
+with the arms clear and their owner present — never chained onto a server start.
 
 ## Tune-before-demo checklist
 
