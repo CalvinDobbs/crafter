@@ -261,10 +261,6 @@ const views = {
 };
 
 function text(id, value) { const node = byId(id); if (node.textContent !== String(value)) node.textContent = value; }
-function elapsed(start, end) {
-  const seconds = Math.max(0, Math.floor(((end || Date.now() / 1000) - start)));
-  return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
-}
 function notice(message) {
   clearTimeout(toastTimer);
   text('toast', message); byId('toast').hidden = false;
@@ -336,8 +332,7 @@ function renderFeed(job) {
     const dot = document.createElement('span'); dot.className = 'event-dot'; article.append(dot);
     const meta = document.createElement('div'); meta.className = 'event-meta';
     const kind = document.createElement('span'); kind.className = 'event-kind'; kind.textContent = row.kind === 'model' ? 'DECISION' : row.kind === 'tool' ? 'TOOL CALL' : 'SCENE UPDATE';
-    const stamp = document.createElement('time'); stamp.textContent = elapsed(job.started_at, row.at);
-    meta.append(kind, stamp); article.append(meta);
+    meta.append(kind); article.append(meta);
     const title = document.createElement('h3'); title.textContent = row.title; article.append(title);
     const detail = document.createElement('p'); detail.textContent = row.detail || ''; article.append(detail);
     if (row.status === 'running' || row.status === 'error' || row.duration !== undefined) {
@@ -378,7 +373,6 @@ function render(s) {
   if (job) {
     const total = job.design.count, placed = job.placed.length, percent = Math.round(placed / total * 100);
     const running = job.status === 'running';
-    text('build-title', job.status === 'failed' ? 'The build needs attention.' : 'Making the shape happen.');
     byId('cancel-build').hidden = !running; byId('cancel-build').disabled = submitting;
     byId('failed-back').hidden = running; byId('failed-back').disabled = submitting;
     byId('build-error').hidden = !job.error;
@@ -401,9 +395,7 @@ function render(s) {
     views.build.animate(running && screen === 'build');
     scene('complete', job.design, 'complete', job.placed, null);
     renderFeed(job);
-    text('complete-description', `Your ${total}-box shape is complete. Every placement has been verified.`);
-    text('complete-boxes', placed); text('complete-time', elapsed(job.started_at, job.finished_at)); text('complete-tools', job.tool_calls);
-    text('complete-next', design && design.id !== job.design.id ? 'A newer Minecraft design is ready on the main screen.' : 'Ready for the next idea.');
+    text('complete-boxes', placed); text('complete-tools', job.tool_calls);
     byId('back-main').disabled = submitting;
   }
   if (views[screen]) views[screen].invalidate();

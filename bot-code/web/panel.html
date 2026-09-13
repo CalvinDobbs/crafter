@@ -43,7 +43,7 @@
     </section>
 
     <section id="build-screen" data-screen="build" hidden>
-      <div class="page-heading"><div><div class="eyebrow">AGENT AT WORK</div><h1 id="build-title">Making the shape happen.</h1><p>One box at a time.</p></div><button id="cancel-build" class="button danger"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>Cancel build</button><button id="failed-back" class="button secondary" hidden>Back to design</button></div>
+      <div class="page-heading"><div></div><button id="cancel-build" class="button danger"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10M15 5 5 15"/></svg>Cancel build</button><button id="failed-back" class="button secondary" hidden>Back to design</button></div>
       <div id="new-design-notice" class="new-design" hidden>A newer Minecraft design has arrived. It will be ready on the main screen; this build stays unchanged.</div>
       <div id="build-error" class="inline-warning" role="alert" hidden></div>
       <div class="activity-layout">
@@ -57,7 +57,7 @@
     </section>
 
     <section id="complete-screen" data-screen="complete" hidden>
-      <div class="completion-layout"><div class="completion-copy"><div class="completion-details"><div class="complete-check"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="m7 14 5 5 9-10"/></svg></div><div class="eyebrow">BUILD COMPLETE</div><h1>Built, block<br>by block.</h1><p id="complete-description">Your shape is complete. Every placement has been verified.</p><div class="completion-metrics"><div><strong id="complete-boxes">4</strong><span>boxes placed</span></div><div><strong id="complete-time">00:00</strong><span>elapsed</span></div><div><strong id="complete-tools">0</strong><span>tool calls</span></div></div></div><div class="completion-actions"><button id="back-main" class="button primary"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19 12H5m6 6-6-6 6-6"/></svg>Back to main screen</button><p id="complete-next" class="button-hint">Ready for the next idea.</p></div></div><div class="scene-card finished-scene"><div class="scene-toolbar"><span class="small-label">THE FINISHED SHAPE</span><span class="badge success">Verified</span></div><div class="canvas-wrap"><canvas id="complete-canvas" tabindex="0" aria-label="Interactive preview of the completed structure."></canvas></div><div class="scene-footer"><span>Drag to inspect the finished arrangement</span><button class="text-button" data-view="complete" data-angle="reset">Reset view</button></div></div></div>
+      <div class="completion-layout"><div class="completion-copy"><div class="completion-details"><div class="complete-check"><svg viewBox="0 0 28 28" aria-hidden="true"><path d="m7 14 5 5 9-10"/></svg></div><div class="eyebrow">BUILD COMPLETE</div><div class="completion-metrics"><div><strong id="complete-boxes">4</strong><span>boxes placed</span></div><div><strong id="complete-tools">0</strong><span>tool calls</span></div></div></div><div class="completion-actions"><button id="back-main" class="button primary">Build another<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button></div></div><div class="scene-card finished-scene"><div class="scene-toolbar"><span class="small-label">THE FINISHED SHAPE</span><span class="badge success">Verified</span></div><div class="canvas-wrap"><canvas id="complete-canvas" tabindex="0" aria-label="Interactive preview of the completed structure."></canvas></div><div class="scene-footer"><span>Drag to inspect the finished arrangement</span><button class="text-button" data-view="complete" data-angle="reset">Reset view</button></div></div></div>
     </section>
     <section id="debug-screen" data-screen="debug" hidden>
       <div class="page-heading">
@@ -126,7 +126,6 @@
       </div>
     </section>
 
-    <footer class="page-footer"><span>CRAFTED IN MINECRAFT. ASSEMBLED BY AN AGENT.</span></footer>
   </main>
 </body>
 </html>

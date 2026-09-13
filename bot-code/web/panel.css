@@ -91,7 +91,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .text-button:hover{color:var(--accent)}
 .text-button span{color:var(--accent);margin-left:5px}
 #receive-notice{margin-top:12px}
-.page-footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);margin-top:32px;padding:19px 0;color:var(--faint);font:9px var(--mono);letter-spacing:.065em}
 .toast{position:fixed;z-index:10;right:30px;top:95px;background:#fff1ed;border:1px solid var(--accent-line);color:#873c36;padding:15px 20px;box-shadow:0 10px 35px #7d3f301a;border-radius:8px;max-width:420px;font-size:12px}
 .activity-layout{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(360px,1fr);gap:22px}
 .build-left{display:flex;flex-direction:column;gap:16px;min-width:0}
@@ -129,7 +128,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .event-meta{font:9px var(--mono);letter-spacing:.08em;color:var(--faint);display:flex;align-items:center;gap:7px;margin-bottom:7px}
 .event.model .event-kind{color:var(--accent)}
 .event.tool .event-kind{color:var(--green)}
-.event-meta time{margin-left:auto;letter-spacing:0}
 .event h3{font-size:12px;line-height:1.5;margin:0;font-weight:500;color:var(--text);overflow-wrap:anywhere}
 .event p{font-size:11px;color:var(--muted);line-height:1.7;margin-top:5px;overflow-wrap:anywhere}
 .event.tool h3{font-family:var(--mono);font-size:11px}
@@ -144,6 +142,7 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 #build-error{margin-bottom:17px}
 .completion-layout{display:grid;grid-template-columns:.85fr 1.15fr;align-items:center;gap:60px;min-height:610px;padding:35px 0 10px}
 .completion-copy{max-width:420px}
+#complete-screen .eyebrow{font-size:clamp(24px,4.2dvh,38px);letter-spacing:.05em;line-height:1.15;margin-bottom:6px}
 .complete-check{width:46px;height:46px;border-radius:50%;background:var(--success-soft);border:1px solid var(--success-line);color:var(--green);display:flex;align-items:center;justify-content:center;margin-bottom:28px}
 .complete-check svg{width:26px;height:26px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .completion-copy h1{font-size:clamp(40px,4.5vw,62px);letter-spacing:-2px;line-height:1.07;margin-bottom:22px}
@@ -215,8 +214,6 @@ h1{font-size:clamp(28px,3vw,40px);font-weight:500;line-height:1.2;letter-spacing
 .complete-check{margin-bottom:23px}
 .finished-scene .canvas-wrap{min-height:330px}
 .completion-metrics{gap:42px}
-.page-footer{font-size:8px;gap:20px;line-height:1.8}
-.page-footer>span:first-child{max-width:180px}
 .bottom-note{align-items:flex-start;gap:15px}
 .bottom-note>span{font-size:9px}
 .text-button{font-size:10px;white-space:nowrap}
@@ -259,7 +256,6 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .design-actions #clear-blueprint{grid-column:3;grid-row:1}
 .design-actions .button-hint{grid-column:1;grid-row:1;margin:0;text-align:left}
 .bottom-note{flex:none;padding-top:10px}
-.page-footer{flex:none;margin-top:12px;padding:10px 0;gap:16px}
 #receive-notice,#build-error,.new-design{flex:none;max-height:18dvh;overflow:auto;overflow-wrap:anywhere}
 .build-left{gap:12px}
 .thinking-card{flex:0 1 20%;min-height:0;max-height:clamp(64px,20dvh,160px);padding:12px 16px;overflow:auto;overflow-wrap:anywhere}
@@ -291,8 +287,7 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 @container(max-height:140px){.waiting p{display:none}
 }
 @media(max-height:600px){.page-heading{padding:8px 0}
-.page-heading .eyebrow,.page-heading p,.page-footer{display:none}
-.page-heading h1{font-size:24px}
+.page-heading .eyebrow,.page-heading p,.page-heading h1{font-size:24px}
 .thinking-card{max-height:64px}
 .build-left{gap:8px}
 .complete-check{width:36px;height:36px;margin-bottom:10px}
@@ -316,7 +311,6 @@ body{height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidd
 .bottom-note{gap:8px}
 .bottom-note>span{min-width:0}
 .text-button{font-size:9px}
-.page-footer{font-size:7px;gap:10px}
 .activity-layout{display:grid;grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1.7fr) minmax(0,1fr);gap:8px}
 .build-left{gap:6px}
 .completion-layout{grid-template-columns:minmax(0,1fr);grid-template-rows:minmax(0,1fr) minmax(100px,.7fr);gap:12px;padding-top:12px}
