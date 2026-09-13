@@ -78,8 +78,7 @@ CARRY_OMEGA = 0.10          # rad/s while loaded; a cradled box is held by squee
 SURVEY_STATIONS = 8     # yaw stops around a full turn
 SURVEY_YAW_RATE = 0.4   # rad/s, well under drive.max_angular_vel (0.9)
 SURVEY_SETTLE_S = 1.2   # dwell per station, comfortably past perception's 0.8 s freshness budget
-SURVEY_YAW_SIGN = 1.0   # drive.ctrl twist[1] is DOCUMENTED as +CCW but has never been verified on
-                        # the robot. Confirm with the smallest possible rotation before trusting it.
+# The hardware's inverted yaw is handled once, in armctl.set_twist; everything here is +CCW.
 
 
 class Executor:
@@ -148,17 +147,21 @@ def look_around(executor, request):
     rig, cancel = executor.rig, executor.cancel
     stations = int(request.get("stations", SURVEY_STATIONS))
     step_rad = 2.0 * np.pi / stations
-    turn_s = step_rad / SURVEY_YAW_RATE
     executor.phase("surveying")
+    covered = 0.0
     try:
         for i in range(stations):
-            rig.set_twist(0.0, SURVEY_YAW_SIGN * SURVEY_YAW_RATE)
-            armctl.dwell(turn_s, cancel)
-            rig.stop_base()
-            executor.log(f"[provider] survey station {i + 1}/{stations}")
+            # Turn by a MEASURED angle. Commanding a rate for a computed duration under-rotated
+            # the first live survey to 137 degrees of an intended 360, because a short step is
+            # mostly acceleration.
+            turned = rig.turn_by(step_rad, SURVEY_YAW_RATE, cancel=cancel, log=executor.log)
+            covered += turned if turned is not None else step_rad
+            executor.log(f"[provider] survey station {i + 1}/{stations}"
+                         f" (covered {covered * 180 / np.pi:+.0f} deg)")
             armctl.dwell(SURVEY_SETTLE_S, cancel)
     finally:
         rig.stop_base()
+    executor.log(f"[provider] survey swept {covered * 180 / np.pi:+.0f} deg of an intended 360")
     executor.phase("settling")
     armctl.dwell(SURVEY_SETTLE_S, cancel)
     return "completed"

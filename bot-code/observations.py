@@ -155,6 +155,38 @@ def found_cells_near(site, detection, voxel_size, pose, tolerance=0.5):
     return ((x, y, 0),)
 
 
+def box_rejection(track, voxel_size):
+    """Why this detector proposal may not be picked, or None if it may be.
+
+    Returning the reason rather than a bare False is the difference between "no box was eligible"
+    and "three were rejected for low confidence" -- the first tells you nothing when a build will
+    not start, and this is the layer that knows.
+    """
+    if track.get("source") != "box_detector":
+        return "not a detector proposal"
+    if track.get("label") not in (None, DETECTOR_LABEL):
+        return f"label {track.get('label')!r}"
+    if not track.get("current"):
+        return "remembered, not currently seen"
+    if track.get("classification") == "protected":
+        return "inside the build footprint"
+    if track.get("classification") != "loose":
+        return f"classification {track.get('classification')!r}"
+    if track.get("identity_status") in {"ambiguous", "pose_epoch_changed"}:
+        return f"identity {track.get('identity_status')}"
+    if track.get("partial_view"):
+        return "clipped by the frame"
+    status = track.get("depth_status")
+    if status not in DEPTH_OK:
+        return f"depth {status}"
+    score = track.get("score")
+    if not isinstance(score, (int, float)) or not math.isfinite(score):
+        return "no confidence score"
+    if score < SCORE_MIN:
+        return f"confidence {score:.2f} below {SCORE_MIN:.2f}"
+    return None
+
+
 def eligible_box(track, voxel_size):
     """Whether a detector proposal may be selected as material to pick.
 
@@ -168,20 +200,7 @@ def eligible_box(track, voxel_size):
     Size is deliberately not checked: the detector cannot measure it, and a fabricated size would
     turn an assumption into evidence.
     """
-    if track.get("source") != "box_detector":
-        return False
-    if track.get("label") not in (None, DETECTOR_LABEL):
-        return False
-    if not track.get("current") or track.get("classification") != "loose":
-        return False
-    if track.get("identity_status") in {"ambiguous", "pose_epoch_changed"}:
-        return False        # an uncertain identity is not a box you can promise to place
-    if track.get("partial_view"):
-        return False        # clipped by the frame: the visible centroid is not the visible face
-    if track.get("depth_status") not in DEPTH_OK:
-        return False
-    score = track.get("score")
-    return isinstance(score, (int, float)) and math.isfinite(score) and score >= SCORE_MIN
+    return box_rejection(track, voxel_size) is None
 
 
 def detector_tracks(scan, site, voxel_size, pose):
@@ -385,6 +404,11 @@ class _EnrichedSession:
             tracks=detector_tracks(scan, site, self.voxel_size, scan.pose))
         snapshot = normalize_scan(source, self.clock(),
                                   eligibility=lambda tr: eligible_box(tr, self.voxel_size))
+        rejected = [box_rejection(tr, self.voxel_size) for tr in source.tracks]
+        reasons = sorted({r for r in rejected if r})
+        if reasons and not any(r is None for r in rejected):
+            snapshot = replace(snapshot, warnings=snapshot.warnings + (
+                f"{len(rejected)} box proposal(s), none eligible: " + "; ".join(reasons),))
         if site is not None and requirements is not None:
             cells = _envelope(requirements)
             occupancy, complete = classify_cells(scan, site, cells, self.voxel_size, self.settings)
