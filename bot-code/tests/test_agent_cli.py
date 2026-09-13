@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -106,6 +107,57 @@ class PerceptionCliTests(unittest.TestCase):
             self.assertEqual(context["images"][0]["data_url"], snapshot.images[0].data_url)
             self.assertEqual({step.operation for step in choices}, {"observe", "stop"})
             self.assertFalse(context["execution_enabled"])
+
+    def test_inspection_waits_for_on_demand_camera_before_output_or_reasoning(self):
+        from agent_types import PerceptionCapabilities, Step
+        for planner in ("auto", "llm"):
+            with self.subTest(planner=planner), patch("agent_adapters.PerceptionObservations") as factory, \
+                 patch("agent_backend.OpenAIReasoner") as reasoner, \
+                 patch("agent_backend.load_api_key", return_value="not-a-real-key"), \
+                 contextlib.redirect_stdout(io.StringIO()) as output:
+                snapshot = self.snapshot()
+                provider = factory.return_value.__enter__.return_value
+                provider.observe.side_effect = [replace(snapshot, images=()), snapshot]
+                provider.capabilities.return_value = PerceptionCapabilities(inventory=True, images=True)
+                reasoner.return_value.decide.return_value = Step("stop", "Read-only test")
+                self.assertEqual(main.main(["--observe-perception", "http://127.0.0.1:8007", "--planner", planner]), 0)
+                self.assertEqual(provider.observe.call_count, 2)
+                self.assertEqual(len(json.loads(output.getvalue())["observation"]["images"]), 1)
+                if planner == "llm":
+                    context, _ = reasoner.return_value.decide.call_args.args
+                    self.assertEqual(context["images"][0]["data_url"], snapshot.images[0].data_url)
+                else:
+                    reasoner.assert_not_called()
+
+    def test_missing_camera_never_spends_a_model_request(self):
+        from agent_types import PerceptionCapabilities, Step
+        with patch("agent_adapters.PerceptionObservations") as factory, \
+             patch("agent_backend.OpenAIReasoner") as reasoner, \
+             patch("agent_backend.load_api_key", return_value="not-a-real-key") as key_loader, \
+             patch("main.time.monotonic", side_effect=[0.0, 5.0]), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as error:
+            provider = factory.return_value.__enter__.return_value
+            provider.observe.return_value = replace(self.snapshot(), images=())
+            provider.capabilities.return_value = PerceptionCapabilities(inventory=True, images=True)
+            reasoner.return_value.decide.return_value = Step("stop")
+            self.assertEqual(main.main(["--observe-perception", "http://127.0.0.1:8007", "--planner", "llm"]), 2)
+            reasoner.assert_not_called()
+            key_loader.assert_not_called()
+            self.assertIn("image unavailable", error.getvalue())
+
+    def test_data_only_inspection_still_reports_world_when_camera_wait_expires(self):
+        from agent_types import PerceptionCapabilities
+        with patch("agent_adapters.PerceptionObservations") as factory, \
+             patch("main.time.monotonic", side_effect=[0.0, 5.0]), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            provider = factory.return_value.__enter__.return_value
+            provider.observe.return_value = replace(self.snapshot(), images=())
+            provider.capabilities.return_value = PerceptionCapabilities(inventory=True, images=True)
+            self.assertEqual(main.main(["--observe-perception", "http://127.0.0.1:8007"]), 0)
+            result = json.loads(output.getvalue())
+            self.assertTrue(result["observation"]["world_model"])
+            self.assertEqual(result["observation"]["images"], [])
+            self.assertFalse(result["execution_enabled"])
 
     def test_perception_inspection_cannot_select_mock_ui_or_action_execution(self):
         for args in (["--mock"], ["--ui"], ["--provider", "other:create"], ["--mode", "oneshot"]):

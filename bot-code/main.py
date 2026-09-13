@@ -227,12 +227,16 @@ def observe_perception(args):
             while True:
                 try:
                     snapshot = provider.observe()
-                    break
+                    if snapshot.images or time.monotonic() >= deadline:
+                        break
                 except (TimeoutError, RuntimeError):
                     if time.monotonic() >= deadline:
                         raise
-                    time.sleep(.05)
+                time.sleep(.05)
             capabilities = asdict(provider.capabilities())
+        if args.planner == "llm" and not snapshot.images:
+            print("[perception] Live camera image unavailable; model request not sent", file=sys.stderr, flush=True)
+            return 2
         observation = asdict(snapshot)
         observation.pop("world_model_json")
         observation["world_model"] = snapshot.world_model
