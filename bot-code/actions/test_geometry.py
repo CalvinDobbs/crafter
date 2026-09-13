@@ -81,12 +81,13 @@ class SteeringStalenessTests(unittest.TestCase):
         pos = g.box_in_base(request(), snapshot=self.snapshot_with(current=False, age=1.0))
         self.assertEqual(len(pos), 3)
 
-    def test_a_long_lost_box_stops_the_drive(self):
+    def test_a_long_lost_box_falls_back_rather_than_stopping(self):
+        """A sighting goes stale fastest while turning onto the box, which is when it cannot be
+        seen at all. Failing there stops the drive for doing the very thing it was asked to."""
         g = geometry(snapshot())
-        stale = self.snapshot_with(current=False, age=geometry(snapshot()).__class__ and 99.0)
-        with self.assertRaises(StaleGeometry) as caught:
-            g.box_in_base(request(), snapshot=stale)
-        self.assertIn("beyond", str(caught.exception))
+        stale = self.snapshot_with(current=False, age=99.0)
+        position = g.box_in_base(request(), snapshot=stale)
+        self.assertEqual(len(position), 3)
 
     def test_a_lost_track_falls_back_to_the_validated_position(self):
         """The tracker mints a new id when a box blinks, so the selected id can vanish.
