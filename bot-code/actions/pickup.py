@@ -18,12 +18,13 @@ margin is a lift offset, not a measured floor distance.
 
 Joint-space, no IK. Stages:
   1. initialize: elbow (J3) -> calibrated 90 deg, grippers (J7) open, then lift (J0) -> top;
-     while raised, return J1, J2, J4, J5 and J6 to each arm's configured home angles.
+     while raised, return J1, J2, J5 and J6 to each arm's configured home angles and
+     roll J4 a mirrored 90 deg from home so the claw openings are vertical.
      Verify every joint reached the reference pose before starting the pickup.
   2. spread: both arms swing J2 (the sideways swing) OUT to the calibrated edge of their range,
      so the forearms straddle a box much wider than the shoulders
-  3. prepare wrists: rotate J5 inward toward the box while J0 stays at the top, preserving
-     the initialized J6 pitch and open J7 claw setpoints; --hook caps J5 travel and 0 skips this stage
+  3. prepare wrists: rotate J6 inward toward the box while J0 stays at the top, preserving
+     the initialized J4 roll, J5 and open J7 claw setpoints; --hook caps J6 travel and 0 skips this stage
   4. lift (J0) -> bottom minus --bottom-margin turns toward the top; --lower-only holds here
   5. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
@@ -58,6 +59,8 @@ ELBOW = 3               # q2urdf(cfg.home)[3] is +1.571 rad on both arms: home[3
 WRIST_YAW = 5           # turns the hand about base z: +-0.25 turns = +-90 deg, sweeps the EE along base y
 WRIST_PITCH = 6         # tips the hand about base y; blended with J5 so the hook stays level once J2 is swung out
 GRIPPER = 7
+WRIST_ROLL = 4
+WRIST_ROLL_TURNS = 0.25
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
 J0_BOTTOM_MARGIN = 0.80
@@ -168,8 +171,11 @@ class Arm:
         if pose.shape != (self.dof,) or not np.all(np.isfinite(pose)):
             raise ValueError(f"{self.side}: invalid calibrated home pose")
         pose[J0], pose[GRIPPER] = self.top, self.grip_open
+        pose[WRIST_ROLL] += float(np.sign(self.elbow_90) or 1.0) * WRIST_ROLL_TURNS
         if not np.all(np.isfinite(pose)) or np.any(pose < self.lo) or np.any(pose > self.hi):
             raise ValueError(f"{self.side}: initialization pose is outside calibrated ranges")
+        if not self.edge(WRIST_ROLL, -1) <= pose[WRIST_ROLL] <= self.edge(WRIST_ROLL, 1):
+            raise ValueError(f"{self.side}: wrist roll target is too close to a calibrated stop")
         return pose
 
     def cradle(self, tilt):
@@ -264,8 +270,8 @@ def settle_joint(arms, joint, timeout=ARRIVE_TIMEOUT_S, *, require_arrival=False
 def initialize_pose(arms, targets, lift_speed):
     stages = [(ELBOW, ELBOW_SPEED, ELBOW_SETTLE_S),
               (GRIPPER, GRIP_SPEED, GRIP_SETTLE_S), (J0, lift_speed, TOP_SETTLE_S)]
-    stages.extend((joint, INITIALIZE_SPEED, 0.0) for joint in (1, SWING, 4, WRIST_YAW, WRIST_PITCH))
-    print("[pickup] initialization: calibrated home, raised lift, open claws", flush=True)
+    stages.extend((joint, INITIALIZE_SPEED, 0.0) for joint in (1, SWING, WRIST_ROLL, WRIST_YAW, WRIST_PITCH))
+    print("[pickup] initialization: calibrated home, raised lift, open claws, 90 deg wrist roll", flush=True)
     for joint, speed, pause in stages:
         if _stop:
             return False
@@ -295,13 +301,13 @@ def pinch_direction(arm):
     return d
 
 
-def hook_direction(arm, keep_height=False):
-    """Rotate J5 inward without changing pitch or claw extension. Yaw can change hand height,
-    so prepare it while raised. The optional keep_height blend retains the J5/J6 level sweep;
-    it is not used for wrist preparation because pitch compensation can dominate the motion."""
+def hook_direction(arm, keep_height=False, *, joint=WRIST_YAW):
+    """Rotate the selected wrist joint inward, holding other joints and claw extension.
+    Rolled claws use J6 instead of J5. Prepare while raised because hand height can change.
+    The optional keep_height blend retains the unrolled J5/J6 level sweep."""
     if not keep_height:
         d = np.zeros(arm.dof)
-        d[WRIST_YAW] = inward_sign(arm.cfg, arm.cmd, WRIST_YAW)
+        d[joint] = inward_sign(arm.cfg, arm.cmd, joint)
         return d
     q = np.asarray(arm.cmd, dtype=np.float64)
     p0, _ = arm.cfg.ik.fk(list(arm.cfg.q2urdf(q.copy())[:7]))
@@ -373,7 +379,7 @@ def main():
     ap.add_argument("--spread", type=float, default=None,
                     help="cap the outward J2 swing at this many turns from the start pose (default: full calibrated range)")
     ap.add_argument("--hook", type=float, default=HOOK_MAX_TRAVEL,
-                    help="max inward J5 wrist rotation in turns before descent; pitch and claws hold, 0 disables (default: %(default)s)")
+                    help="max inward J6 wrist rotation in turns before descent; roll, J5 and claws hold, 0 disables (default: %(default)s)")
     ap.add_argument("--squeeze", type=float, default=PINCH_SQUEEZE,
                     help="extra inward J2 turns past detected contact, capped by calibration (default: %(default)s)")
     ap.add_argument("--cradle", type=float, default=CRADLE_TILT, help="extra elbow flex in turns after gripping; 0 disables")
@@ -430,10 +436,11 @@ def main():
         hold(arms, SPREAD_SETTLE_S)
 
         if not args.lower_only and args.hook > 0:
-            print("[pickup] prepare grasp: rotate wrists inward (J5), holding pitch and claw extension", flush=True)
-            creep_to_contact(arms, hook_direction, HOOK_SPEED, HOOK_CONTACT_ERR, HOOK_SQUEEZE,
-                             max_travel=args.hook, label="wrist yaw inward")
-            settle_joint(arms, WRIST_YAW)
+            print("[pickup] prepare grasp: rotate rolled wrists inward (J6), holding roll, J5 and claw extension", flush=True)
+            creep_to_contact(arms, lambda a: hook_direction(a, joint=WRIST_PITCH),
+                             HOOK_SPEED, HOOK_CONTACT_ERR, HOOK_SQUEEZE,
+                             max_travel=args.hook, label="rolled wrist inward")
+            settle_joint(arms, WRIST_PITCH)
             hold(arms, TOP_SETTLE_S)
         if _stop:
             return
@@ -477,7 +484,8 @@ def main():
         for a in arms:
             live = a.live()
             print(f"[pickup] {a.side}: J0 at {live[J0]:+.3f}  J2 {live[SWING]:+.3f} (cmd {a.cmd[SWING]:+.3f})"
-                  f"  J5 {live[WRIST_YAW]:+.3f} (cmd {a.cmd[WRIST_YAW]:+.3f})"
+                  f"  J4 {live[WRIST_ROLL]:+.3f} (cmd {a.cmd[WRIST_ROLL]:+.3f})"
+                  f"  J6 {live[WRIST_PITCH]:+.3f} (cmd {a.cmd[WRIST_PITCH]:+.3f})"
                   f"  elbow {live[ELBOW]:+.3f}  grip {live[GRIPPER]:+.3f}", flush=True)
         print(f"[pickup] holding {hold_description}; torque drops on exit and releases the box", flush=True)
         hold(arms, args.hold)
