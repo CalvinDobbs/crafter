@@ -1,0 +1,8 @@
+{
+  "actions": [
+    {"kind": "pick", "box_id": 3},
+    {"kind": "place", "cell": [0, 1, 0]},
+    {"kind": "pick", "box_id": 1},
+    {"kind": "place", "cell": [1, 0, 0]}
+  ]
+}

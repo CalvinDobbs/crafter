@@ -92,15 +92,58 @@ def plan_llm(structure: Structure, boxes: list[Detection],
     return plan
 
 
-def plan_build(structure: Structure, boxes: list[Detection],
-               backend="auto") -> Plan:
-    if backend == "deterministic":
-        return plan_deterministic(structure, boxes)
+def _attach_voice(plan: Plan, structure: Structure,
+                  voice_pack: str | None = None,
+                  voice_flavor: str | None = None) -> Plan:
+    """Personality + optional OpenAI rewrite *after* assignment is fixed.
+
+    Never changes actions. Fail-open to pack templates.
+    Env defaults: VOICE_PACK=neutral, VOICE_FLAVOR=template|openai.
+    """
+    pack_id = (voice_pack or os.environ.get("VOICE_PACK", "neutral")).strip()
+    flavor = (voice_flavor or os.environ.get("VOICE_FLAVOR", "template")).strip()
     try:
-        return plan_llm(structure, boxes)
+        from pathlib import Path
+        import sys
+        voice_dir = str(Path(__file__).resolve().parent / "voice")
+        if voice_dir not in sys.path:
+            sys.path.insert(0, voice_dir)
+        from packs import get_pack, set_pack
+        from from_plan import events_from_plan
+        from flavor import pair_lines_for_plan, prewrite
+        from contracts import plan_to_dict
+
+        pack = set_pack(pack_id)
+        kinds = {(b.x, b.y, b.z): b.kind for b in structure.blocks}
+        plan.narration = pair_lines_for_plan(
+            [a.__dict__ for a in plan.actions], kinds, pack)
+        if pack.startup and plan.narration:
+            # Keep startup for orchestrator to say before first pick if desired.
+            plan.narration = [pack.startup] + plan.narration
+        # Phase script for mc_skills narrate() path (loaded into flavor overrides).
+        events = events_from_plan(plan_to_dict(plan))
+        prewrite(events, pack=pack, flavor=flavor)
+        print(f"[planner] voice pack={pack.id} flavor={flavor} "
+              f"narration={len(plan.narration)}", flush=True)
     except Exception as e:
-        print(f"[planner] llm failed ({e}); deterministic fallback", flush=True)
-        return plan_deterministic(structure, boxes)
+        print(f"[planner] voice attach skipped ({e})", flush=True)
+    return plan
+
+
+def plan_build(structure: Structure, boxes: list[Detection],
+               backend="auto",
+               voice_pack: str | None = None,
+               voice_flavor: str | None = None) -> Plan:
+    if backend == "deterministic":
+        plan = plan_deterministic(structure, boxes)
+    else:
+        try:
+            plan = plan_llm(structure, boxes)
+        except Exception as e:
+            print(f"[planner] llm failed ({e}); deterministic fallback", flush=True)
+            plan = plan_deterministic(structure, boxes)
+    return _attach_voice(plan, structure, voice_pack=voice_pack,
+                         voice_flavor=voice_flavor)
 
 
 if __name__ == "__main__":
