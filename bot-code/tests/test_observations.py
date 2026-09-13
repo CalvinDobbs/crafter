@@ -201,11 +201,17 @@ class CarryVolumeTests(unittest.TestCase):
         self.assertEqual(held.status, "unknown")
         self.assertEqual(held.source, "carry-volume-occluded")
 
-    def test_a_seen_but_boxless_volume_is_empty(self):
-        seen = [[0.4 + 0.001 * i, 0.0, 0.3] for i in range(20)]
-        held = self.source(scan(points=seen)).holding()
+    def test_seeing_through_the_volume_to_something_beyond_is_empty(self):
+        # returns landing further out on the same lines of sight: nothing was in the way
+        beyond = [[1.2, 0.0 + 0.001 * i, 0.3] for i in range(20)]
+        held = self.source(scan(points=beyond)).holding()
         self.assertEqual(held.status, "empty")
-        self.assertEqual(held.source, "carry-volume-detector")
+        self.assertEqual(held.source, "carry-volume-see-through")
+
+    def test_returns_inside_the_volume_alone_do_not_prove_it_is_empty(self):
+        # an empty volume has no returns IN it; points there mean something is there
+        inside = [[0.4, 0.0 + 0.001 * i, 0.3] for i in range(20)]
+        self.assertEqual(self.source(scan(points=inside)).holding().status, "unknown")
 
     def test_evidence_carries_the_measurement_time_not_the_read_time(self):
         s = scan(boxes=[self.box((0.4, 0.0, 0.3))])

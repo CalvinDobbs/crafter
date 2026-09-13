@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import base64
 import math
+import struct
+import zlib
 import threading
 import time
 
@@ -29,6 +31,9 @@ from agent_types import (MAX_IMAGE_BYTES, BuildSite, CellObservation, MotionObse
                          PerceptionCapabilities, SceneImage)
 
 import perception
+
+JPEG_MAGIC = bytes.fromhex("ffd8ff")      # SOI marker; a JPEG must start with it
+PNG_MAGIC = bytes.fromhex("89504e470d0a1a0a")
 
 # A measured column height counts as a surface when it lands within this fraction of a box edge
 # of where that surface should be. Wider than this and the cell is unknown, not a near miss.
@@ -263,14 +268,18 @@ class _EnrichedSession:
 
     def _images(self, scan, snapshot):
         data, ts = self.session.streams.get("rect", (b"", 0.0))
-        if not data or len(data) > MAX_IMAGE_BYTES or not data.startswith(b"\xff\xd8\xff"):
-            return ()
-        if not -0.05 <= self.clock() - ts <= self.settings.fresh_s:
-            return ()       # a stale frame labelled fresh is worse than no frame
-        return (SceneImage("rect", "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"),
-                           ts, snapshot.epoch, frame_id=snapshot.frame_id,
-                           simulated=bool(self.session.mock),
-                           description="Live rectified head camera; not motion authority."),)
+        usable = data and len(data) <= MAX_IMAGE_BYTES and data.startswith(JPEG_MAGIC)
+        if usable and -0.05 <= self.clock() - ts <= self.settings.fresh_s:
+            return (SceneImage("rect", "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii"),
+                               ts, snapshot.epoch, frame_id=snapshot.frame_id,
+                               simulated=bool(self.session.mock),
+                               description="Live rectified head camera; not motion authority."),)
+        if self.session.mock:
+            return (_plan_view(scan, snapshot),)
+        # Live, with no usable frame: no image at all. The agent refuses to act without one,
+        # which is the correct response to a camera that has stopped delivering. A stale frame
+        # labelled fresh would be worse than none.
+        return ()
 
     def close(self):
         close = getattr(self.session, "close", None)
@@ -433,12 +442,58 @@ class CarryVolume:
             if all(abs(detection.pos[i] - centre[i]) <= reach for i in range(3)):
                 return Holding("holding", detection.id, scan.ts, "carry-volume-detector")
 
-        # No box was identified there. Only call that empty if the volume was actually seen:
-        # without depth returns this is a blind spot, not an absence.
+        # No box was identified there. Calling that empty needs proof the volume was actually
+        # looked through, and the proof is NOT depth returns inside it -- an empty volume has
+        # none, because the rays pass straight through. What shows it is empty is returns landing
+        # BEYOND it on the same lines of sight: the camera looks along +x, so a return further out
+        # than the far face means nothing was in the way.
         points = np.asarray(getattr(scan, "points", []), dtype=float).reshape(-1, 3)
         if len(points):
             finite = points[np.isfinite(points).all(axis=1)]
-            near = finite[np.all(np.abs(finite - np.asarray(centre)) <= reach, axis=1)]
-            if len(near) >= CARRY_MIN_POINTS:
-                return Holding("empty", ts=scan.ts, source="carry-volume-detector")
+            through = finite[(np.abs(finite[:, 1] - centre[1]) <= reach)
+                             & (np.abs(finite[:, 2] - centre[2]) <= reach)
+                             & (finite[:, 0] > centre[0] + reach)]
+            if len(through) >= CARRY_MIN_POINTS:
+                return Holding("empty", ts=scan.ts, source="carry-volume-see-through")
         return Holding("unknown", ts=scan.ts, source="carry-volume-occluded")
+
+
+def _plan_view(scan, snapshot, size=128):
+    """A simulated overhead sketch of the scene, for mock runs only.
+
+    Mock perception serves no camera frames, and the agent refuses to act without an image, so an
+    offline end-to-end run needs something to look at. It is marked simulated, so nothing can
+    mistake it for a camera view, and the live path never reaches it: a live session with no
+    usable frame returns no image at all, which correctly stops the agent.
+    """
+    pad = bytes.fromhex("00")
+    pixels = bytearray(bytes((242, 244, 247)) * size * size)
+    points = [(0.0, 0.0)] + [(b.position[0], b.position[1]) for b in snapshot.boxes]
+    if scan.build is not None:
+        points.append((scan.build.origin[0], scan.build.origin[1]))
+    left, right = min(p[0] for p in points) - .5, max(p[0] for p in points) + .5
+    bottom, top = min(p[1] for p in points) - .5, max(p[1] for p in points) + .5
+
+    def square(position, color, radius):
+        x = round((position[0] - left) / (right - left) * (size - 1))
+        y = round((top - position[1]) / (top - bottom) * (size - 1))
+        for row in range(max(0, y - radius), min(size, y + radius + 1)):
+            for col in range(max(0, x - radius), min(size, x + radius + 1)):
+                offset = (row * size + col) * 3
+                pixels[offset:offset + 3] = bytes(color)
+
+    if scan.build is not None:
+        square(scan.build.origin, (170, 175, 185), 4)
+    for box in snapshot.boxes:
+        square((box.position[0], box.position[1]), (45, 165, 85), 3)
+    square((0.0, 0.0), (225, 160, 20), 4)
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+    rows = b"".join(pad + pixels[r * size * 3:(r + 1) * size * 3] for r in range(size))
+    png = (PNG_MAGIC + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    return SceneImage("overview", "data:image/png;base64," + base64.b64encode(png).decode("ascii"),
+                      snapshot.captured_at, snapshot.epoch, frame_id=snapshot.frame_id,
+                      simulated=True, description="SIMULATED plan view; mock perception, not a camera.")
