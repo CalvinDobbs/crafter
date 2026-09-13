@@ -302,6 +302,24 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PanelAssetsTests(unittest.TestCase):
+    def test_light_theme_has_red_accent_and_readable_contrast(self):
+        html = (PANEL_DIR / "panel.html").read_text()
+        css = (PANEL_DIR / "panel.css").read_text()
+        self.assertIn('<meta name="color-scheme" content="light">', html)
+        self.assertIn("color-scheme:light", css)
+        colors = dict(re.findall(r"(--[\w-]+):#([0-9a-f]{6})\b", css))
+        for name in ("--bg", "--surface", "--raised"):
+            self.assertGreaterEqual(min(int(colors[name][i:i+2], 16) for i in (0, 2, 4)), 230)
+        red, green, blue = (int(colors["--accent"][i:i+2], 16) for i in (0, 2, 4))
+        self.assertGreater(red, max(green, blue)+50)
+        for foreground, background in ((colors["--text"], colors["--bg"]), ("ffffff", colors["--accent"])):
+            luminance = []
+            for color in (foreground, background):
+                channels = [int(color[i:i+2], 16)/255 for i in (0, 2, 4)]
+                linear = [v/12.92 if v <= .04045 else ((v+.055)/1.055)**2.4 for v in channels]
+                luminance.append(sum(v*weight for v, weight in zip(linear, (.2126, .7152, .0722))))
+            self.assertGreaterEqual((max(luminance)+.05)/(min(luminance)+.05), 4.5)
+
     def test_brand_uses_packaged_svg(self):
         self.assertEqual(PANEL_DIR.name, "web")
         html = (PANEL_DIR / "panel.html").read_text()
@@ -408,6 +426,9 @@ class PanelAssetsTests(unittest.TestCase):
                         await evaluate(`window.__layoutState=${JSON.stringify(s)};state=window.__layoutState;render(state);new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);
                         const result=await evaluate(`(()=>{
                             const problems=[],root=document.documentElement;
+                            if(getComputedStyle(root).colorScheme!=='light')problems.push('native controls are not in light mode');
+                            const background=getComputedStyle(document.body).backgroundColor.match(/[0-9]+/g).slice(0,3).map(Number);
+                            if(Math.min(...background)<230)problems.push('page background is not light');
                             if(root.scrollHeight>innerHeight+1||root.scrollWidth>innerWidth+1)problems.push('document overflows: '+root.scrollWidth+'x'+root.scrollHeight);
                             const controls=${JSON.stringify(screen==='main'?['#start-build','#clear-blueprint','#load-example','#main-canvas']:screen==='build'?[mode==='failure'?'#failed-back':'#cancel-build','#build-canvas','#activity-feed']:['#back-main','#complete-canvas'])};
                             controls.push('.brand-logo','.header-status');
@@ -429,6 +450,12 @@ class PanelAssetsTests(unittest.TestCase):
                             }
                             const canvas=document.querySelector('[data-screen]:not([hidden]) canvas'),r=canvas.getBoundingClientRect();
                             if(r.width<1||r.height<1)problems.push('preview collapsed');
+                            const pixel=canvas.getContext('2d').getImageData(0,0,1,1).data;
+                            if(Math.min(pixel[0],pixel[1],pixel[2])<150)problems.push('preview background is not light');
+                            if(${JSON.stringify(mode)}==='configuration'){
+                                const input=getComputedStyle(document.querySelector('#api-key')).backgroundColor.match(/[0-9]+/g).slice(0,3).map(Number);
+                                if(Math.min(...input)<230)problems.push('key input is not light');
+                            }
                             if(${JSON.stringify(screen)}==='build'){
                                 const feed=document.querySelector('#activity-feed'),r=feed.getBoundingClientRect();
                                 if(r.bottom>innerHeight+1||r.height<1||getComputedStyle(feed).overflowY!=='auto')problems.push('activity feed is not contained');
