@@ -6,15 +6,16 @@
 # [tool.uv.sources]
 # bbos = { path = "/home/bracketbot/bbos", editable = true }
 # ///
-"""Initialize a calibrated reference pose, then spread, turn the wrists, lower and squeeze.
+"""Initialize, spread, prepare the wrists, reach down, squeeze, then lift and hold at shoulder level.
 
 Every run first reaches the same calibrated home angles with the lift raised and
 claws open. This is a pose reset for an already-homed, unloaded robot, not encoder
 homing. By default, prepare the wrists before descent, bring the arms inward, and
-hold the squeeze until Ctrl+C (or --hold SECS). Torque stays on during the hold;
-exiting disables torque and releases the box. --lower-only skips wrist preparation
-and grasping, but not initialization or elbow extension. --pickup adds grip, cradle and lift. The bottom
-margin is a lift offset, not a measured floor distance.
+lift back to shoulder level while maintaining the squeeze. Hold there until Ctrl+C
+(or --hold SECS). Torque stays on during the lift and hold; exiting disables torque
+and releases the box. --lower-only skips wrist preparation, grasping and the final
+lift, but not initialization or elbow extension. --pickup adds grip and cradle before
+lifting. The bottom margin is a lift offset, not a measured floor distance.
 
 Joint-space, no IK. Stages:
   1. initialize: elbow (J3) -> calibrated 90 deg, grippers (J7) open, then lift (J0) -> top;
@@ -25,17 +26,17 @@ Joint-space, no IK. Stages:
      so the forearms straddle a box much wider than the shoulders
   3. prepare wrists: rotate J6 inward toward the box while J0 stays at the top, preserving
      the initialized J4 roll, J5 and open J7 claw setpoints; --hook caps J6 travel and 0 skips this stage
-  4. extend elbows (J3) by --elbow-extension turns from home while raised (default: 20 deg);
+  4. extend elbows (J3) by --elbow-extension turns from home while raised (default: 30 deg);
      wait for both arms to arrive, then lift (J0) -> bottom minus --bottom-margin turns
      toward the top; --lower-only holds this extended reach pose
   5. cage the box, keeping the prepared wrist angles:
        a. pinch: J2 brings the elbows and forearms inward until each forearm meets the box side
-          (tracking error rises), then holds --squeeze turns past contact; hold here by default
+          (tracking error rises), then holds --squeeze turns past contact through the lift
        b. with --pickup, grip: grippers close (on a rim/corner if there is one; otherwise they just stiffen the
           hand into a solid paddle -- the daemon's J7 current-relief loop keeps the grip gentle)
        c. with --pickup, cradle: the elbows flex a little from the reach pose, lifting the front edge of the box so it
           tilts back against the upper arms and the weight rests on the forearms
-  6. with --pickup, shoot J0 back up to the top (shoulder level) and hold
+  6. lift J0 back up to the top (shoulder level), preserving the grasp, and hold until termination
 All other joints hold their initialized pose. Range edges come from the per-robot
 ranges.calibration.json (motor turns, the arm_ctrl.pos frame); the "down", "outward" and
 "inward" signs are per-arm (the arms are mirror images in motor-turn space) and are derived
@@ -66,7 +67,7 @@ WRIST_ROLL_TURNS = 0.25
 RATE_HZ = 200.0
 J0_SPEED = 0.4          # turns/s along the lift (matches homing.J0_PARK_DOWN_SPEED)
 J0_BOTTOM_MARGIN = 1.0
-ELBOW_EXTENSION = 20.0 / 360.0
+ELBOW_EXTENSION = 30.0 / 360.0
 ELBOW_EXTENSION_SPEED = 0.05
 INITIALIZE_SPEED = 0.08
 LIFT_SPEED = 1.2        # turns/s for the final shoot-up
@@ -387,7 +388,7 @@ def main():
                     help="J0 turns above the calibrated bottom; larger values stop higher (default: %(default)s)")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--lower-only", action="store_true", help="hold the spread low pose without grasping")
-    mode.add_argument("--pickup", action="store_true", help="continue after the inward grasp into grip, cradle and lift")
+    mode.add_argument("--pickup", action="store_true", help="add gripper closure and cradle after the inward grasp, before the final lift")
     ap.add_argument("--spread", type=float, default=None,
                     help="cap the outward J2 swing at this many turns from the start pose (default: full calibrated range)")
     ap.add_argument("--hook", type=float, default=HOOK_MAX_TRAVEL,
@@ -493,30 +494,36 @@ def main():
                          max_travel=np.inf, label="pinch")
         hold(arms, PINCH_SETTLE_S)
 
-        if not args.pickup:
-            print(f"[pickup] holding inward squeeze {hold_description}; torque drops on exit and releases the box", flush=True)
-            hold(arms, args.hold)
+        if _stop:
             return
 
-        print("[pickup] cage: grippers -> closed", flush=True)
-        ramp_joint(arms, GRIPPER, [a.grip_closed for a in arms], GRIP_SPEED)
-        hold(arms, GRIP_SETTLE_S)
+        if args.pickup:
+            print("[pickup] cage: grippers -> closed", flush=True)
+            ramp_joint(arms, GRIPPER, [a.grip_closed for a in arms], GRIP_SPEED)
+            hold(arms, GRIP_SETTLE_S)
+            if _stop:
+                return
+            if cradle_targets:
+                print("[pickup] cage: cradle tilt from extended reach pose", flush=True)
+                ramp_joint(arms, ELBOW, cradle_targets, CRADLE_SPEED, ease=smootherstep)
+                hold(arms, CRADLE_SETTLE_S)
+        if _stop:
+            return
 
-        if cradle_targets:
-            print("[pickup] cage: cradle tilt from extended reach pose", flush=True)
-            ramp_joint(arms, ELBOW, cradle_targets, CRADLE_SPEED, ease=smootherstep)
-            hold(arms, CRADLE_SETTLE_S)
-
-        print("[pickup] J0 -> top (shoot up)", flush=True)
+        print("[pickup] final stage: J0 -> shoulder level, maintaining grasp", flush=True)
         ramp_joint(arms, J0, [a.top for a in arms], LIFT_SPEED)
+        if _stop:
+            return
         settle_joint(arms, J0)
+        if _stop:
+            return
         for a in arms:
             live = a.live()
             print(f"[pickup] {a.side}: J0 at {live[J0]:+.3f}  J2 {live[SWING]:+.3f} (cmd {a.cmd[SWING]:+.3f})"
                   f"  J4 {live[WRIST_ROLL]:+.3f} (cmd {a.cmd[WRIST_ROLL]:+.3f})"
                   f"  J6 {live[WRIST_PITCH]:+.3f} (cmd {a.cmd[WRIST_PITCH]:+.3f})"
                   f"  elbow {live[ELBOW]:+.3f}  grip {live[GRIPPER]:+.3f}", flush=True)
-        print(f"[pickup] holding {hold_description}; torque drops on exit and releases the box", flush=True)
+        print(f"[pickup] holding shoulder-level target and grasp {hold_description}; torque drops on exit and releases the box", flush=True)
         hold(arms, args.hold)
     finally:
         # Leave the arms limp on exit.
