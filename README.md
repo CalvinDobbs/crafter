@@ -2,7 +2,7 @@
 
 Build a structure in Minecraft, send it to a robot.
 
-The overall project plan (goals, sequencing, gaps, voice) is **[PLAN.md](PLAN.md)**. This README is how to build and run the Minecraft mod.
+This README is how to build and run the Minecraft mod. For the bot side: **[bot-code/README.md](bot-code/README.md)** is the current architecture and runbook, **[AGENTS.md](AGENTS.md)** has the operational rules and verified commands, and **[PLAN.md](PLAN.md)** is the goals-and-sequencing plan.
 
 ## Components
 
@@ -18,10 +18,14 @@ instead of structures.
 
 ## The bot side
 
-Python for the robot lives in [`bot-code/`](bot-code/) (planner, perception, orchestrator).
-The `main.py --ui` panel receives Minecraft designs on TCP 5005 and previews them before Start.
-Builds use real LLM calls with simulated tools; this mode does not execute hardware action scripts.
-Hardware motion integration is separate (see PLAN.md). Live scans follow [WIRE_FORMAT.md](WIRE_FORMAT.md).
+Python for the robot lives in [`bot-code/`](bot-code/): the reasoning agent, perception, the panel
+and receiver, and voice. The `main.py --ui` panel receives Minecraft designs on TCP 5005 and previews
+them before Start. Builds use real LLM calls with simulated tools; this mode does not move the robot.
+
+Hardware motion is not wired up yet: there is no action provider implementing interface v2, so a live
+build fails preflight by design. See [bot-code/README.md](bot-code/README.md) for the interface and
+[bot-code/actions/motion_and_arms.md](bot-code/actions/motion_and_arms.md) for how the base and arms
+actually work. Live scans follow [WIRE_FORMAT.md](WIRE_FORMAT.md).
 
 ## Model key and developer access
 
