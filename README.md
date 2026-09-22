@@ -84,12 +84,6 @@ ssh -N -L 127.0.0.1:8005:127.0.0.1:8005 bracketbot@100.66.148.86
 
 Open <http://127.0.0.1:8005>, review the preview, then press Start. Nothing builds on its own.
 
-## Status
-
-Perception, reasoning and the build loop run end to end against an offline simulator, so a build
-needs no model, no API key and no robot. Physical motion is documented and partly implemented,
-but no live action provider is wired up yet — a hardware build fails preflight by design.
-
 ## What's next
 
 - More than cardboard: a wider range of block types, colours and textures
